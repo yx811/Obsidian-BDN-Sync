@@ -10,6 +10,7 @@
 
 - GitHub Actions Release 工作流：推送标签自动构建、打包并创建 GitHub Release
 - Release 包包含 `manifest.json` / `main.js` / `styles.css`
+- README 重写：基于源码完善系统架构、同步机制、配置参考、命令列表等文档
 
 ### 变更
 
