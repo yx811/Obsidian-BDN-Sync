@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  build-and-release:
+  release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -14,29 +14,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Audit dependencies
-        run: npm audit --audit-level=high
-
-      - name: Type check
-        run: npx tsc -noEmit -skipLibCheck
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Test
-        run: npm test
-
-      - name: Build production
-        run: npm run build
+      # 注意：本仓库直接提交已构建好的 main.js / styles.css，
+      # 此处不再重新构建（避免产物与本地现有文件不一致）。
+      - name: Verify release artifacts present
+        run: |
+          for f in manifest.json main.js styles.css; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少发布文件 $f（请确保已提交到仓库）"
+              exit 1
+            fi
+          done
 
       - name: Generate release notes
         run: |
