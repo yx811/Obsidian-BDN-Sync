@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Type check
+        run: npx tsc -noEmit -skipLibCheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build production
+        run: npm run build
+
+      - name: Create plugin zip
+        run: |
+          mkdir -p dist/bdnsync
+          cp manifest.json main.js styles.css dist/bdnsync/
+          (cd dist && zip -r bdnsync-${{ github.ref_name }}.zip bdnsync/)
+
+      - name: Generate release notes
+        run: |
+          {
+            echo "## BDNSync ${{ github.ref_name }}"
+            echo ""
+            echo "### 安装"
+            echo ""
+            echo "1. 下载下方的 \`bdnsync-${{ github.ref_name }}.zip\`"
+            echo "2. 解压到 vault 的 \`.obsidian/plugins/bdnsync/\` 目录"
+            echo "3. 在 Obsidian 设置 → 第三方插件中启用 BDNSync"
+            echo ""
+            echo "### 插件文件"
+            echo ""
+            echo "- \`manifest.json\` — 插件清单"
+            echo "- \`main.js\` — 编译后的运行代码"
+            echo "- \`styles.css\` — 界面样式"
+            echo ""
+            echo "### 更新日志"
+            echo ""
+          } > RELEASE_NOTES.md
+          # Append changelog for this version if available
+          if [ -f CHANGELOG.md ]; then
+            awk "/^## \\[${{ github.ref_name }}/{flag=1; next} /^## \\[/{flag=0} flag" CHANGELOG.md >> RELEASE_NOTES.md
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/bdnsync-${{ github.ref_name }}.zip

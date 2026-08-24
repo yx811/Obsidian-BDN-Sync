@@ -1,0 +1,24 @@
+# Normalize line endings across platforms
+* text=auto eol=lf
+
+# Explicitly declare text files
+*.ts   text
+*.js   text
+*.cjs  text
+*.mjs  text
+*.json text
+*.md   text
+*.yml  text
+*.yaml text
+*.css  text
+*.html text
+*.svg  text
+
+# Binary files
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
