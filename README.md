@@ -36,8 +36,8 @@
 BDNSync 通过 GitHub Releases 分发，无需从源码构建：
 
 1. 访问本仓库 **[Releases](../../releases)** 页面
-2. 下载最新的 `bdnsync-v*.zip`
-3. 解压到 vault 目录下的 `.obsidian/plugins/bdnsync/`
+2. 下载最新 Release 中的三个插件文件：`manifest.json`、`main.js`、`styles.css`
+3. 放入 vault 目录下的 `.obsidian/plugins/bdnsync/`
 4. 在 Obsidian 设置 → 第三方插件中启用 **BDNSync**
 
 插件包仅含三个文件：
@@ -174,8 +174,8 @@ npm run format       # 自动格式化
 本项目通过 GitHub Actions 自动化 Release：
 
 1. 推送标签：`git tag v1.0.1 && git push origin v1.0.1`
-2. CI 自动执行类型检查 → Lint → 测试 → 生产构建 → 打包 zip
-3. 自动创建 GitHub Release，上传 `bdnsync-v*.zip`
+2. CI 自动执行类型检查 → Lint → 测试 → 生产构建 → 生成插件文件
+3. 自动创建 GitHub Release，上传 `manifest.json` / `main.js` / `styles.css` 三个插件文件
 
 ---
 
