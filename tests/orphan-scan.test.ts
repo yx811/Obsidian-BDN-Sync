@@ -521,6 +521,76 @@ describe('classifyOrphans：vault 自身目录命名基（.obsidian / .bdnsync�
   });
 });
 
+describe('classifyOrphans：vault 根目录安全护栏（空索引不误删整库）', () => {
+  it('full-vault + 空索引（isActive 全 false）：vault 根自身绝不出现在候选中', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [f('Obsidian Vault', true)],
+      [REMOTE_ROOT]: [f('Notes', true), f('a.md', false, 100)],
+      [`${REMOTE_ROOT}/Notes`]: [f('b.md', false, 50)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 2,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false, // 换账号 / 索引重置 / LocalIndex 读取失败
+      ignoreGlobs: ['.bdnsync', '.bdnsync-base', '.bdnsync-merge-draft', '.bdnsync-backup', '.obsidian'],
+    });
+    // vault 根（/apps/bdnsync/Obsidian Vault）绝不能是候选
+    expect(out.some((x) => x.fullPath === REMOTE_ROOT)).toBe(false);
+    // vault 内部真正的孤儿（文件/子目录）仍应被识别
+    expect(out.some((x) => x.fullPath === `${REMOTE_ROOT}/a.md`)).toBe(true);
+    expect(out.some((x) => x.fullPath === `${REMOTE_ROOT}/Notes`)).toBe(true);
+  });
+
+  it('scoped + 空索引：vault 根同样不出现在候选中', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [f('Obsidian Vault', true)],
+      [REMOTE_ROOT]: [f('Notes', true), f('a.md', false, 100)],
+      [`${REMOTE_ROOT}/Notes`]: [f('b.md', false, 50)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'scoped',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 2,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+    });
+    expect(out.some((x) => x.fullPath === REMOTE_ROOT)).toBe(false);
+  });
+
+  it('护栏不误伤父目录层备份目录（relPath="" 的 backup-dir 仍被识别）', async () => {
+    const nodes: ScannedNode[] = [
+      {
+        absPath: `${PARENT}/.obsidian_20260825_140911`,
+        name: '.obsidian_20260825_140911',
+        isDir: true,
+        bytes: 0,
+        mtime: 0,
+        relPath: '',
+        depth: 0,
+        origin: 'parent',
+      },
+    ];
+    const out = await classifyOrphans(nodes, { vaultName: VAULT, isActive: () => false });
+    expect(out.some((x) => x.kind === 'backup-dir' && x.name === '.obsidian_20260825_140911')).toBe(true);
+  });
+});
+
 // ---------------- mergeFindings ----------------
 
 describe('mergeFindings：旧管线 + 新管线合并去重', () => {

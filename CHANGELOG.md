@@ -42,6 +42,11 @@
 - **vault 自身目录孤儿扫描盲区修复（重要级）**：分类器此前仅认 `vault名` 单命名基，导致 vault 自身目录下的 `.obsidian_*` / `.bdnsync_*` 时间戳备份目录「看得见认不出」；扩展为 `[vault名, .obsidian, .bdnsync]` 多命名基循环匹配，父目录层与 vault 自身层孤儿均被正确识别、归类与处理，消除扫描盲区
 - **插件备份白名单硬保护（阻断级）**：遍历引擎早已能进入 vault，但硬排除此前依赖「前缀黑名单」易漏；改为精确名称白名单 `PLUGIN_INFRA_HARD_EXCLUDE`（含 `.bdnsync` / `.bdnsync-base` / `.bdnsync-merge-draft` / `.bdnsync-backup`），且严格区分下划线时间戳孤儿（可清理）与中划线插件基础设施目录（`.bdnsync-backup` 等保留期备份，永不进入候选、绝对不删）；新增回归测试覆盖 `.bdnsync-backup` / `.bdnsync-backup_<ts>` 零误判
 - **孤儿来源溯源（可观测性）**：`OrphanFinding` 与 `ScannedNode` 新增 `origin: 'parent' | 'vault'` 标记，UI 弹窗与复制预览清单展示「父目录层 / vault 自身层」来源徽标，便于审计两类候选
+- **vault 根目录误删护栏（阻断级，代码审查发现）**：`scoped`/`full-vault` 下，当本地同步索引为空（换账号 / 索引重置 / LocalIndex 读取失败）时，vault 根自身（`/apps/bdnsync/<vault>`）会被 `classifyOrphans` 误判为 orphan-dir「目录内 N 项均不在 sync index 中」——一旦被勾选删除 = 清空整个网盘 vault（与 quickSync 的 B1 空索引护栏同源风险）。修复：orphan-dir 分类对 `relPath===''`（remoteRoot 之外）的目录一律跳过；父目录层备份目录（backup-dir）不受影响；新增 3 条回归测试（full-vault/scoped 空索引 + 护栏不误伤父层 backup-dir）
+- **巡检保留天数过滤缺失（重要级，代码审查发现）**：v2 主链路（`startDeepScan`）未应用 `orphanRetentionDays`，自动巡检会把保留期内的近期备份也弹出来（legacy `scan()` 有过滤但被 v2 取代）；修复：autoMode 下扫描结果按 mtime 过滤（`mtime===0 || mtime < cutoff`），与 legacy 行为对齐
+- **弹窗双扫描竞态（重要级，代码审查发现）**：v2 主入口 `open()` 后 `onOpen` 仍会跑 legacy 1 层自扫，与 `startDeepScan` 深度扫描并发执行——双份 API 扫描、phase/items/findings/勾选集合互相覆盖、结果不确定。修复：主入口传 `legacyScanOnOpen: false` 抑制 legacy 自扫（外部直接构造 modal 的旧调用方仍保持默认自扫）
+- **检测型巡检覆盖盲区（重要级，代码审查发现）**：`autoPrune=false` 的「仅检测」巡检与爆发检测此前走 `collectOrphanCandidates`（只扫父目录层），vault 自身层 `.obsidian_*`/`.bdnsync_*` 孤儿漏报；改为复用 `runOrphanScan` 统一引擎（两层全覆盖），日志按三类计数，爆发检测对比两层命中路径；删除不再使用的 `collectOrphanCandidates`
+- **v2 测量失败标注（轻微级）**：`measureDirFindings` 将 `measureError` 透传进 `OrphanFinding`，v2 分组视图显示「测量失败」徽标而非误导性的「空 / 仅目录」（与 legacy 行一致）
 
 ### 安全
 

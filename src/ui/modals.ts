@@ -1120,6 +1120,14 @@ export class OrphanCleanupModal extends Modal {
         durationMs: number;
         errors: { path: string; message: string }[];
       };
+      /**
+       * 是否在 onOpen 时跑 legacy 1 层自扫（默认 true）。
+       * main.ts 的 v2 主入口（openOrphanCleanupModal）在 open() 之后调用 startDeepScan，
+       * 此时必须置 false——否则 onOpen 的 legacy scan() 与深度扫描并发竞态：
+       * 双份 API 扫描、phase/items/findings 互相覆盖，且 legacy scan 只扫父目录层，
+       * 会让「已选集合」与展示结果不确定。
+       */
+      legacyScanOnOpen?: boolean;
     } = {},
   ) {
     super(app);
@@ -1129,6 +1137,11 @@ export class OrphanCleanupModal extends Modal {
 
   onOpen(): void {
     this.renderShell();
+    if (this.opts.legacyScanOnOpen === false) {
+      // v2 主入口（main.ts openOrphanCleanupModal）会在 open() 后调用 startDeepScan；
+      // 这里若再跑 legacy scan() 会与深度扫描并发竞态（双扫描 / 阶段互覆 / 结果不确定）。
+      return;
+    }
     // v2 短路：若主入口已预扫，直接进入 ready；否则走 legacy 自扫
     if (this.opts.findings && this.opts.scanStats) {
       this.findings = [...this.opts.findings];
@@ -1193,8 +1206,15 @@ export class OrphanCleanupModal extends Modal {
     this.renderFooter();
     try {
       const result = await scanFn();
+      // autoMode（同步结束/启动巡检）：按保留天数过滤，只保留「超过保留期」的候选——
+      // 保留期内的备份可能是近期合法活动产物，不应在巡检中弹出（与 legacy scan() 行为对齐）。
+      let findings = result.findings;
+      if (this.opts.autoMode && (this.opts.retentionDays ?? 0) > 0) {
+        const cutoff = Date.now() - (this.opts.retentionDays ?? 0) * 24 * 3600 * 1000;
+        findings = findings.filter((f) => f.mtime === 0 || f.mtime < cutoff);
+      }
       // F4 修复：目录类候选缺省 bytes=0，测量补齐后再展示
-      const measured = await this.measureDirFindings(result.findings);
+      const measured = await this.measureDirFindings(findings);
       this.findings = measured;
       this.scanStats = {
         scannedNodes: result.scannedNodes,
@@ -1246,7 +1266,9 @@ export class OrphanCleanupModal extends Modal {
     return findings.map((f) => {
       if (f.kind === 'orphan-file' || f.bytes > 0) return f;
       const m = byPath.get(f.fullPath);
-      if (!m || m.measureError) return f;
+      if (!m) return f;
+      // 测量失败：显式标注（UI 显示「测量失败」而非误导性的「空 / 仅目录」）
+      if (m.measureError) return { ...f, measureError: true };
       return { ...f, bytes: m.totalBytes };
     });
   }
@@ -1629,7 +1651,10 @@ export class OrphanCleanupModal extends Modal {
         createBadge(meta, `风险 ${riskLabel}`, f.risk === 2 ? 'error' : f.risk === 1 ? 'warning' : 'info');
         createBadge(meta, `${f.segments} 段时间戳`, 'info');
       }
-      if (f.bytes > 0) createBadge(meta, formatBytes(f.bytes), 'info');
+      if (f.measureError) {
+        // 列出子项失败 ≠ 空目录，显式标「测量失败」避免误导（与 legacy 行一致）
+        createBadge(meta, '测量失败', 'warning');
+      } else if (f.bytes > 0) createBadge(meta, formatBytes(f.bytes), 'info');
       else if (kindLabel === 'orphan-dir' || kindLabel === 'backup-dir') {
         createBadge(meta, '空 / 仅目录', 'info');
       }

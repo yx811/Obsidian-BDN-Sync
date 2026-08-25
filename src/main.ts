@@ -56,14 +56,11 @@ import { Logger } from './util/logger';
 import { md5Hex } from './util/md5';
 import { LogStore } from './util/log-store';
 import {
-  pickOrphans as pickOrphansUtil,
-  measureOrphans as measureOrphansUtil,
   shouldScanOrphans,
   PLUGIN_INFRA_HARD_EXCLUDE,
   type RemoteLister,
   type RemoteDeleter,
   type RemoteDirRow,
-  type OrphanEntry,
 } from './util/orphan-cleanup';
 import {
   walkRemoteTree,
@@ -1568,6 +1565,9 @@ export default class BDNSyncPlugin extends Plugin {
       bulkConfirmThreshold: this.settings.bulkDeleteConfirm,
       useRecycleBin: this.settings.orphanUseRecycleBin !== false,
       scanMode: this.settings.orphanScanMode,
+      // v2 主入口：open() 后由 startDeepScan 驱动扫描，禁止 onOpen 再跑 legacy 自扫
+      // （否则并发双扫描竞态：结果/阶段/勾选集合不确定，且 legacy 只扫父目录层）。
+      legacyScanOnOpen: false,
       onComplete: (r) => {
         // 扫描结果从 modal 取（startDeepScan 完成时回填 lastScan；取消/失败时可能为空）
         const scanResult = modal.lastScan;
@@ -1809,18 +1809,28 @@ export default class BDNSyncPlugin extends Plugin {
       this.settings.lastOrphanScanAt = now;
       void this.saveSettings();
       try {
-        const items = await this.collectOrphanCandidates();
-        if (items.length > 0) {
-          const high = items.filter((it) => it.risk === 2).length;
-          const mid = items.filter((it) => it.risk === 1).length;
-          this.logger.log(
-            'cleanup',
-            'info',
-            'warn',
-            `${opts.from === 'startup' ? '启动' : '同步后'}检测到 ${items.length} 个疑似孤儿目录（高风险 ${high}、中等 ${mid}）。请运行「BDNSync：扫描并清理网盘备份目录」处理。`,
-          );
-          // 爆发检测
-          void this.maybeBurstNotice(items);
+        // 检测必须与弹窗主链路同一引擎（runOrphanScan），覆盖父目录层 + vault 自身层
+        // 两类孤儿（旧 collectOrphanCandidates 只扫父目录层，vault 内 .obsidian_*/ .bdnsync_*
+        // 时间戳备份会漏报——升级目标「消除扫描盲区」要求检测路径同样覆盖两层）。
+        const vaultName = this.app.vault.getName();
+        const remoteRoot = this.settings.remoteRoot || `/apps/bdnsync/${vaultName}`;
+        const parentDir = remoteParent(remoteRoot);
+        if (parentDir && parentDir !== '/' && parentDir !== remoteRoot) {
+          const scan = await this.runOrphanScan({ vaultName, parentDir, remoteRoot });
+          const { findings } = scan;
+          if (findings.length > 0) {
+            const high = findings.filter((f) => f.risk === 2).length;
+            const mid = findings.filter((f) => f.risk === 1).length;
+            const kinds = this.countFindingsByKind(findings);
+            this.logger.log(
+              'cleanup',
+              'info',
+              'warn',
+              `${opts.from === 'startup' ? '启动' : '同步后'}检测到 ${findings.length} 个疑似孤儿（高风险 ${high}、中等 ${mid}；备份目录 ${kinds.backupDir}、孤儿文件 ${kinds.orphanFile}、孤儿目录 ${kinds.orphanDir}）。请运行「BDNSync：扫描并清理网盘备份目录」处理。`,
+            );
+            // 爆发检测（基于两层命中路径对比上次清理报告）
+            void this.maybeBurstNotice(findings);
+          }
         }
       } catch (e) {
         this.logger.log(
@@ -1850,7 +1860,7 @@ export default class BDNSyncPlugin extends Plugin {
    */
   private static readonly BURST_THRESHOLD = 3;
 
-  private async maybeBurstNotice(currentItems: OrphanEntry[]): Promise<void> {
+  private async maybeBurstNotice(currentItems: Array<{ fullPath: string }>): Promise<void> {
     if (currentItems.length === 0) return;
     const currentPaths = new Set(currentItems.map((it) => it.fullPath));
     let prevHandled: Set<string> | null = null;
@@ -1878,44 +1888,6 @@ export default class BDNSyncPlugin extends Plugin {
       `⚠️ BDNSync：网盘父目录短期内新增 ${burstCount} 个疑似孤儿备份\n${sample}${more}\n\n常见原因：\n  · 其它同步工具 / 百度网盘客户端在写入同路径\n  · 你在网盘 Web 端手动重命名了 vault 根\n  · 多设备 BDNSync 并发同步竞争\n\n建议：运行命令「BDNSync：扫描并清理网盘备份目录」处理。`,
       0, // 持续显示，需用户手动关闭
     );
-  }
-
-  /** 共用的"候选识别"流水线（仅检测不入弹窗时复用） */
-  private async collectOrphanCandidates(): Promise<OrphanEntry[]> {
-    if (!this.adapter) return [];
-    if (!this.hasAuth()) return [];
-    const vaultName = this.app.vault.getName();
-    const remoteRoot = this.settings.remoteRoot || `/apps/bdnsync/${vaultName}`;
-    const parentDir = remoteParent(remoteRoot);
-    if (!parentDir || parentDir === '/' || parentDir === remoteRoot) return [];
-    // 与 makeOrphanLister 同样的「相对 basename → 绝对路径」修复：
-    // 若不拼接，pickOrphans 输出的 fullPath 仅为 basename，measureOrphans 进一步
-    // 用「相对路径」去 listDir 会再次落入用户家目录，触发 errno=-7/-9 噪声。
-    const rows = await this.adapter.listRemoteDir(parentDir);
-    const entries: RemoteDirRow[] = rows.map((r) => ({
-      path: r.path ? remoteJoin(parentDir, r.path) : remoteJoin(parentDir, r.name),
-      name: r.name,
-      isDir: r.isDir,
-      mtime: r.mtime,
-      size: r.size,
-    }));
-    const candidates = pickOrphansUtil(entries, vaultName);
-    if (candidates.length === 0) return [];
-    const adapter = this.adapter; // 闭包捕获：函数开头已 guard 非空
-    const lister: RemoteLister = {
-      listDir: async (p: string) => {
-        const rs = await adapter.listRemoteDir(p);
-        return rs.map((r) => ({
-          // measureOrphans 传入的 p 已经是 orphan 的绝对路径，此处继续拼绝对
-          path: r.path ? remoteJoin(p, r.path) : remoteJoin(p, r.name),
-          name: r.name,
-          isDir: r.isDir,
-          mtime: r.mtime,
-          size: r.size,
-        }));
-      },
-    };
-    return await measureOrphansUtil(lister, candidates);
   }
 
   /** 版本历史：从文件右键/命令打开（取当前活动文件） */

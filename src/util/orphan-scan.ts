@@ -413,6 +413,14 @@ export async function classifyOrphans(
       }
       // 非备份目录：判断是否 orphan-dir（空 / 整棵子树无 active 文件）
       const kids = byParent.get(n.absPath) ?? [];
+      // 🔴 安全护栏（vault 根误删）：relPath==='' 的目录位于 remoteRoot 之外，
+      // 其中唯一会被展开出子项的节点就是「vault 根自身」（父目录层列出、子项来自
+      // remoteRoot 列表）。本地索引为空（换账号 / 索引重置 / 读取失败）时整库文件都判
+      // inactive，vault 根会落入「目录内 N 项均不在 sync index 中」→ 一旦被勾选删除
+      // = 清空整个网盘 vault（与 quickSync 的 B1 空索引护栏同源的风险）。
+      // 父目录层其它目录从未展开（childrenListed=false）本就无法判定，跳过无损失；
+      // 而父目录层的备份目录（backup-dir）不受影响（走上面的命名分支）。
+      if (!n.relPath) continue;
       // 子树内存在同步中的文件（传递性）→ 不能删
       if (protectedDirs.has(n.absPath)) continue;
       if (kids.length === 0) {
