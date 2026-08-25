@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-![Obsidian](https://img.shields.io/badge/Obsidian-1.4.0%2B-purple.svg)
+![Obsidian](https://img.shields.io/badge/Obsidian-1.13.7%2B-purple.svg)
 
 ![CI](https://github.com/yx811/Obsidian-BDN-Sync/actions/workflows/ci.yml/badge.svg)
 
@@ -875,7 +875,7 @@ BDNSync 的核心是三向对比决策矩阵，对比以下三个版本：
 | 类别    | 技术                                                    | 说明                                      |
 | ----- | ----------------------------------------------------- | --------------------------------------- |
 | 语言    | TypeScript（strict 严格模式）                               | 类型安全                                    |
-| 宿主平台  | [Obsidian](https://obsidian.md) 1.4.0+（Electron 桌面端）  | 插件 API：`requestUrl`、`Notice`、`Plugin` 等 |
+| 宿主平台  | [Obsidian](https://obsidian.md) 1.13.7+（Electron 桌面端）  | 插件 API：`requestUrl`、`Notice`、`Plugin` 等 |
 | 构建工具  | [esbuild](https://esbuild.github.io/)                 | 打包为 CJS，支持 tree-shaking / minify        |
 | 测试框架  | [Vitest](https://vitest.dev/)                         | 单元测试 + 集成测试                             |
 | 代码规范  | ESLint + Prettier + EditorConfig                      | 统一风格                                    |
@@ -938,7 +938,7 @@ BDNSync 的核心是三向对比决策矩阵，对比以下三个版本：
 
 - Node.js >= 18
 - npm >= 9
-- Obsidian 1.4.0+
+- Obsidian 1.13.7+
 
 ### 常用命令
 
@@ -1094,7 +1094,7 @@ BDNSync 默认使用智能合并策略：
 
 ### Q: 支持哪些 Obsidian 版本？
 
-BDNSync 支持 Obsidian 1.4.0 及以上版本。插件本身可安装于桌面端与移动端，但流式代理等依赖 Node 运行时的功能仅在桌面端可用（详见[已知限制](#已知限制)）。
+BDNSync 支持 Obsidian 1.13.7 及以上版本。插件本身可安装于桌面端与移动端，但流式代理等依赖 Node 运行时的功能仅在桌面端可用（详见[已知限制](#已知限制)）。
 
 ### Q: 实时同步和自动同步有什么区别？
 

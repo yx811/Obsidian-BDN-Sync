@@ -52,6 +52,12 @@
 
 - 默认仅预勾选 `backup-dir`（风险 ≥1），`orphan-file` / `orphan-dir` 默认不勾选，最大限度降低误删
 
+### 发布元数据
+
+- 版本号：**1.0.2**；作者：**Game811**
+- 最低 Obsidian 版本：`minAppVersion` 由 `1.4.0` 提升为 **`1.13.7`**（`manifest.json` 与 `versions.json` 同步更新），要求 Obsidian 1.13.7 及以上
+- README 版本徽标、宿主平台说明、开发环境要求、FAQ 同步更新为 1.13.7+
+
 ---
 
 ## [1.0.1] - 2026-08-24
