@@ -113,9 +113,12 @@ export class RetryQueue {
     try {
       await this.flushFn(paths);
       // 成功路径会在各自同步流程里 markSuccess；这里不再重复移除
-    } catch {
+    } catch (e) {
       // flush 整体失败：基于快照恢复条目，attempts 在当前值上 +1（本次重试又失败），
       // 退避基数与 attempts 口径统一（去掉原逻辑「双重 +1 或重置为 1」的问题）。
+      // 保留本次失败的最新错误信息（审计：原逻辑丢失新错误，用户看到的永远是旧消息）
+      const newMsg = e instanceof Error ? e.message : String(e);
+      const newErrno = e instanceof BaiduApiError ? e.errno : undefined;
       for (const p of paths) {
         const prev = snapshot.get(p);
         const attempts = (prev?.attempts ?? 0) + 1;
@@ -123,8 +126,8 @@ export class RetryQueue {
           path: p,
           attempts,
           nextAt: Date.now() + computeDelay(attempts, 0),
-          lastError: prev?.lastError ?? '重试失败',
-          lastErrno: prev?.lastErrno,
+          lastError: newErrno !== undefined ? `errno=${newErrno} ${newMsg}` : newMsg,
+          lastErrno: newErrno ?? prev?.lastErrno,
         });
       }
       void this.persist();

@@ -366,12 +366,24 @@ export class BaiduAdapter {
     }
 
     const done = new Set(session.doneParts);
-    for (let i = 0; i < chunks.length; i++) {
-      if (done.has(i)) continue;
-      let ok = false;
-      for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+    // TS 收窄：worker 是 async 闭包会丢失外层 session 的非空性，这里先捕获为常量
+    const sess = session;
+    // 🚀 分片并发上传：百度 superfile2 允许乱序分片（partseq 标识顺序，create 时合并），
+    // 串行逐片上传（每片一次 HTTP 往返）在分片多时是速度瓶颈。这里按 uploadConcurrency
+    // 起固定 worker 池并发上传（默认 2-3，避免同一 uploadid 过多并发触发限流）。
+    const partConcurrency = Math.min(
+      3,
+      Math.max(1, this.settings().uploadConcurrency || 2),
+    );
+    let cursor = 0;
+    const partWorkers = Array.from({ length: partConcurrency }, async () => {
+      while (cursor < chunks.length) {
+        const i = cursor++;
+        if (done.has(i)) continue;
+        let ok = false;
+        for (let attempt = 0; attempt < 3 && !ok; attempt++) {
           try {
-            const r = await this.api.superfileUpload(remotePath, session.uploadid, i, chunks[i]);
+            const r = await this.api.superfileUpload(remotePath, sess.uploadid, i, chunks[i]);
             // 分片必须返回 md5 且与本地一致，缺 md5 视为失败（防「假成功」→ create errno=10）
             if (!r.md5) {
               throw new BaiduApiError(42111, `第 ${i + 1} 块未返回 MD5：${relPath}`);
@@ -381,24 +393,26 @@ export class BaiduAdapter {
             }
             ok = true;
           } catch (e) {
-          if (e instanceof BaiduApiError && e.errno === 42112 && attempt < 2) {
-            await sleep(1500);
-            continue;
+            if (e instanceof BaiduApiError && e.errno === 42112 && attempt < 2) {
+              await sleep(1500);
+              continue;
+            }
+            throw e;
           }
-          throw e;
         }
+        done.add(i);
+        // F1：持久化分块级进度，使崩溃重启后能续传而非从 precreate 重来
+        sess.doneParts = Array.from(done).sort((a, b) => a - b);
+        sess.doneBytes = sess.doneParts.reduce(
+          (sum, idx) => sum + (chunks[idx]?.length ?? 0),
+          0,
+        );
+        sess.blockMd5[i] = md5s[i];
+        opts.onPartDone?.(sess);
+        opts.onProgress?.(Math.min(sess.doneBytes, total), total);
       }
-      done.add(i);
-      session.doneParts = Array.from(done).sort((a, b) => a - b);
-      // F1：持久化分块级进度，使崩溃重启后能续传而非从 precreate 重来
-      session.doneBytes = session.doneParts.reduce(
-        (sum, idx) => sum + (chunks[idx]?.length ?? 0),
-        0,
-      );
-      session.blockMd5[i] = md5s[i];
-      opts.onPartDone?.(session);
-      opts.onProgress?.(Math.min((i + 1) * partSize, total), total);
-    }
+    });
+    await Promise.all(partWorkers);
 
     try {
       const created = await this.api.createFile(

@@ -10,14 +10,17 @@ import type {
   ConflictReportEntry,
   OrphanFinding,
   DeepScanResult,
+  ScanProgress,
 } from '../types';
 import { conflictKindText } from '../sync/conflict-resolver';
 import type { LocalStore } from '../storage/local-store';
-import { formatBytes, formatTime, runWithConcurrency } from '../util/misc';
+import { formatBytes, formatTime, runWithConcurrency, remoteParent } from '../util/misc';
 import {
   deleteOrphans,
   measureOrphans,
   pickOrphans,
+  parseOrphanSegments,
+  PLUGIN_INFRA_HARD_EXCLUDE,
   type OrphanEntry,
   type RemoteDirRow,
   type RemoteLister,
@@ -225,6 +228,8 @@ export class MassDeleteGuardModal extends Modal {
 /**
  * 强制全量同步确认：force-upload / force-download 会删除对侧多余文件，
  * 属于破坏性修复操作，执行前必须让用户明确确认意图与后果。
+ * 可选传入 plan（dry-run 计划），弹窗内会展示将上传/下载/删除/已校验一致的文件数量 + 样本列表，
+ * 让用户在点击"确认"前就预知这次 force 实际会产生哪些副作用，避免"点了没动作"的困惑感。
  */
 export class ForceSyncConfirmModal extends Modal {
   private resolveP: ((choice: 'confirm' | 'cancel') => void) | null = null;
@@ -232,6 +237,7 @@ export class ForceSyncConfirmModal extends Modal {
   constructor(
     app: App,
     private direction: 'force-upload' | 'force-download',
+    private plan: SyncPlanPreview | null = null,
   ) {
     super(app);
     this.modalEl.addClass('bdnsync-modal', 'bdnsync-guard-modal');
@@ -275,6 +281,67 @@ export class ForceSyncConfirmModal extends Modal {
           '本地索引错乱，需要以云端为准重新对齐',
         ];
     for (const it of items) list.createEl('div', { text: `· ${it}`, cls: 'bdnsync-guard-sample' });
+
+    // 计划概览（dry-run 抽样）：让用户点击"确认"前就能看到这次 force 实际会发生什么。
+    // 这是"提升强制覆盖能力"的关键 UX 反馈：很多用户误以为 force 没动作，其实是因为
+    // 所有文件已与对侧一致（哈希匹配）→ 全程"跳过"，不会触发任何上传/下载。
+    // 把 skipped/upload/download/delete 的真实数字摆出来，用户一眼就能看到 force 是
+    // 真的执行了对比、只是不需要传输而已。
+    if (this.plan) {
+      const p = this.plan;
+      const isUp = this.direction === 'force-upload';
+      const verified = p.skip;
+      const willAct =
+        (isUp ? p.upload + p.deleteRemote : p.download + p.deleteLocal) > 0;
+      const stats = body.createDiv({ cls: 'bdnsync-guard-stats' });
+      stats.createEl('div', {
+        text: willAct
+          ? '本次将执行（dry-run 计划）：'
+          : '本次 dry-run 计划：所有文件已与对侧一致，不会产生任何上传/下载/删除（仅刷新对账索引）。',
+        cls: 'bdnsync-guard-stats-title',
+      });
+      const grid = stats.createDiv({ cls: 'bdnsync-guard-stats-grid' });
+      const cell = (
+        label: string,
+        value: number,
+        accent: 'accent' | 'muted' | 'danger',
+      ) => {
+        const c = grid.createDiv({ cls: `bdnsync-guard-stat bdnsync-guard-stat-${accent}` });
+        c.createEl('div', { text: String(value), cls: 'bdnsync-guard-stat-value' });
+        c.createEl('div', { text: label, cls: 'bdnsync-guard-stat-label' });
+      };
+      if (isUp) {
+        cell('将上传', p.upload, 'accent');
+        cell('将删除云端', p.deleteRemote, p.deleteRemote > 0 ? 'danger' : 'muted');
+      } else {
+        cell('将下载', p.download, 'accent');
+        cell('将删除本地', p.deleteLocal, p.deleteLocal > 0 ? 'danger' : 'muted');
+      }
+      cell('已校验一致', verified, 'muted');
+      // 样本：直接把 buildPreviewPlan 已经抽好的前 12 个动作展示出来
+      if (p.samples.length > 0 && willAct) {
+        const sampleWrap = body.createDiv({ cls: 'bdnsync-guard-samples' });
+        sampleWrap.createEl('div', { text: '操作样本（前 12 项）：', cls: 'bdnsync-guard-samples-title' });
+        const opLabel: Record<string, string> = {
+          upload: '↑上传',
+          download: '↓下载',
+          'delete-local': '🗑删本地',
+          'delete-remote': '🗑删云端',
+          conflict: '⚠冲突',
+          skip: '跳过',
+        };
+        for (const s of p.samples) {
+          const row = sampleWrap.createDiv({ cls: 'bdnsync-guard-sample' });
+          row.createSpan({
+            text: opLabel[s.op] || s.op,
+            cls: `bdnsync-orphan-tag bdnsync-orphan-tag-${
+              s.op.startsWith('delete') ? 'danger' : s.op === 'conflict' ? 'warning' : 'info'
+            }`,
+          });
+          row.createSpan({ text: s.path, cls: 'bdnsync-guard-sample-path' });
+        }
+      }
+    }
 
     body.createEl('p', {
       cls: 'bdnsync-modal-subtitle',
@@ -1072,7 +1139,11 @@ export class OrphanCleanupModal extends Modal {
   private findings: OrphanFinding[] = []; // v2 三类合并命中（由 main.ts 预扫后传入）
   private scanStats: { scannedNodes: number; scannedBytes: number; truncated: boolean; durationMs: number; errors: { path: string; message: string }[] } | null = null;
   private selected = new Set<string>(); // fullPath 集合
-  private phase: 'scanning' | 'ready' | 'deleting' | 'done' = 'scanning';
+  /** 弹窗阶段。构造时为 'idle'——onOpen 仅渲染 shell，v2 主入口随后调 startDeepScan 才进入 'scanning'。
+   *  注意：历史版本曾默认 'scanning'，结果 v2 路径（onOpen 不渲染 body）下 main.ts 紧接着调 startDeepScan，
+   *  其首行守卫 `if (this.phase === 'scanning') return;` 直接吞掉调用，导致弹窗 body 永远空白。
+   *  改为 'idle' 起始可彻底避免该竞态。 */
+  private phase: 'idle' | 'scanning' | 'ready' | 'deleting' | 'done' = 'idle';
   private summary = { total: 0, totalBytes: 0, selectedCount: 0, selectedBytes: 0 };
   private deleteResult: { ok: string[]; failed: { path: string; error: string; errno?: number }[] } | null = null;
   private bodyEl!: HTMLElement;
@@ -1083,6 +1154,19 @@ export class OrphanCleanupModal extends Modal {
   private useRecycleBin = true;
   /** v2.1：最后一次成功扫描的结果快照（main.ts 的 onComplete 审计从此处读取 findings/stats）。 */
   lastScan: { findings: OrphanFinding[]; stats: NonNullable<OrphanCleanupModal['scanStats']> } | null = null;
+  /** 扫描阶段实时计时器：每秒刷新"已用 N 秒"，避免用户在 vault 大库 / 网络慢时误以为卡死 */
+  private scanTimerHandle: number | null = null;
+  private scanStartAt = 0;
+  /** 扫描超时上限（ms）：超过则强制 abort + 提示（防 walkRemoteTree 在某个 listDir 永久挂起） */
+  private readonly SCAN_TIMEOUT_MS = 60_000;
+  private scanAborted = false;
+  /** 扫描阶段按钮引用：实时更新取消/超时文案 */
+  private scanCancelBtn?: HTMLButtonElement;
+  private scanStatusLine?: HTMLElement;
+  /** 最近一次扫描进度快照（由 updateScanProgress 写入，供 1Hz 计时器重绘秒数） */
+  private lastProgress?: ScanProgress;
+  /** 本次扫描产物中的非致命诊断警告（如父目录不可读·搜索兜底找回 N 个孤儿），用于 0 候选面板解释 */
+  private lastWarnings: string[] = [];
 
   constructor(
     app: App,
@@ -1170,6 +1254,9 @@ export class OrphanCleanupModal extends Modal {
   }
 
   onClose(): void {
+    // 关键：modal 关闭（用户点 X / 取消 / 主动关闭）时立即停掉扫描计时器，
+    // 避免"orphan modal 关闭后 setInterval 仍每 1s 刷新已经 detached 的 DOM"
+    this.stopScanTimer();
     this.opts.onComplete?.({
       cancelled: this.phase !== 'done',
       okCount: this.deleteResult?.ok.length ?? 0,
@@ -1201,38 +1288,50 @@ export class OrphanCleanupModal extends Modal {
   /** v2.1：主入口调用的「后台深度扫描」入口。先展示「正在扫描…」，扫描完成后回填列表。
    *  U1 修复：扫描不再阻塞弹窗打开（main.ts 先 open 再调本方法），用户能实时看到进度状态。 */
   async startDeepScan(scanFn: () => Promise<DeepScanResult>): Promise<void> {
+    // 🟡#17 自守卫：避免「自动巡检 + 手动打开」或重复点击导致同一弹窗并发两次深度扫描
+    // （双扫描会竞态覆盖 this.findings / scanStats，结果不确定）。已在扫描中则直接忽略。
+    // 关键：用 scanStartAt>0 判断「真的跑过了」，不再用 phase==='scanning'——后者在 modal 构造时
+    // 也是 'scanning'（旧版），会让 main.ts 紧接着的首次调用被早 return，导致 body 永远空白。
+    if (this.scanStartAt > 0 && !this.scanAborted && Date.now() - this.scanStartAt < this.SCAN_TIMEOUT_MS) {
+      return;
+    }
     this.phase = 'scanning';
+    this.scanStartAt = Date.now();
+    this.scanAborted = false;
+    this.lastProgress = undefined;
     this.renderBody();
     this.renderFooter();
+    // 启动 1Hz 计时器：实时刷新"已用 N 秒"——避免大库扫描时用户以为弹窗卡死
+    this.startScanTimer();
+    // 启动超时保险：60s 后若仍在扫描则 abort + 提示（防止 walkRemoteTree 在某个 listDir 永久挂起）
+    const timeoutHandle = window.setTimeout(() => {
+      if (this.phase === 'scanning' && !this.scanAborted) {
+        this.scanAborted = true;
+        this.stopScanTimer();
+        this.phase = 'done';
+        if (this.scanStatusLine) {
+          this.scanStatusLine.setText('扫描超时（>60s）已自动取消，请检查网络或改用更浅的扫描模式');
+        }
+        if (this.scanCancelBtn) {
+          this.scanCancelBtn.setText('关闭');
+          this.scanCancelBtn.disabled = false;
+        }
+        this.bodyEl.empty();
+        this.bodyEl.createEl('p', {
+          cls: 'bdnsync-modal-subtitle',
+          text: '扫描超时：超过 60 秒未返回。可能原因：网络受限、网盘响应慢、扫描模式太深。建议改用「父目录单层」模式重试，或到设置里调高「扫描并发数 / 减少节点预算」。',
+        });
+      }
+    }, this.SCAN_TIMEOUT_MS);
     try {
       const result = await scanFn();
-      // autoMode（同步结束/启动巡检）：按保留天数过滤，只保留「超过保留期」的候选——
-      // 保留期内的备份可能是近期合法活动产物，不应在巡检中弹出（与 legacy scan() 行为对齐）。
-      let findings = result.findings;
-      if (this.opts.autoMode && (this.opts.retentionDays ?? 0) > 0) {
-        const cutoff = Date.now() - (this.opts.retentionDays ?? 0) * 24 * 3600 * 1000;
-        findings = findings.filter((f) => f.mtime === 0 || f.mtime < cutoff);
-      }
-      // F4 修复：目录类候选缺省 bytes=0，测量补齐后再展示
-      const measured = await this.measureDirFindings(findings);
-      this.findings = measured;
-      this.scanStats = {
-        scannedNodes: result.scannedNodes,
-        scannedBytes: result.scannedBytes,
-        truncated: result.truncated,
-        durationMs: result.durationMs,
-        errors: result.errors,
-      };
-      this.lastScan = { findings: this.findings, stats: this.scanStats };
-      this.phase = 'ready';
-      // 按 risk ≥ 1 默认勾选；orphan-file/orphan-dir（risk=0）默认不勾（保守）
-      for (const f of this.findings) {
-        if (f.risk >= 1) this.selected.add(f.fullPath);
-      }
-      this.recomputeSummary();
-      this.renderBody();
-      this.renderFooter();
+      window.clearTimeout(timeoutHandle);
+      this.stopScanTimer();
+      if (this.scanAborted) return; // 用户已点取消
+      await this.applyPreScanned(result);
     } catch (e) {
+      window.clearTimeout(timeoutHandle);
+      this.stopScanTimer();
       this.phase = 'done';
       this.bodyEl.empty();
       this.bodyEl.createEl('p', {
@@ -1244,6 +1343,110 @@ export class OrphanCleanupModal extends Modal {
         .createEl('button', { text: '关闭', cls: 'bdnsync-btn' })
         .addEventListener('click', () => this.close());
     }
+  }
+
+  /** 实时扫描进度回调（由 main.ts 的 runOrphanScan → walkRemoteTree.onProgress 调用）。
+   *  仅记录快照并触发单行重绘；真正的文本合成在 renderScanStatusLine 中。 */
+  updateScanProgress(info: ScanProgress): void {
+    this.lastProgress = info;
+    this.renderScanStatusLine();
+  }
+
+  /** 合成扫描状态行文本：已用秒数 + 已扫描节点数 + 当前路径。供 onProgress 与 1Hz 计时器共用。 */
+  private renderScanStatusLine(): void {
+    if (this.phase !== 'scanning' || !this.scanStatusLine) return;
+    const sec = Math.floor((Date.now() - this.scanStartAt) / 1000);
+    const info = this.lastProgress;
+    let path = info?.currentPath ? ` · ${info.currentPath}` : '';
+    if (path.length > 56) path = path.slice(0, 53) + '…';
+    this.scanStatusLine.setText(`正在扫描…已用 ${sec}s · 已扫描 ${info?.scannedNodes ?? 0} 节点${path}`);
+  }
+
+  /** 启动 1Hz 扫描计时器：实时刷新"已用 N 秒"与节点数。
+   *  调用前已确保 bodyEl/renderBody 已就绪。 */
+  private startScanTimer(): void {
+    this.stopScanTimer();
+    this.scanTimerHandle = window.setInterval(() => {
+      this.renderScanStatusLine();
+    }, 1000);
+  }
+
+  private stopScanTimer(): void {
+    if (this.scanTimerHandle !== null) {
+      window.clearInterval(this.scanTimerHandle);
+      this.scanTimerHandle = null;
+    }
+  }
+
+  /**
+   * 回填扫描结果（供 startDeepScan 与「钩子预扫后直接打开」复用，避免二次扫描）。
+   * autoMode（同步后/启动巡检）会按保留天数过滤；若过滤后仍无候选则直接关闭弹窗，
+   * 不展示无意义的空弹窗。
+   */
+  async applyPreScanned(result: DeepScanResult): Promise<void> {
+    // autoMode：按保留天数过滤，只保留「超过保留期」的候选——保留期内的备份可能是
+    // 近期合法活动产物，不应在巡检中弹出（与 legacy scan() 行为对齐）。
+    let findings = result.findings;
+    if (this.opts.autoMode && (this.opts.retentionDays ?? 0) > 0) {
+      const cutoff = Date.now() - (this.opts.retentionDays ?? 0) * 24 * 3600 * 1000;
+      findings = findings.filter((f) => f.mtime === 0 || f.mtime < cutoff);
+    }
+    // 0 候选：autoMode 直接关闭（保留原行为）；manual 模式也立即关闭，避免用户看到
+    // 空弹窗或"按 ESC 都不动"的困惑（旧的 renderBody 在 activeCount=0 时仅显示一行灰字，
+    // 不但无法操作还会遮挡 sync 完成提示，是用户「orphan 弹窗一直不开」的真实感受）。
+    if (findings.length === 0) {
+      const statsText = result.scannedNodes > 0
+        ? `已扫描 ${result.scannedNodes} 个节点（耗时 ${result.durationMs} ms）`
+        : '已扫描完成';
+      // 记录诊断警告：父目录层不可读 → 搜索兜底找回 N 个孤儿 等（用于下方 0 候选面板解释）
+      this.lastWarnings = result.warnings ?? [];
+      // 先填 lastScan，让 onClose 回调中的审计能拿到真实扫描统计（无论自动/手动路径）。
+      this.scanStats = {
+        scannedNodes: result.scannedNodes,
+        scannedBytes: result.scannedBytes,
+        truncated: result.truncated,
+        durationMs: result.durationMs,
+        errors: result.errors,
+      };
+      this.findings = [];
+      this.lastScan = { findings: [], stats: this.scanStats };
+      // 自动巡检：保持静默关闭，避免例行巡检弹出无意义空弹窗
+      if (this.opts.autoMode) {
+        const text = `orphan 巡检：未发现需清理的孤儿备份（${statsText}），不弹窗`;
+        // 与 engine.ts:248 同样的延迟 require 兜底——避免模块顶层依赖 obsidian
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const NoticeCtor = (globalThis as any).require?.('obsidian')?.Notice;
+        if (NoticeCtor) new NoticeCtor(text, 4000);
+        this.phase = 'done';
+        this.close();
+        return;
+      }
+      // 手动模式：不再静默关闭！改为展示透明结果面板 + 手动路径录入入口，
+      // 让用户即便"扫描接口读不到"也能凭截图里的绝对路径把孤儿加进来清理。
+      this.phase = 'ready';
+      this.renderBody();
+      this.renderFooter();
+      return;
+    }
+    // F4 修复：目录类候选缺省 bytes=0，测量补齐后再展示
+    const measured = await this.measureDirFindings(findings);
+    this.findings = measured;
+    this.scanStats = {
+      scannedNodes: result.scannedNodes,
+      scannedBytes: result.scannedBytes,
+      truncated: result.truncated,
+      durationMs: result.durationMs,
+      errors: result.errors,
+    };
+    this.lastScan = { findings: this.findings, stats: this.scanStats };
+    this.phase = 'ready';
+    // 按 risk ≥ 1 默认勾选；orphan-file/orphan-dir（risk=0）默认不勾（保守）
+    for (const f of this.findings) {
+      if (f.risk >= 1) this.selected.add(f.fullPath);
+    }
+    this.recomputeSummary();
+    this.renderBody();
+    this.renderFooter();
   }
 
   /** F4 修复：目录类候选（backup-dir / orphan-dir）缺省 bytes=0，用单层测量（measureOrphans）补齐。 */
@@ -1271,6 +1474,68 @@ export class OrphanCleanupModal extends Modal {
       if (m.measureError) return { ...f, measureError: true };
       return { ...f, bytes: m.totalBytes };
     });
+  }
+
+  /**
+   * 手动路径录入：扫描接口读不到父目录层时（errno=-9）的逃生舱。
+   * 用户从网盘截图里复制孤儿目录的绝对路径粘贴进来，工具测量大小并加入待清理清单（默认勾选）。
+   * 安全护栏：拒绝非绝对路径、同步根/父目录本身、受保护基础设施目录（.bdnsync* 等）。
+   */
+  private async addManualPath(raw: string): Promise<void> {
+    const path = raw.trim();
+    if (!path) return;
+    if (!path.startsWith('/')) {
+      new Notice('请提供绝对路径（以 / 开头），如 /apps/bdnsync/Obsidian Vault_20260825_011832');
+      return;
+    }
+    const name = path.slice(path.lastIndexOf('/') + 1);
+    if (!name) {
+      new Notice('路径无效：缺少目录名');
+      return;
+    }
+    if (path === this.parentDir || path === `${this.parentDir}/${this.vaultName}`) {
+      new Notice('不能把同步根 / 父目录本身加入清理');
+      return;
+    }
+    if (PLUGIN_INFRA_HARD_EXCLUDE.has(name)) {
+      new Notice(`「${name}」是插件受保护目录，绝不能清理`);
+      return;
+    }
+    const parsed = parseOrphanSegments(name, this.vaultName);
+    const entry: OrphanEntry = {
+      fullPath: path,
+      name,
+      segments: parsed.matched ? parsed.segments : 0,
+      risk: parsed.matched ? parsed.risk : 1, // 非命名型也允许手动加入（用户已确认是孤儿）
+      mtime: 0,
+      fileCount: 0,
+      totalBytes: 0,
+    };
+    const measured = await measureOrphans(this.lister, [entry]);
+    const m = measured[0];
+    const finding: OrphanFinding = {
+      kind: 'backup-dir',
+      fullPath: path,
+      name,
+      parentPath: remoteParent(path),
+      relPath: '',
+      depth: 0,
+      bytes: m?.measureError ? 0 : m?.totalBytes ?? 0,
+      mtime: 0,
+      risk: entry.risk,
+      reason: parsed.matched
+        ? '手动指定（已被识别为命名型孤儿）'
+        : '手动指定路径（请确认确为孤儿）',
+      segments: entry.segments,
+      origin: 'parent',
+      measureError: m?.measureError,
+    };
+    this.findings.push(finding);
+    this.selected.add(path);
+    this.recomputeSummary();
+    this.renderBody();
+    this.renderFooter();
+    new Notice(`已添加「${name}」${m?.measureError ? '（测量失败，请核对）' : `（${formatBytes(finding.bytes)}）`}到待清理清单`);
   }
 
   /**
@@ -1375,13 +1640,43 @@ export class OrphanCleanupModal extends Modal {
   private renderBody(): void {
     this.bodyEl.empty();
     if (this.phase === 'scanning' || this.phase === 'deleting') {
-      this.bodyEl.createEl('p', {
-        cls: 'bdnsync-modal-subtitle',
-        text:
-          this.phase === 'scanning'
-            ? '正在扫描…'
-            : `正在删除（剩 ${this.summary.total - this.summary.selectedCount} 条未选中）…`,
-      });
+      if (this.phase === 'scanning') {
+        // 扫描期：实时显示"已用 N 秒" + 状态提示 + 取消按钮
+        const wrap = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-scan-progress' });
+        // 旋转图标占位
+        const icon = wrap.createSpan({ cls: 'bdnsync-orphan-scan-spinner' });
+        setIcon(icon, 'refresh-cw', 24);
+        // 状态行：实时计时（由 startScanTimer 每秒刷新）
+        this.scanStatusLine = wrap.createEl('p', {
+          cls: 'bdnsync-modal-subtitle',
+          text: '正在扫描…已用 0 秒',
+        });
+        wrap.createEl('p', {
+          cls: 'bdnsync-callout-text',
+          text: '扫描大库时可能耗时数十秒到数分钟；超过 60 秒将自动取消。',
+        });
+        // 取消按钮（用户主动放弃：清掉守卫，不让弹窗"卡死"）
+        this.scanCancelBtn = wrap.createEl('button', {
+          text: '取消扫描',
+          cls: 'bdnsync-btn',
+        });
+        this.scanCancelBtn.addEventListener('click', () => {
+          this.scanAborted = true;
+          this.stopScanTimer();
+          this.phase = 'done';
+          this.bodyEl.empty();
+          this.bodyEl.createEl('p', {
+            cls: 'bdnsync-modal-subtitle',
+            text: '已取消扫描',
+          });
+          this.renderFooter();
+        });
+      } else {
+        this.bodyEl.createEl('p', {
+          cls: 'bdnsync-modal-subtitle',
+          text: `正在删除 ${this.summary.selectedCount} 项…`,
+        });
+      }
       return;
     }
     if (this.phase === 'done' && this.deleteResult) {
@@ -1389,7 +1684,7 @@ export class OrphanCleanupModal extends Modal {
       const sum = createCard(this.bodyEl, 'bdnsync-orphan-summary');
       sum.createEl('p', {
         cls: 'bdnsync-callout-text',
-        text: `✓ 成功删除 ${ok.length} 个目录`,
+        text: `✓ 成功删除 ${ok.length} 项`,
       });
       if (failed.length > 0) {
         sum.createEl('p', {
@@ -1467,9 +1762,53 @@ export class OrphanCleanupModal extends Modal {
       break;
     }
     if (activeCount === 0) {
-      this.bodyEl.createEl('p', {
+      const wrap = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-empty' });
+      wrap.createEl('p', {
         cls: 'bdnsync-modal-subtitle',
-        text: '没有发现疑似孤儿备份目录。扫描范围：' + this.parentDir,
+        text: '没有发现疑似孤儿备份目录（已完成扫描）。',
+      });
+      // 诊断块：扫描期发生的非致命警告（如父目录层不可读、搜索兜底找回了 N 个孤儿）
+      if (this.lastWarnings.length > 0) {
+        const w = wrap.createDiv({ cls: 'bdnsync-orphan-warnings' });
+        w.createEl('div', { text: '⚠️ 扫描诊断：', cls: 'bdnsync-orphan-warnings-title' });
+        for (const line of this.lastWarnings) {
+          w.createEl('div', { text: '· ' + line, cls: 'bdnsync-orphan-warnings-row' });
+        }
+      }
+      // 扫描错误（若有）
+      if (this.scanStats && this.scanStats.errors.length > 0) {
+        const w = wrap.createDiv({ cls: 'bdnsync-orphan-warnings' });
+        w.createEl('div', { text: '扫描期错误：', cls: 'bdnsync-orphan-warnings-title' });
+        for (const e of this.scanStats.errors.slice(0, 5)) {
+          w.createEl('div', { text: `· ${e.path} (${e.message})`, cls: 'bdnsync-orphan-warnings-row' });
+        }
+      }
+      // 直接回答用户的疑问：为何"自身的备份"不在候选里
+      const note = wrap.createDiv({ cls: 'bdnsync-orphan-source-hint' });
+      note.createEl('div', { text: '为什么看不到我网盘里的孤儿目录？', cls: 'bdnsync-orphan-source-hint-title' });
+      const notes = [
+        '插件自身的保留期备份（.bdnsync / .bdnsync-backup 等）是被「刻意保护、绝不清理」，并非被"排除扫描"——它们本来就不该出现在候选里。',
+        '真正的孤儿是指「vault 名 + 下划线 + 时间戳」的目录（如 Obsidian Vault_20260825_011832）。若它们存在却扫描不到，通常是父目录层（/apps/bdnsync）被百度接口限制为不可列（errno=-9）。',
+        '本版本已对此增加「搜索接口兜底」：当 list 读不到父目录时，自动改用搜索找回孤儿目录。若仍扫描不到，请用下方入口手动粘贴绝对路径。',
+      ];
+      for (const n of notes) note.createEl('div', { text: n, cls: 'bdnsync-orphan-source-hint-row' });
+      // 手动路径录入入口（扫描接口读不到时的逃生舱）
+      const inputRow = wrap.createDiv({ cls: 'bdnsync-orphan-manual' });
+      const input = inputRow.createEl('input', {
+        type: 'text',
+        cls: 'bdnsync-orphan-manual-input',
+        attr: {
+          placeholder: '粘贴孤儿目录的绝对路径，如 /apps/bdnsync/Obsidian Vault_20260825_011832',
+        },
+      });
+      const addBtn = inputRow.createEl('button', { text: '添加并测量', cls: 'bdnsync-btn' });
+      addBtn.addEventListener('click', () => void this.addManualPath(input.value.trim()));
+      input.addEventListener('keydown', (ev) => {
+        if ((ev as KeyboardEvent).key === 'Enter') void this.addManualPath(input.value.trim());
+      });
+      wrap.createEl('p', {
+        cls: 'bdnsync-callout-text',
+        text: '提示：如果你在网盘里能直接看到孤儿目录、但本工具扫描不到，可手动粘贴其完整绝对路径，由工具测量大小并加入待清理清单（加入后默认勾选）。',
       });
       return;
     }
@@ -1899,16 +2238,34 @@ export class OrphanCleanupModal extends Modal {
   private async confirmAndDelete(): Promise<void> {
     const selectedItems = this.collectSelectedAsOrphanEntries();
     if (selectedItems.length === 0) return;
+    // 🟡#9：扫描被截断（触达节点/字节预算上限）时，目录类孤儿（orphan-dir）可能漏扫活跃文件，
+    // 误删风险高。截断时拒绝删除目录类候选，仅允许 orphan-file（单文件判断不依赖遍历完整性）。
+    // naming 型 backup-dir 不依赖遍历完整性，仍可删除。
+    let toDelete = selectedItems;
+    if (this.scanStats?.truncated) {
+      const blocked = new Set<string>();
+      for (const f of this.findings) {
+        if (this.selected.has(f.fullPath) && f.kind === 'orphan-dir') blocked.add(f.fullPath);
+      }
+      if (blocked.size > 0) {
+        new Notice(
+          `BDNSync：本次扫描已被截断，为安全起见未删除 ${blocked.size} 个目录类候选（可能漏扫活跃文件）。请提高扫描预算或分批后再清理。`,
+          9000,
+        );
+        toDelete = toDelete.filter((it) => !blocked.has(it.fullPath));
+      }
+    }
+    if (toDelete.length === 0) return;
     const threshold = this.opts.bulkConfirmThreshold ?? 50;
-    if (selectedItems.length >= threshold) {
-      const ok = await this.askBulkConfirm(selectedItems.length);
+    if (toDelete.length >= threshold) {
+      const ok = await this.askBulkConfirm(toDelete.length);
       if (!ok) return;
     }
 
     this.phase = 'deleting';
     this.renderBody();
     this.renderFooter();
-    this.deleteResult = await deleteOrphans(this.deleter, selectedItems, {
+    this.deleteResult = await deleteOrphans(this.deleter, toDelete, {
       confirmedByUser: true,
       retries: 2,
       delayMs: 300,

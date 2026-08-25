@@ -1,6 +1,6 @@
 // BDNSync 插件入口：生命周期、命令、事件、调度器、新 UI 集成
 
-import { Modal, Notice, Plugin, TAbstractFile, TFile } from 'obsidian';
+import { Modal, Notice, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
 import {
   BaiduApi,
   parseCookieField,
@@ -42,6 +42,8 @@ import {
   type DeepScanOptions,
   type DeepScanResult,
   type OrphanFinding,
+  type SyncPlanPreview,
+  type ScanProgress,
 } from './types';
 import {
   PathFilter,
@@ -231,6 +233,16 @@ export default class BDNSyncPlugin extends Plugin {
         // rename = oldPath 删除 + newPath 创建：两路都交给 onLocalChange（watcher 内部会做重命名配对）
         onFileChanged(oldPath);
         if (f instanceof TFile) onFileChanged(f.path);
+        // 目录重命名：新路径的目录需在云端补建（空目录同步修复点）
+        if (f instanceof TFolder) this.ensureRemoteFolder(f.path);
+      }),
+    );
+    // 目录创建：Obsidian 仅对 TFolder 发 create 事件（新建笔记时可能自动建空子目录）。
+    // 此前同步链路只监听 TFile，本地空文件夹永远不会同步到云端。这里补建云端目录，
+    // 放松同步限制（原不同步空目录 → 现在允许空目录同步）。
+    this.registerEvent(
+      this.app.vault.on('create', (f: TAbstractFile) => {
+        if (f instanceof TFolder) this.ensureRemoteFolder(f.path);
       }),
     );
 
@@ -678,25 +690,48 @@ export default class BDNSyncPlugin extends Plugin {
     // 防重入短路：引擎已在同步时，直接返回「占用中」结果，不再走到预览弹窗/配额
     // 查询等后续步骤（否则连续点击「立即同步」会重复 buildPreviewPlan + 重复弹窗，
     // 且每次都会重复「已有同步正在进行」Notice）。
+    // 例外：force 方向（强制上传/下载）需等待进行中的同步结束后再继续，否则会被
+    // busy 守卫静默吞掉，导致用户点击「强制同步」却无任何动作（🔴协调）。
     if (this.engine?.isBusy()) {
-      this.statusBar.setSyncing('同步进行中…');
-      this.log('info', '同步被跳过：已有同步进行中');
-      // 用户主动点击同步时给出明确反馈（限频：3 秒内同文案不重复弹，避免连点刷屏）
-      if (trigger === 'manual') this.notifyBusy('BDNSync：已有同步正在进行，请稍候。完成后再试即可。', 4000);
-      return {
-        ok: false,
-        cancelled: true,
-        uploaded: 0,
-        downloaded: 0,
-        deletedLocal: 0,
-        deletedRemote: 0,
-        conflicts: 0,
-        skipped: 0,
-        errors: 0,
-        bytesUp: 0,
-        bytesDown: 0,
-        errorMessages: [],
-      };
+      if (direction !== 'bidirectional') {
+        const released = await this.waitForIdle(20000);
+        if (!released || this.engine?.isBusy()) {
+          this.logM('general', 'info', 'warn', `强制同步：等待进行中的同步${released ? '后仍忙碌' : '超时'}，已放弃`);
+          return {
+            ok: false,
+            cancelled: true,
+            uploaded: 0,
+            downloaded: 0,
+            deletedLocal: 0,
+            deletedRemote: 0,
+            conflicts: 0,
+            skipped: 0,
+            errors: 0,
+            bytesUp: 0,
+            bytesDown: 0,
+            errorMessages: [],
+          };
+        }
+      } else {
+        this.statusBar.setSyncing('同步进行中…');
+        this.log('info', '同步被跳过：已有同步进行中');
+        // 用户主动点击同步时给出明确反馈（限频：3 秒内同文案不重复弹，避免连点刷屏）
+        if (trigger === 'manual') this.notifyBusy('BDNSync：已有同步正在进行，请稍候。完成后再试即可。', 4000);
+        return {
+          ok: false,
+          cancelled: true,
+          uploaded: 0,
+          downloaded: 0,
+          deletedLocal: 0,
+          deletedRemote: 0,
+          conflicts: 0,
+          skipped: 0,
+          errors: 0,
+          bytesUp: 0,
+          bytesDown: 0,
+          errorMessages: [],
+        };
+      }
     }
     if (!this.engine || !navigator.onLine) {
       if (!navigator.onLine) this.statusBar.setOffline();
@@ -712,6 +747,26 @@ export default class BDNSyncPlugin extends Plugin {
         bytesUp: 0,
         bytesDown: 0,
         errorMessages: [!navigator.onLine ? '当前离线' : '引擎未初始化'],
+      };
+    }
+    // 🟡#5：未配置连接时 fullSync 会返回 null（与「busy」同源），下方「!result → 已有同步进行中」
+    // 会把「未配置」误标为「占用中」，误导用户。这里提前给出明确提示并短路，避免混淆。
+    if (!this.hasAuth()) {
+      this.statusBar.setError('未配置连接');
+      new Notice('BDNSync：请先在设置中配置百度网盘连接');
+      this.logM('general', 'info', 'warn', '同步被跳过：未配置百度网盘连接');
+      return {
+        ok: false,
+        uploaded: 0,
+        downloaded: 0,
+        deletedLocal: 0,
+        deletedRemote: 0,
+        conflicts: 0,
+        skipped: 0,
+        errors: 1,
+        bytesUp: 0,
+        bytesDown: 0,
+        errorMessages: ['未配置百度网盘连接'],
       };
     }
     // 配额告警：手动/启动时预检云端空间，避免同步中途因配额耗尽失败
@@ -785,7 +840,7 @@ export default class BDNSyncPlugin extends Plugin {
         const result = await this.engine!.fullSync(trigger, direction);
         if (!result || result.cancelled) {
           this.statusBar.setIdle();
-          if (!result) this.log('info', '同步被跳过（已有同步进行中）');
+          if (!result) this.log('info', '同步被跳过：已有同步进行中');
           return (
             result ?? {
               ok: false,
@@ -805,6 +860,13 @@ export default class BDNSyncPlugin extends Plugin {
         } else if (result.ok) {
           this.statusBar.setDone(this.summaryText(result));
           this.logM('engine', 'info', 'info', `同步完成：${this.summaryText(result)}`);
+          // 🔴 仅当本次同步产生了「需要用户手动裁决」的草稿（pending-merge）才自动打开
+          // 冲突面板，避免每次同步结束都被骚扰：
+          //   - pending-merge：smart-merge 内嵌用户冲突标记，需手动合并 → 必然需要操作
+          //   - 其它未 resolved（如 ask-me 策略产生）：用户已选择询问，本就在被弹
+          //   - 全自动合并成功：仅发 Notice 提示，不弹窗
+          // 同步失败 / 取消 / 网络异常一律不弹，避免误导用户。
+          void this.maybeOpenConflictPanelAfterSync();
         } else {
           this.statusBar.setError(result.errorMessages[0] || '未知错误');
           this.logM(
@@ -852,17 +914,48 @@ export default class BDNSyncPlugin extends Plugin {
     });
   }
 
-  /** 强制全量同步（本地覆盖云端 / 云端覆盖本地）：破坏性修复操作，先确认再执行 */
-  async forceSync(direction: 'force-upload' | 'force-download'): Promise<void> {
-    if (this.engine && this.engine.isBusy()) {
-      new Notice('BDNSync：已有同步正在进行，请稍候');
-      return;
+  /** 强制全量同步（本地覆盖云端 / 云端覆盖本地）：破坏性修复操作，先确认再执行。
+   * 改造：先 dry-run 计算 SyncPlanPreview，让确认弹窗把"将上传/下载/删除/已校验一致"摆出来，
+   * 避免"点了 force 提示'无变更'"带来的困惑——其实是没有需要传输/删除的文件，全程都跳过而已。*/
+  /** 轮询等待引擎空闲（最多 timeoutMs）。用于「强制同步」等需要抢占锁的场景，
+   *  避免被 busy 守卫静默吞掉。返回 true=已空闲，false=超时仍在忙。 */
+  private async waitForIdle(timeoutMs: number): Promise<boolean> {
+    const start = Date.now();
+    while (this.engine?.isBusy()) {
+      if (Date.now() - start > timeoutMs) return false;
+      await new Promise((r) => setTimeout(r, 200));
     }
+    return true;
+  }
+
+  async forceSync(direction: 'force-upload' | 'force-download'): Promise<void> {
     if (!this.hasAuth()) {
       new Notice('BDNSync：请先在设置中配置百度网盘连接');
       return;
     }
-    const modal = this.openExclusive('force-sync-confirm', () => new ForceSyncConfirmModal(this.app, direction));
+    // 等待进行中的同步结束，避免「强制同步」被 busy 守卫静默吞掉
+    // （用户日志中 force-upload 被「已有同步进行中」拦截的根因）。
+    if (this.engine?.isBusy()) {
+      const released = await this.waitForIdle(20000);
+      if (!released) {
+        new Notice('BDNSync：同步等待超时，请稍后重试');
+        this.logM('general', 'info', 'warn', '强制同步：等待进行中的同步超时，已放弃');
+        return;
+      }
+    }
+    // 先 dry-run 一份计划（不发起任何写入），让弹窗展示"这次 force 实际会做什么"。
+    // 若引擎未就绪或网络不通，回退成无计划的纯净确认弹窗（维持旧行为兜底）。
+    let plan: SyncPlanPreview | null = null;
+    if (this.engine) {
+      try {
+        plan = await this.engine.buildPreviewPlan(direction);
+      } catch (e) {
+        // dry-run 失败不阻断 force 流程（罕见的网络/解析异常都能让用户继续确认）
+        this.log('info', `[dry-run 跳过] 强制同步预览失败，将不展示计划：${e instanceof Error ? e.message : String(e)}`);
+        plan = null;
+      }
+    }
+    const modal = this.openExclusive('force-sync-confirm', () => new ForceSyncConfirmModal(this.app, direction, plan));
     if (!modal) return; // 已有确认弹窗打开，忽略本次连点
     const confirm = await modal.open();
     if (confirm !== 'confirm') {
@@ -929,10 +1022,21 @@ export default class BDNSyncPlugin extends Plugin {
           this.log('error', `保存同步失败：${(result.errorMessages || []).join('；')}`);
           return;
         }
-        // ok=true：全量成功（errors===0）
-        this.dirtySet.clearPaths(allPaths);
-        this.statusBar.setDone(`同步完成（${allPaths.length}）`);
-        this.log('info', `保存同步完成：${allPaths.length} 个文件`);
+        // ok=true：本次增量同步无内部错误。只清除 quickSync「已确认处理」的文件
+        // （upload/download/delete 或判定为已一致）；其余（因 busy / 无凭据 / 用户取消等
+        // 被 bail 的文件）保留在脏集合中，待下次 flush 补齐——避免「被跳过却误清空脏集合」
+        // 导致改动永久丢失（🔴#3）。
+        this.dirtySet.clearPaths(Array.from(successSet));
+        if (successSet.size === allPaths.length) {
+          this.statusBar.setDone(`同步完成（${allPaths.length}）`);
+          this.log('info', `保存同步完成：${allPaths.length} 个文件`);
+        } else if (successSet.size > 0) {
+          this.statusBar.setDone(`同步完成（${successSet.size}/${allPaths.length}）`);
+          this.log('info', `保存同步完成：${successSet.size} 个文件，其余将在下次补齐`);
+        } else {
+          // 增量判定无需变更或暂挂：保留路径，等下次 flush 重新评估
+          this.logM('general', 'info', 'debug', `保存同步暂未变更 ${allPaths.length} 个文件，保持待同步`);
+        }
       } catch (e) {
         // quickSync 内部已吞掉异常并转为 SyncResult，此处仅捕获「quickSync 之外的异常」
         // （如 dirtySet/statusBar 调用异常）。无法获知部分成功集，保守整组 keep+重试。
@@ -983,6 +1087,28 @@ export default class BDNSyncPlugin extends Plugin {
     if (!this.settings.syncOnSave || this.settings.syncMode === 'manual') return;
     if (new PathFilter(this.settings).isExcluded(path)) return;
     this.watcher.onChange(path);
+  }
+
+  /**
+   * 本地目录创建/移动后的云端目录补建（空文件夹同步修复点）。
+   * 复用 engine.ensureRemoteDirs（幂等、受沙箱根护栏保护）。
+   * 仅在已登录、未处于手动模式、路径未被排除时执行；运行中同步会由下一次全量扫描覆盖，故并发跳过。
+   */
+  private ensureRemoteFolder(relPath: string): void {
+    if (!this.hasAuth() || !this.engine) return;
+    if (this.settings.syncMode === 'manual') return;
+    if (new PathFilter(this.settings).isExcluded(relPath)) return;
+    if (this.engine.isBusy()) return; // 正在同步中：本次由全量扫描统一补建，避免重复 mkdir
+    void this.engine
+      .ensureRemoteDirs([relPath])
+      .then((r) => {
+        if (r.errors.length) {
+          new Notice(`BDNSync：空目录同步失败 ${relPath}（详见控制台）`, 4000);
+        }
+      })
+      .catch(() => {
+        /* 静默 */
+      });
   }
 
   /** 反向引用索引：vault 变更后防抖重建（仅实验室 Backlinks 开启时） */
@@ -1213,6 +1339,8 @@ export default class BDNSyncPlugin extends Plugin {
 
   /** 已打开的弹窗实例表（单实例守卫用）：key → 实例引用 */
   private openModals = new Map<string, Modal>();
+  /** 当前打开的孤儿清理弹窗引用（用于「已打开时重新聚焦」而非静默忽略） */
+  private orphanModal: OrphanCleanupModal | null = null;
 
   /** 忙碌提示：与 engine 通知共用同一套共享限频（同文案 3 秒内只弹一次） */
   private notifyBusy(msg: string, timeout?: number): void {
@@ -1228,7 +1356,19 @@ export default class BDNSyncPlugin extends Plugin {
    * 弹窗关闭时自动从表里移除（覆写 close 钩子，不破坏原行为）。
    */
   private openExclusive<T extends Modal>(key: string, create: () => T): T | null {
-    if (this.openModals.has(key)) return null;
+    const existing = this.openModals.get(key);
+    if (existing) {
+      // 🔴 守卫自修复：若已登记的弹窗其实已关闭（close 因 open 渲染异常 / 特殊关闭路径
+      // 未触发 guard 清理），其 containerEl 已被 Obsidian detach（脱离 DOM）。此时仍把它
+      // 当成「打开中」会永久卡死该 key——表现为「孤儿目录扫描一直被限制打开」。
+      // 检测到失效引用即清除，允许本次重新打开（自愈），杜绝一次异常后的死锁。
+      const stillOpen = !!(existing.containerEl && existing.containerEl.parentElement);
+      if (!stillOpen) {
+        this.openModals.delete(key);
+      } else {
+        return null;
+      }
+    }
     const modal = create();
     this.openModals.set(key, modal);
     const origClose = modal.close.bind(modal);
@@ -1257,9 +1397,13 @@ export default class BDNSyncPlugin extends Plugin {
       const conflicts = idx.conflicts.filter((c) => !c.resolved);
       const refresh = async () => {
         const fresh = await this.store.loadLocalIndex();
-        this.statusBar.setConflicts(fresh.conflicts.filter((c) => !c.resolved).length);
+        // 强制同步 conflict + retry 两个独立徽章（避免 retry 抢占 conflict 元素）
+        this.statusBar.forceSyncBadges(
+          fresh.conflicts.filter((c) => !c.resolved).length,
+          this.retryQueue.size,
+        );
       };
-      this.openExclusive('conflict-panel', () =>
+      const modal = this.openExclusive('conflict-panel', () =>
         new ConflictModal(
           this.app,
           conflicts,
@@ -1273,8 +1417,57 @@ export default class BDNSyncPlugin extends Plugin {
           },
           () => void refresh(),
         ),
-      )?.open();
+      );
+      if (!modal) return;
+      // 🔴 关键修复：ConflictModal 关闭（用户点 X / 全部解决完 / 按 ESC）时强制同步徽章。
+      // 旧实现仅在 resolve 回调里 refresh——若用户点 X 关闭、resolvePending 抛错、或 modal
+      // 被 onClose hook 路径不触发 refresh，徽章就会卡在"已处理还显示 N"的旧状态。
+      const origClose = modal.close.bind(modal);
+      modal.close = () => {
+        origClose();
+        void refresh();
+      };
+      modal.open();
     })();
+  }
+
+  /**
+   * 同步完成后自动开冲突面板的判定函数。仅当存在 status==='pending-merge' 的草稿时
+   * 自动打开 ConflictModal（这些草稿需要用户手动合并，无法自动收尾）；其它情形
+   * （无冲突 / 仅 ask-me 策略未决议 / 已自动合并完成）一律不主动弹窗。
+   *
+   * 异常路径（同步被取消 / 鉴权失败 / 网络错误）不弹，避免误导用户。
+   */
+  private async maybeOpenConflictPanelAfterSync(): Promise<void> {
+    try {
+      const idx = await this.store.loadLocalIndex();
+      const pending = idx.conflicts.filter(
+        (c) => !c.resolved && c.status === 'pending-merge' && !!c.draftPath,
+      );
+      if (pending.length === 0) {
+        // 已全部自动合并完成或无冲突：发一条 Notice 告知，避免用户疑惑（视图中
+        // statusBar 徽章会清零，但有些用户会盯着「同步完成」提示）。
+        // 这里判静默 OR Notice 二选：仅当之前有未解决冲突才提示，避免噪声。
+        const anyUnresolved = idx.conflicts.some((c) => !c.resolved);
+        if (anyUnresolved) {
+          this.notifyBusy(
+            `BDNSync：${idx.conflicts.filter((c) => !c.resolved).length} 个冲突未解决（含 ask-me/强制分支等），点击状态栏徽章打开面板`,
+            6000,
+          );
+        }
+        return;
+      }
+      this.logger.log(
+        'cleanup',
+        'info',
+        'info',
+        `检测到 ${pending.length} 个待手动合并的草稿，自动打开冲突面板`,
+      );
+      this.openConflictPanel();
+    } catch (e) {
+      // 读索引失败不阻断主流程，仅记录
+      this.log('info', `检查冲突面板失败：${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /** P0-1.4 打开第一个待处理草稿的合并面板（命令入口） */
@@ -1535,7 +1728,7 @@ export default class BDNSyncPlugin extends Plugin {
    * 网盘孤儿备份目录清理入口（手动 + 自动巡检共用）。
    * 不论哪种入口都走 OrphanCleanupModal，行为差异通过 opts.autoMode 区分。
    */
-  async openOrphanCleanupModal(opts: { autoMode?: boolean } = {}): Promise<void> {
+  async openOrphanCleanupModal(opts: { autoMode?: boolean; preScanned?: DeepScanResult } = {}): Promise<void> {
     if (!this.adapter) {
       new Notice('BDNSync：尚未配置，无法扫描');
       return;
@@ -1559,7 +1752,10 @@ export default class BDNSyncPlugin extends Plugin {
     //    不再在打开弹窗前 await 扫描，避免大库扫描期间 UI 长时间无响应/卡死）
     const lister = this.makeOrphanLister();
     const deleter = this.makeOrphanDeleter();
-    const modal = new OrphanCleanupModal(this.app, vaultName, parentDir, lister, deleter, {
+    // 🟡#10：自动巡检（同步结束钩子）与手动打开可能并发触发，用 openExclusive 互斥，
+    // 避免同一时刻出现两个孤儿清理弹窗（双弹窗会各自扫描、竞态覆盖结果）。
+    const modal = this.openExclusive('orphan-cleanup', () =>
+      new OrphanCleanupModal(this.app, vaultName, parentDir, lister, deleter, {
       autoMode: !!opts.autoMode,
       retentionDays: this.settings.orphanRetentionDays,
       bulkConfirmThreshold: this.settings.bulkDeleteConfirm,
@@ -1569,8 +1765,14 @@ export default class BDNSyncPlugin extends Plugin {
       // （否则并发双扫描竞态：结果/阶段/勾选集合不确定，且 legacy 只扫父目录层）。
       legacyScanOnOpen: false,
       onComplete: (r) => {
-        // 扫描结果从 modal 取（startDeepScan 完成时回填 lastScan；取消/失败时可能为空）
-        const scanResult = modal.lastScan;
+        // 弹窗真正关闭：释放引用（🟡#10 重新聚焦守卫依赖此字段判定「已有弹窗」）
+        this.orphanModal = null;
+        // 扫描结果从 modal 取（startDeepScan 完成时回填 lastScan；取消/失败时可能为空）。
+        // modal 由 openExclusive 返回（可能为 null），但本回调只在弹窗真正关闭时触发，
+        // 此时 modal 必为非 null。闭包捕获的联合类型无法被下方 null 守卫收窄，故用非空断言
+        // （与 engine.ts 既有用法一致）。
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const scanResult = modal!.lastScan;
         const findings = scanResult?.findings ?? [];
         const stats = scanResult?.stats;
         // 任何结果（取消/完成/失败）都更新 lastOrphanScanAt，作为下次 24h 限频基准
@@ -1622,10 +1824,41 @@ export default class BDNSyncPlugin extends Plugin {
           );
         }
       },
-    });
-    modal.open();
-    // 2) 后台执行深度扫描：弹窗先显示「正在扫描…」，完成后回填列表（U1 修复）
-    void modal.startDeepScan(() => this.runOrphanScan({ vaultName, parentDir, remoteRoot }));
+    }),
+    );
+    if (!modal) {
+      // 已有孤儿清理弹窗在打开中（自动巡检 + 手动并发）。不再静默记「忽略」日志，
+      // 而是给出明确提示，避免用户反复点击命令却只看到忽略日志、误以为弹窗坏了（🟡#10）。
+      // 注：不重复调用 modal.open()（会再次触发 onOpen 重复渲染），弹窗本就可见，提示即可。
+      new Notice('BDNSync：孤儿清理弹窗已在打开中');
+      return;
+    }
+    this.orphanModal = modal;
+    try {
+      modal.open();
+    } catch (e) {
+      // 🔴 自修复：open() 渲染期异常（如 DOM 构建失败）会导致弹窗未真正显示但仍占着
+      // openModals 的 'orphan-cleanup' key。立即清理守卫并提示，避免「一次异常后永远
+      // 打不开」的死锁（与 openExclusive 的自修复互为兜底）。
+      this.openModals.delete('orphan-cleanup');
+      this.orphanModal = null;
+      new Notice(`BDNSync：孤儿清理弹窗打开失败：${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    // 2) 后台执行深度扫描：弹窗先显示「正在扫描…」，完成后回填列表（U1 修复）。
+    //    若调用方已预扫（自动巡检钩子路径），直接回填预扫结果，避免二次扫描。
+    if (opts.preScanned) {
+      void modal.applyPreScanned(opts.preScanned);
+    } else {
+      void modal.startDeepScan(() =>
+        this.runOrphanScan({
+          vaultName,
+          parentDir,
+          remoteRoot,
+          onProgress: (info) => modal.updateScanProgress(info),
+        }),
+      );
+    }
   }
 
   /**
@@ -1638,6 +1871,8 @@ export default class BDNSyncPlugin extends Plugin {
     vaultName: string;
     parentDir: string;
     remoteRoot: string;
+    /** 实时进度回调（由 modal 接收并展示当前扫描路径/节点数） */
+    onProgress?: (info: ScanProgress) => void;
   }): Promise<DeepScanResult> {
     const s = this.settings;
     const mode = s.orphanScanMode;
@@ -1670,7 +1905,18 @@ export default class BDNSyncPlugin extends Plugin {
       }
       activeFiles = set;
     } catch {
-      activeFiles = null; // 读不到不阻断（宁可多判孤儿不可漏判）
+      activeFiles = null; // 读不到不阻断
+    }
+    // 🔴#4：索引为空 / 读取失败 → 不可信。此时「索引依赖型」孤儿判定会把整库误标为可删除，
+    // 因此降级为仅保留命名型备份目录判定（trustIndex=false）。删除是破坏性操作，漏判远优于误删。
+    const indexUsable = activeFiles !== null && activeFiles.size > 0;
+    if (!indexUsable) {
+      this.logM(
+        'general',
+        'info',
+        'warn',
+        '孤儿清理：本地同步索引为空/不可用，已跳过「索引依赖型」孤儿判定（仅保留命名型备份目录），避免误标整个 vault',
+      );
     }
 
     const isActive: ClassifyOptions['isActive'] = (relPath) => {
@@ -1690,12 +1936,16 @@ export default class BDNSyncPlugin extends Plugin {
         maxBytes: s.orphanScanMaxBytes || 0,
         concurrency: s.orphanScanConcurrency || 3,
         ignoreGlobs,
+        onProgress: opts.onProgress,
       });
       const findings = await classifyOrphans(walked.nodes, {
         vaultName: opts.vaultName,
         isActive,
         ignoreGlobs,
+        trustIndex: indexUsable,
       });
+      // 诊断警告落地到日志，便于审计"为何父目录层走了搜索兜底"
+      for (const w of walked.warnings) this.logM('cleanup', 'info', 'warn', w);
       return {
         findings,
         scannedNodes: walked.scannedNodes,
@@ -1703,6 +1953,7 @@ export default class BDNSyncPlugin extends Plugin {
         truncated: walked.truncated,
         durationMs: 0,
         errors: walked.errors,
+        warnings: walked.warnings,
       };
     }
 
@@ -1717,12 +1968,25 @@ export default class BDNSyncPlugin extends Plugin {
       maxBytes: s.orphanScanMaxBytes || 0,
       concurrency: s.orphanScanConcurrency || 3,
       ignoreGlobs,
+      onProgress: opts.onProgress,
     };
-    return runDeepScan(this.makeOrphanLister(), scanOpts, {
+    const res = await runDeepScan(this.makeOrphanLister(), scanOpts, {
       vaultName: opts.vaultName,
       isActive,
       ignoreGlobs,
+      trustIndex: indexUsable,
     });
+    // 诊断警告落地到日志
+    for (const w of res.warnings) this.logM('cleanup', 'info', 'warn', w);
+    return {
+      findings: res.findings,
+      scannedNodes: res.scannedNodes,
+      scannedBytes: res.scannedBytes,
+      truncated: res.truncated,
+      durationMs: res.durationMs,
+      errors: res.errors,
+      warnings: res.warnings,
+    };
   }
 
   /** 按 kind 统计 OrphanFinding 数量（用于审计摘要） */
@@ -1750,18 +2014,34 @@ export default class BDNSyncPlugin extends Plugin {
    * 「文件或目录名不合法」（API 在用户家目录找 basename 找不到）。
    */
   private makeOrphanLister(): RemoteLister {
-    const adapter = this.adapter;
-    if (!adapter) throw new Error('BDNSync：adapter 未初始化');
+    if (!this.adapter) throw new Error('BDNSync：adapter 未初始化');
+    const api = this.getApi();
     return {
       async listDir(absPath: string): Promise<RemoteDirRow[]> {
-        const rows = await adapter.listRemoteDir(absPath);
+        // strict：listDir 在百度沙箱根（如 /apps/bdnsync）常因 errno=-9 被 api.listDir
+        // **静默返回空**（同步链路把「不存在」当「空」是有意为之）。孤儿扫描必须区分
+        // 「真空 vs 读取失败」——strict 模式抛错后 walkRemoteTree 才能正确走 search 兜底
+        // 并产出诊断 warning（否则「网盘里明明有孤儿却扫描为 0」，且无任何提示）。
+        const rows = await api.listDir(absPath, { strict: true });
         return rows.map((r) => ({
-          // 关键：把相对 basename 与已知 absPath 拼回绝对路径，供 deleter 使用
-          path: r.path ? remoteJoin(absPath, r.path) : remoteJoin(absPath, r.name),
+          // api.listDir 返回的是绝对路径（与 adapter 的"剥前缀"不同），直接透传
+          path: r.path || remoteJoin(absPath, r.name),
           name: r.name,
           isDir: r.isDir,
           mtime: r.mtime,
           size: r.size,
+        }));
+      },
+      // 🔴 孤儿扫描兜底：父目录层（沙箱根）listDir 常因 errno=-9 返回空，导致扫描 0 结果。
+      // 这里暴露百度 search 接口，由 walkRemoteTree 在 listDir 失败时反向枚举孤儿目录。
+      async search(keyword: string, dir: string): Promise<RemoteDirRow[]> {
+        const hits = await api.search(keyword, dir);
+        return hits.map((h) => ({
+          path: h.path,
+          name: h.name,
+          isDir: h.isDir,
+          mtime: h.mtime,
+          size: h.size,
         }));
       },
     };
@@ -1842,13 +2122,47 @@ export default class BDNSyncPlugin extends Plugin {
       }
       return;
     }
-    // autoPrune 开启：弹模态框（仍需手动确认删除）。
-    // 审计 #4：与「仅检测」分支同样受 24h 限频，避免每次成功同步都弹框打扰。
+    // autoPrune 开启：先扫描，仅当确有候选时才弹模态框（仍需手动确认删除）。
+    // 关键修复：不再「无论有无孤儿都弹空弹窗」——空弹窗既无清理价值，又会在同步刚结束/启动时
+    // 弹窗遮挡，让用户误以为「同步未完成」（即用户反馈的「同步一直不显示完成」根因）。
     const now2 = Date.now();
     if (!shouldScanOrphans(this.settings.lastOrphanScanAt, now2)) return;
     this.settings.lastOrphanScanAt = now2;
     void this.saveSettings();
-    await this.openOrphanCleanupModal({ autoMode: true });
+    try {
+      const vaultName = this.app.vault.getName();
+      const remoteRoot = this.settings.remoteRoot || `/apps/bdnsync/${vaultName}`;
+      const parentDir = remoteParent(remoteRoot);
+      if (!parentDir || parentDir === '/' || parentDir === remoteRoot) {
+        this.logger.log('cleanup', 'info', 'info', `${opts.from === 'startup' ? '启动' : '同步后'}孤儿巡检：同步根位于网盘根，跳过`);
+        return;
+      }
+      const scan = await this.runOrphanScan({ vaultName, parentDir, remoteRoot });
+      // 与 modal 内一致：autoMode 按保留天数过滤（保留期内的近期备份属正常活动，不弹出）
+      let findings = scan.findings;
+      if ((this.settings.orphanRetentionDays ?? 0) > 0) {
+        const cutoff = Date.now() - (this.settings.orphanRetentionDays ?? 0) * 24 * 3600 * 1000;
+        findings = findings.filter((f) => f.mtime === 0 || f.mtime < cutoff);
+      }
+      if (findings.length === 0) {
+        this.logger.log(
+          'cleanup',
+          'info',
+          'info',
+          `${opts.from === 'startup' ? '启动' : '同步后'}孤儿巡检：未发现需清理的孤儿备份，不弹窗`,
+        );
+        return;
+      }
+      // 直接把预扫结果交给弹窗回填，避免二次扫描
+      await this.openOrphanCleanupModal({ autoMode: true, preScanned: scan });
+    } catch (e) {
+      this.logger.log(
+        'cleanup',
+        'info',
+        'warn',
+        `orphan 巡检失败：${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   /**

@@ -591,6 +591,65 @@ describe('classifyOrphans：vault 根目录安全护栏（空索引不误删整�
   });
 });
 
+describe('classifyOrphans：🔴#4 trustIndex=false 降级护栏（空索引不整库误标）', () => {
+  it('索引不可信时：仅保留命名型备份目录判定，vault 内部孤儿文件/目录不再被误标', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [f('Obsidian Vault_20240101_000000', true)], // 命名型备份目录（应保留判定）
+      [REMOTE_ROOT]: [f('Notes', true), f('a.md', false, 100)],
+      [`${REMOTE_ROOT}/Notes`]: [f('b.md', false, 50)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 2,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false, // 换账号 / 索引重置 / LocalIndex 读取失败 → 空索引
+      trustIndex: false, // 🔴#4 降级：索引不可信，索引依赖型孤儿判定关闭
+      ignoreGlobs: ['.bdnsync', '.bdnsync-base', '.bdnsync-merge-draft', '.bdnsync-backup', '.obsidian'],
+    });
+    // vault 内部「索引依赖型」孤儿：不再误标（否则会整库删除）
+    expect(out.some((x) => x.fullPath === `${REMOTE_ROOT}/a.md`)).toBe(false);
+    expect(out.some((x) => x.fullPath === `${REMOTE_ROOT}/Notes`)).toBe(false);
+    expect(out.some((x) => x.fullPath === REMOTE_ROOT)).toBe(false);
+    // 但「命名型」备份目录（不依赖索引）仍应被识别
+    expect(
+      out.some(
+        (x) => x.kind === 'backup-dir' && x.fullPath === `${PARENT}/Obsidian Vault_20240101_000000`,
+      ),
+    ).toBe(true);
+  });
+
+  it('trustIndex 缺省（true）时仍走原行为：空索引下内部孤儿会被判（由调用方决定是否安全）', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('a.md', false, 100)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 2,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false, // 缺省 trustIndex（true）：保留原行为
+    });
+    // 缺省行为下，空索引仍会把 vault 内文件判为 orphan-file（由 main.ts 传入 trustIndex=false 来关闭）
+    expect(out.some((x) => x.kind === 'orphan-file' && x.fullPath === `${REMOTE_ROOT}/a.md`)).toBe(true);
+  });
+});
+
 // ---------------- mergeFindings ----------------
 
 describe('mergeFindings：旧管线 + 新管线合并去重', () => {
@@ -658,5 +717,385 @@ describe('mergeFindings：旧管线 + 新管线合并去重', () => {
     ];
     const merged = mergeFindings(legacy, newFindings);
     expect(merged.length).toBe(2);
+  });
+});
+
+// ---------------- 本轮回归：🟡#7 深度截断护栏 / 🟡#8 仅含被忽略子项 / 🟢 基础设施目录硬排除 ----------------
+
+describe('🟡#7 深度截断护栏：命中 maxDepth 的目录不误判 orphan-dir', () => {
+  it('full-vault 命中 maxDepth 的目录 depthTruncated=true，且自身及祖先均不被判 orphan-dir', async () => {
+    // maxDepth=2：Notes/sub 位于 depth=2（=maxDepth）→ 子树不再展开，被标记 depthTruncated。
+    // Notes（祖先）因此进入 unsafeDirs，整棵不被判 orphan-dir，避免把含深层未知内容的目录误标。
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('root.md', false, 100), f('Notes', true)],
+      [`${REMOTE_ROOT}/Notes`]: [f('note.md', false, 10), f('sub', true)],
+      [`${REMOTE_ROOT}/Notes/sub`]: [f('c.md', false, 5)], // 不会进入（被深度限制）
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 2,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    // walk 输出：sub 应带 depthTruncated=true（命中深度上限）
+    const sub = walked.nodes.find((n) => n.name === 'sub');
+    expect(sub).toBeDefined();
+    expect(sub?.depthTruncated).toBe(true);
+    // c.md 不应进入（被深度限制）
+    expect(walked.nodes.map((n) => n.name)).not.toContain('c.md');
+
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false, // 索引全空，但截断目录不应因此被误标
+    });
+    // 截断目录自身 + 其祖先均不被判 orphan-dir
+    expect(out.some((x) => x.kind === 'orphan-dir' && x.name === 'sub')).toBe(false);
+    expect(out.some((x) => x.kind === 'orphan-dir' && x.name === 'Notes')).toBe(false);
+    // 同层真正无活跃文件的文件仍被识别
+    expect(out.some((x) => x.kind === 'orphan-file' && x.name === 'root.md')).toBe(true);
+    expect(out.some((x) => x.kind === 'orphan-file' && x.name === 'note.md')).toBe(true);
+  });
+
+  it('未截断的深度目录（整棵已展开、子项均 inactive）仍被正确判为 orphan-dir（修复不误伤）', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('Trash', true)],
+      [`${REMOTE_ROOT}/Trash`]: [f('old.md', false, 20)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 3, // 充足深度，Trash 完整展开
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    const trash = walked.nodes.find((n) => n.name === 'Trash');
+    expect(trash?.depthTruncated).toBeFalsy(); // 未被截断
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+    });
+    // 已完整展开且无活跃文件 → 正确判 orphan-dir（修复不误伤合法判定）
+    expect(out.some((x) => x.kind === 'orphan-dir' && x.name === 'Trash')).toBe(true);
+  });
+});
+
+describe('🟡#8 仅含被忽略子项的目录不误判 orphan-dir（realKids 过滤）', () => {
+  it('目录仅含被忽略子项（.DS_Store）→ 不判为空/孤儿目录', async () => {
+    // 注意：ignoreGlobs 只传给 classifyOrphans，不传给 walker ——
+    // 这样被忽略的 .DS_Store 仍以节点形式进入 kids，真正考验 realKids 过滤（而非 walker 预过滤）。
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('Secret', true), f('a.md', false, 100)],
+      [`${REMOTE_ROOT}/Secret`]: [f('.DS_Store', false, 0)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 2, // 让 Secret 展开，.DS_Store 作为真实节点进入 kids
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+      ignoreGlobs: ['.DS_Store'],
+    });
+    // 仅含忽略子项的目录：不得判 orphan-dir（修复前会被误判为「1 项孤儿目录」）
+    expect(out.some((x) => x.kind === 'orphan-dir' && x.name === 'Secret')).toBe(false);
+    // 真正的孤儿文件仍被识别
+    expect(out.some((x) => x.kind === 'orphan-file' && x.name === 'a.md')).toBe(true);
+  });
+
+  it('目录含「忽略子项 + 真实 inactive 子项」→ 判 orphan-dir，但字节/项数仅计真实子项', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('Docs', true)],
+      [`${REMOTE_ROOT}/Docs`]: [f('.DS_Store', false, 0), f('note.md', false, 200)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 2,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+      ignoreGlobs: ['.DS_Store'],
+    });
+    const docs = out.find((x) => x.kind === 'orphan-dir' && x.name === 'Docs');
+    expect(docs).toBeDefined();
+    // 字节仅计真实子项 note.md（200），不含被忽略的 .DS_Store；项数=1
+    expect(docs?.bytes).toBe(200);
+    expect(docs?.reason).toContain('1 项');
+  });
+});
+
+describe('🟢 PLUGIN_INFRA_HARD_EXCLUDE：分类器直接跳过基础设施目录（不依赖 ignore-globs）', () => {
+  it('未传 ignoreGlobs 时，.bdnsync 目录节点仍被分类器硬排除（不判 orphan-dir）', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('.bdnsync', true), f('a.md', false, 100)],
+      // 故意不传 ignoreGlobs：证明分类器层 PLUGIN_INFRA_HARD_EXCLUDE 兜底生效（纵深防御）
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0, // .bdnsync 不被递归，但仍作为节点进入 walk 输出
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    // 证明 .bdnsync 节点确实进了 walk 输出（否则就测不到分类器兜底）
+    expect(walked.nodes.map((n) => n.name)).toContain('.bdnsync');
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+    });
+    // 基础设施目录自身绝不被判 orphan-dir / 任何 kind
+    expect(out.some((x) => x.name === '.bdnsync')).toBe(false);
+    // 真正的孤儿文件仍被识别
+    expect(out.some((x) => x.kind === 'orphan-file' && x.name === 'a.md')).toBe(true);
+  });
+});
+
+// ---------------- 本轮修复：🔴 父目录层 listDir 空 → search 兜底 / 进度回调 ----------------
+
+describe('walkRemoteTree：🔴 父目录层 listDir 空 → search 兜底找回孤儿（0 结果根因修复）', () => {
+  it('listDir(parentDir) 返回空且 lister.search 命中孤儿目录时，父目录层仍能找回 backup-dir 候选', async () => {
+    // 父目录 listDir 空（模拟百度 errno=-9：沙箱根常返回空），真实场景因此 0 结果
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [], // 关键：父目录不可列
+      [REMOTE_ROOT]: [f('Notes', true), f('a.md', false, 100)],
+    };
+    // search 接口兜底找回孤儿（百度 search 返回完整条目）
+    const searchHits: RemoteDirRow[] = [
+      {
+        path: `${PARENT}/Obsidian Vault_20240101_000000`,
+        name: 'Obsidian Vault_20240101_000000',
+        isDir: true,
+        mtime: 0,
+        size: 0,
+      },
+    ];
+    const lister: RemoteLister = {
+      async listDir(p: string): Promise<RemoteDirRow[]> {
+        if (!(p in map)) throw new Error(`not found: ${p}`);
+        return map[p];
+      },
+      async search(): Promise<RemoteDirRow[]> {
+        return searchHits;
+      },
+    };
+    const r = await walkRemoteTree(lister, {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    // 父目录层仍应包含 search 兜底的孤儿目录
+    const names = r.nodes.map((n) => n.name);
+    expect(names).toContain('Obsidian Vault_20240101_000000');
+    // 应产生一条 warning 说明走了搜索兜底
+    expect(r.warnings.length).toBeGreaterThan(0);
+    expect(r.warnings[0]).toContain('搜索');
+    // 分类器应把它识别为 backup-dir
+    const out = await classifyOrphans(r.nodes, { vaultName: VAULT });
+    expect(
+      out.some((x) => x.kind === 'backup-dir' && x.name === 'Obsidian Vault_20240101_000000'),
+    ).toBe(true);
+  });
+
+  it('listDir 正常返回时不应触发 search（无 warning、search 不被调用）', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [f('Obsidian Vault', true), f('Obsidian Vault_20240101_000000', true)],
+    };
+    let searchCalled = false;
+    const lister: RemoteLister = {
+      async listDir(p: string): Promise<RemoteDirRow[]> {
+        if (!(p in map)) throw new Error(`not found: ${p}`);
+        return map[p];
+      },
+      async search(): Promise<RemoteDirRow[]> {
+        searchCalled = true;
+        return [];
+      },
+    };
+    const r = await walkRemoteTree(lister, {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'parent-only',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    expect(searchCalled).toBe(false);
+    expect(r.warnings.length).toBe(0);
+  });
+
+  it('listDir 抛错时同样走 search 兜底（而非静默 0 结果）', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [REMOTE_ROOT]: [f('a.md', false, 100)],
+    };
+    const searchHits: RemoteDirRow[] = [
+      {
+        path: `${PARENT}/Obsidian Vault_20240101_000000`,
+        name: 'Obsidian Vault_20240101_000000',
+        isDir: true,
+        mtime: 0,
+        size: 0,
+      },
+    ];
+    const lister: RemoteLister = {
+      async listDir(p: string): Promise<RemoteDirRow[]> {
+        if (p === PARENT) throw new Error('errno=-9 父目录不可列');
+        if (!(p in map)) throw new Error(`not found: ${p}`);
+        return map[p];
+      },
+      async search(): Promise<RemoteDirRow[]> {
+        return searchHits;
+      },
+    };
+    const r = await walkRemoteTree(lister, {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'parent-only',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    expect(r.nodes.map((n) => n.name)).toContain('Obsidian Vault_20240101_000000');
+    expect(r.warnings.some((w) => w.includes('搜索'))).toBe(true);
+  });
+
+  it('search 兜底只收「≥1 段时间戳」的孤儿：vault 根（无时间戳）不被找回', async () => {
+    // 全盘搜索可能把 vault 根自身（Obsidian Vault，segments=0）也模糊命中；
+    // 过滤必须与分类器一致（segments>=1），否则 vault 根会被误收为候选。
+    const map: Record<string, RemoteDirRow[]> = { [PARENT]: [] };
+    const lister: RemoteLister = {
+      async listDir(p: string): Promise<RemoteDirRow[]> {
+        if (!(p in map)) throw new Error(`not found: ${p}`);
+        return map[p];
+      },
+      async search(): Promise<RemoteDirRow[]> {
+        return [
+          { path: `${PARENT}/Obsidian Vault`, name: 'Obsidian Vault', isDir: true, mtime: 0, size: 0 },
+          {
+            path: `${PARENT}/Obsidian Vault_20240101_000000`,
+            name: 'Obsidian Vault_20240101_000000',
+            isDir: true,
+            mtime: 0,
+            size: 0,
+          },
+        ];
+      },
+    };
+    const r = await walkRemoteTree(lister, {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    const names = r.nodes.map((n) => n.name);
+    expect(names).not.toContain('Obsidian Vault'); // vault 根被过滤
+    expect(names).toContain('Obsidian Vault_20240101_000000'); // 真孤儿被找回
+    const out = await classifyOrphans(r.nodes, { vaultName: VAULT });
+    expect(
+      out.some((x) => x.kind === 'backup-dir' && x.name === 'Obsidian Vault_20240101_000000'),
+    ).toBe(true);
+  });
+
+  it('search 全盘命中父目录之外的孤儿时，absPath 使用真实路径而非硬拼 parentDir', async () => {
+    // 孤儿若在网盘其它位置（如根目录 /Obsidian Vault_20240101_000000），
+    // 兜底结果必须保留其真实绝对路径，否则会被错误拼到 parentDir 之下。
+    const map: Record<string, RemoteDirRow[]> = { [PARENT]: [] };
+    const lister: RemoteLister = {
+      async listDir(p: string): Promise<RemoteDirRow[]> {
+        if (!(p in map)) throw new Error(`not found: ${p}`);
+        return map[p];
+      },
+      async search(): Promise<RemoteDirRow[]> {
+        return [
+          {
+            path: '/Obsidian Vault_20240101_000000', // 网盘根目录，不在 PARENT 下
+            name: 'Obsidian Vault_20240101_000000',
+            isDir: true,
+            mtime: 0,
+            size: 0,
+          },
+        ];
+      },
+    };
+    const r = await walkRemoteTree(lister, {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+    });
+    const hit = r.nodes.find((n) => n.name === 'Obsidian Vault_20240101_000000');
+    expect(hit).toBeDefined();
+    // 关键断言：真实路径被保留，而不是拼成 /apps/bdnsync/Obsidian Vault_20240101_000000
+    expect(hit?.absPath).toBe('/Obsidian Vault_20240101_000000');
+  });
+});
+
+describe('walkRemoteTree：onProgress 实时上报 currentPath（扫描进度反馈）', () => {
+  it('遍历中至少上报父目录层、vault 根与子树目录路径', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('Notes', true), f('a.md', false, 100)],
+      [`${REMOTE_ROOT}/Notes`]: [f('b.md', false, 10)],
+    };
+    const paths: string[] = [];
+    await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 1,
+      onProgress: (info) => {
+        if (info.currentPath) paths.push(info.currentPath);
+      },
+    });
+    expect(paths).toContain(PARENT); // 父目录层
+    expect(paths).toContain(REMOTE_ROOT); // vault 根
+    expect(paths).toContain(`${REMOTE_ROOT}/Notes`); // 子树目录
   });
 });

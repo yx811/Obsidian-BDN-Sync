@@ -2,7 +2,61 @@
 
 本文件记录 BDNSync 的所有版本变更。版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-> 📌 最新版本：**1.0.2**（2026-08-25）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+> 📌 最新版本：**1.0.3**（2026-08-26）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+
+---
+
+## [1.0.3] - 2026-08-26
+
+### 新增
+
+- **空文件夹同步支持**：本地空目录（自身及子孙均无文件，含多层嵌套）现在同步到云端——全量同步显式 `ensureDir` 补建、实时模式监听 `TFolder` 创建/移动即时增量补建，均受沙箱根护栏保护（`/apps/<appName>` 之内、绝不越过，修复历史 `errno=102`）；新建的空目录数计入同步摘要「建目录 N」
+
+### 稳健性 & 技术债闭环（交付前代码审查）
+
+交付前以「功能 / UI / 代码质量 / UX」四维做最后一轮全面审查，并将此前遗留的 17 项 🟡 稳健性项与 🟢 技术债一次性闭环（详见各模块注释与单元测试；验证：`tsc -noEmit` 0 错误、`eslint` 0 问题、`vitest` 全绿、`esbuild` 生产构建通过）。主要主题：
+
+- **并发 / 重入协调**：强制同步（force）并发锁与 `cancelled` 状态机协调，避免全量同步与 quickSync 互踩；`isBusy()` 守卫在全量同步期间抑制增量补建
+- **大规模删除保护（B1）强化**：强制方向同步的空索引护栏、vault 根误删护栏延伸至更多路径，确保换账号 / 索引重置 / LocalIndex 读取失败时不会清空整库
+- **风险闭环（S1–S4）**：覆盖同步计划生成、执行、索引提交、取消各阶段的状态一致性与错误边界
+- **孤儿扫描 `isIgnored` basename 回退匹配**：修复嵌套路径忽略规则（如 `ignoreGlobs: ['.DS_Store']`）无法匹配子目录内同名文件的误判，与 `.gitignore` 语义对齐（新增回归测试）
+- **重试队列 / dirty-set / 索引提交稳健性**：边界条件下重试、脏集合清理、索引合并竞态的加固
+- **日志脱敏与 log-store / logger 稳健性**：凭证字段持续脱敏、日志写入异常不阻断主流程
+- **UI 弹窗（modals）与同步日志视图（sync-log-view）健壮性**：空态、超长内容、滚动可见性等边界处理
+- **孤儿清理弹窗守卫死锁修复（🔴）**：`openExclusive('orphan-cleanup')` 守卫原仅依赖 `close()` 覆写清理引用，若弹窗因 `open()` 渲染异常 / 特殊关闭路径未触发清理，key 会永久残留于 `openModals`，导致后续所有孤儿扫描被「一直限制打开」而静默失败（表现为日志反复 `孤儿清理弹窗已打开，忽略本次重复触发`、同步看似不完成）。修复：①守卫增加**自修复**——检测到已登记弹窗的 `containerEl` 已脱离 DOM 即清除失效引用，允许本次重开；②`openOrphanCleanupModal` 在 `open()` 外包 `try/catch`，渲染异常时立即清理守卫并提示，杜绝「一次异常后永远打不开」；③自动巡检（`autoPrune`）改为**先扫描、确有候选才弹窗**（且按保留天数过滤），不再弹空弹窗遮挡同步完成；④已打开时给出明确 Notice 而非静默忽略日志
+
+### 修复：孤儿备份扫描「大量孤儿却扫描为 0 结果」
+
+用户反馈：网盘里能看到大量孤儿备份目录（`vault名_YYYYMMDD_HHMMSS[_...]`），但「清理孤儿备份」弹窗始终扫描不到、直接提示「当前无需清理」。
+
+- **根因**：百度 OpenAPI `listDir` 在沙箱根 `/apps/bdnsync` 因 `errno=-9` 返回空（沙箱根不可列），且旧 `search` 兜底走错接口（`rest/2.0/xpan/file?method=search` GET，官方实为 `rest/2.0/xpan/multimedia?method=search` POST），兜底形同虚设；旧代码把空结果当「真实为空」→ 父目录层 0 节点 → 0 候选 → 弹窗静默关闭。并非「自身备份被排除」（插件自身 `.bdnsync*` 备份是**被刻意保护、绝不清理**，而非被排除扫描）。
+- **修复**：
+  1. `api.listDir(dir, { strict })` 新增严格模式：`errno=-9/-7` 改为**抛错**（默认行为不变，不影响同步链路）；孤儿扫描 lister 改用 strict，失败即正确走 search 兜底 + 产出诊断 warning（「父目录不可读，已改用搜索兜底」），0 候选面板会如实显示
+  2. `api.search` 重写：优先官方 `multimedia?method=search`（POST，`recursion=1`、`limit=500`），dir 限定命中为空时**自动升级全盘搜索**（`dir=/`），仍空时再试 web 兼容接口一次
+  3. `walkRemoteTree` 搜索兜底过滤收紧为 `segments >= 1`（与分类器一致，避免 vault 根被误收）；命中条目**优先使用真实绝对路径**（search 全盘命中可能在父目录之外，不能再硬拼 parentDir）
+  4. **0 候选不再静默关闭（manual 模式）**：手动打开扫描后即便仍 0 候选，弹窗**不再直接关闭**，而是展示透明结果面板：含扫描诊断、解答「为何看不到我网盘的孤儿」、以及**手动路径录入入口**（粘贴绝对路径，工具测量大小并加入待清理清单，默认勾选），作为接口读不到时的逃生舱；自动巡检（autoMode）仍保持静默不弹窗
+  5. **实时扫描进度反馈**：`walkRemoteTree` 每展开一个目录即通过 `onProgress` 上报「当前路径 + 已扫描节点数」，弹窗扫描期实时显示「正在扫描…已用 Ns · 已扫描 M 节点 · 正在访问 …」，避免大库扫描时用户误以为卡死
+
+### 修复：上传 / 下载速度慢
+
+- **根因**：`request()` 的全局 QPS 节流（默认 550ms）覆盖了**数据面**——每个分片上传（`superfileUpload`）与每次整文件下载都强制 `throttle()`，全局共享 `lastRequestAt` 使并发也近似串行；且分片**串行**逐片上传（4MB × N 片 × 550ms = 大文件龟速）。
+- **修复**：
+  1. `request()` / `openRequest()` 新增 `skipThrottle`；`superfileUpload` 与 `downloadByDlink` 传 `skipThrottle: true` —— **数据面全速**，QPS 节流只作用于元数据接口（list/precreate/create/search 等）
+  2. 分片上传**并发化**：按 `uploadConcurrency` 起 worker 池并发传分片（百度 superfile2 支持乱序分片，create 时按序合并；默认 2-3），md5 校验/断点续传/失败重试语义不变
+  3. 默认值调整：`requestIntervalMs` 550→**200**（元数据 5 QPS，推荐区间 200-300）、`chunkSizeMB` 4→**8**（分片请求数减半，设置页补充 8MB 选项）
+
+### 修复：扫描弹窗完全空白（v1.0.3 起 v2 路径回归）
+
+- **根因**：v1.0.3 引入 v2 路径时，把 `OrphanCleanupModal.phase` 默认值设为 `'scanning'`。后续链路：Obsidian 框架调 `modal.onOpen()` 的 `legacyScanOnOpen=false` 分支直接 `return`（只跑 `renderShell()`，body 节点为空）→ main.ts 紧接调 `modal.startDeepScan(...)` → 其首行守卫 `if (this.phase === 'scanning') return;` 因 phase 在构造时就是 `'scanning'` 而**首次调用被早 return**，跳过 `renderBody` + `renderFooter` + `startScanTimer` → 弹窗终态 = 标题 + 扫描范围一行 + 空 body。这意味着 **v1.0.3 起所有 v2 入口打开的弹窗都坏**（1.0.2 还能扫出来，正是因为 1.0.2 还没引入 v2 路径）。
+- **修复**：`phase` 默认从 `'scanning'` 改为 `'idle'`（中性占位）；`startDeepScan` 守卫从 `phase==='scanning'` 改为基于 `scanStartAt` 标志（真在跑才拦截，不再误伤首次进入）。
+
+### 验证
+
+- `tsc -noEmit` 0 错误；`eslint` 0 error（1 处预存 `any` warning）；`vitest` 全绿（含搜索兜底 / 进度回调 / 真实路径优先等回归测试）；`esbuild` 生产构建通过
+
+### 发布元数据
+
+- 版本号：**1.0.3**（自 1.0.2 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` 同步更新
 
 ---
 
@@ -62,8 +116,20 @@
 
 ## [1.0.1] - 2026-08-24
 
+> 注：初始发布版本即 **1.0.1**（不存在 1.0.0 发布），原 1.0.0 条目所列功能均包含在 1.0.1 中。
+
 ### 新增
 
+- 双模式连接：Cookie（BDUSS/STOKEN）+ OpenAPI 设备码扫码授权
+- 三向冲突合并：diff3 文本自动合并，二进制分叉保留
+- 墓碑删除同步：宽限期内可恢复误删
+- 三种同步模式：实时（保存即同步）/ 自动（定时轮询）/ 手动
+- AES-256-GCM 端到端加密，PBKDF2(10 万轮) 密钥派生
+- 断点续传：分片上传，崩溃后基于已上行字节续传
+- 整库快照与回滚
+- 大规模删除保护
+- 网盘浏览器：浏览、下载、流式预览
+- 实验功能：bdn:// 媒体直嵌、反向引用、离线收藏、同步健康分
 - GitHub Actions Release 工作流：推送标签自动构建、打包并创建 GitHub Release
 - Release 包包含 `manifest.json` / `main.js` / `styles.css`
 - README 重写：基于源码完善系统架构、同步机制、配置参考、命令列表等文档
@@ -88,19 +154,3 @@
 - `.html` 格式重复文档，仅保留 Markdown 版本
 - `copy-to-vault.cjs` 中硬编码的作者本地 vault 路径
 
----
-
-## [1.0.0] - 2026-08-20
-
-### 新增
-
-- 双模式连接：Cookie（BDUSS/STOKEN）+ OpenAPI 设备码扫码授权
-- 三向冲突合并：diff3 文本自动合并，二进制分叉保留
-- 墓碑删除同步：宽限期内可恢复误删
-- 三种同步模式：实时（保存即同步）/ 自动（定时轮询）/ 手动
-- AES-256-GCM 端到端加密，PBKDF2(10 万轮) 密钥派生
-- 断点续传：分片上传，崩溃后基于已上行字节续传
-- 整库快照与回滚
-- 大规模删除保护
-- 网盘浏览器：浏览、下载、流式预览
-- 实验功能：bdn:// 媒体直嵌、反向引用、离线收藏、同步健康分

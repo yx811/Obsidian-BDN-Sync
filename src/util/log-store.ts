@@ -83,10 +83,10 @@ export class LogStore {
     }
 
     for (const date of dateDirs) {
-      let part = 1;
-      // 依次读取 .json / .p2.json / .p3.json … 直到不存在
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
+      // 依次读取 .json / .p2.json / .p3.json … 直到不存在。
+      // 🟡#12：用 MAX_PARTS 封顶替代 while(true)，避免分片文件异常持续存在时无限循环。
+      const MAX_PARTS = 1000;
+      for (let part = 1; part <= MAX_PARTS; part++) {
         const file = this.fileForDate(date, part);
         try {
           const raw = await this.adapter.read(file);
@@ -95,7 +95,6 @@ export class LogStore {
         } catch {
           break; // 该分片不存在，停止该日循环
         }
-        part += 1;
       }
     }
     return all;
@@ -118,11 +117,30 @@ export class LogStore {
     }
     this.todayEntries.push(entry);
     this.todayBytes += this.estimateBytes(entry);
-    // 超过单日大小上限：当前缓冲即时 flush（同样用当前 todayKey 的明确值）
+    // 超过单日大小上限：当前缓冲即时 flush（同样用当前 todayKey 的明确值）。
+    // 🟢 修正：flush 后必须清空缓冲，否则同批条目会被反复重写、内存持续增长。
     if (this.todayBytes >= this.maxFileSizeBytes) {
       const k = this.todayKey;
       const e = this.todayEntries;
       void this.flushDay(k, e);
+      this.todayEntries = [];
+      this.todayBytes = 0;
+    }
+  }
+
+  /** 将某条已存在条目标记为墓碑并重写其所在日期分片（供 Logger.deleteEntry 调用，
+   *  补齐两阶段删除机制的真实落盘入口，🟡#14）。 */
+  async tombstoneEntry(entry: SyncLogEntry): Promise<void> {
+    const date = dayKey(entry.time);
+    const existing = await this.readDay(date);
+    const idx = existing.findIndex((e) => e.id === entry.id);
+    if (idx === -1) return;
+    existing[idx] = entry;
+    await this.adapter.mkdir(this.dirForDate(date)).catch(() => {});
+    try {
+      await this.adapter.write(this.fileForDate(date, 1), JSON.stringify({ entries: existing }));
+    } catch {
+      /* 写盘失败静默：墓碑将在下次 purge 兜底清理 */
     }
   }
 
@@ -163,7 +181,12 @@ export class LogStore {
       try {
         const raw = await this.adapter.read(file);
         const parsed = JSON.parse(raw) as { entries?: SyncLogEntry[] };
-        if (Array.isArray(parsed?.entries)) out.push(...parsed.entries);
+        // 🟡#13：跳过数组内的非法/null 条目，避免损坏的单条日志令整日 purge 抛错中断
+        if (Array.isArray(parsed?.entries)) {
+          for (const e of parsed.entries) {
+            if (e && typeof e === 'object') out.push(e as SyncLogEntry);
+          }
+        }
       } catch {
         break;
       }

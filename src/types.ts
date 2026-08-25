@@ -180,6 +180,20 @@ export interface OrphanFinding {
   measureError?: boolean;
 }
 
+/** 扫描进度回调信息（orphan-scan.ts 在每次访问节点时回调一次，供 UI 实时展示） */
+export interface ScanProgress {
+  /** 已扫描节点数 */
+  scannedNodes: number;
+  /** 已扫描累计字节 */
+  scannedBytes: number;
+  /** 是否触达预算上限被截断 */
+  truncated: boolean;
+  /** 当前正在访问的网盘绝对路径（便于用户看到扫到哪一层，避免误以为卡死） */
+  currentPath?: string;
+  /** 当前阶段：parent=父目录层 / walking=vault 子树遍历中 / done=结束 */
+  phase?: 'parent' | 'walking' | 'done';
+}
+
 /** 深度扫描选项（orphan-scan.ts 主入口） */
 export interface DeepScanOptions {
   /** 扫描根（默认 = settings.remoteRoot 父目录 + settings.remoteRoot 整棵树） */
@@ -198,8 +212,8 @@ export interface DeepScanOptions {
   maxBytes: number;
   /** 并发 listDir 数 */
   concurrency: number;
-  /** 进度回调（每访问一个节点调一次） */
-  onProgress?: (info: { scannedNodes: number; scannedBytes: number; truncated: boolean }) => void;
+  /** 进度回调（每访问一个节点调一次，含当前路径，供 UI 实时展示扫描进度） */
+  onProgress?: (info: ScanProgress) => void;
   /** 忽略规则（glob 数组）—— 相对路径匹配；返回 true 时整棵子树跳过 */
   ignoreGlobs?: string[];
 }
@@ -212,6 +226,8 @@ export interface DeepScanResult {
   truncated: boolean;
   durationMs: number;
   errors: { path: string; message: string }[];
+  /** 非致命诊断警告（如父目录层不可读、改用搜索兜底找回了 N 个孤儿等），供 UI 解释"为何这样扫" */
+  warnings: string[];
 }
 
 export interface CumulativeStats {
@@ -235,6 +251,8 @@ export interface SyncStats {
   errors: number;
   bytesUp: number;
   bytesDown: number;
+  /** 本次同步新补建到云端的空目录数（此前同步链路只处理文件，空文件夹缺口的修复载体）。可选：部分失败占位结果不携带该计数 */
+  dirsCreated?: number;
   errorMessages: string[];
 }
 
@@ -505,8 +523,8 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
 
   uploadConcurrency: 3,
   downloadConcurrency: 3,
-  chunkSizeMB: 4,
-  requestIntervalMs: 550,
+  chunkSizeMB: 8,
+  requestIntervalMs: 200,
   bandwidthLimitKBps: 0,
   syncPreviewEnabled: true,
   renameGraceMs: 1500,

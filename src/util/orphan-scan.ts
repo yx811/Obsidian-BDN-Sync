@@ -32,6 +32,7 @@
 
 import {
   parseOrphanSegments,
+  PLUGIN_INFRA_HARD_EXCLUDE,
   type RemoteDirRow,
   type RemoteLister,
 } from './orphan-cleanup';
@@ -80,10 +81,20 @@ function compileIgnoreGlobs(globs: string[] | undefined): RegExp[] | null {
   return out.length > 0 ? out : null;
 }
 
-/** 匹配该相对路径是否被忽略规则命中（任一命中即整棵子树跳过） */
+/**
+ * 匹配该相对路径是否被忽略规则命中（任一命中即整棵子树跳过）。
+ * 非通配 glob（如 `.DS_Store`）除了精确路径匹配外，也做 basename 匹配——
+ * 用户传 `.DS_Store` 自然期望所有层级的该文件都被忽略，而非仅根层级的。
+ */
 function isIgnored(relPath: string, regs: RegExp[] | null): boolean {
   if (!regs) return false;
   for (const re of regs) if (re.test(relPath)) return true;
+  // basename 匹配：让 `.DS_Store` 也能命中 `Docs/.DS_Store`（与 .gitignore 语义一致）
+  const lastSlash = relPath.lastIndexOf('/');
+  if (lastSlash >= 0) {
+    const basename = relPath.slice(lastSlash + 1);
+    for (const re of regs) if (re.test(basename)) return true;
+  }
   return false;
 }
 
@@ -118,6 +129,13 @@ export interface ScannedNode {
    */
   childrenListed: boolean;
   /**
+   * 该目录因 `maxDepth` 深度限制而**未能展开其子树**（full-vault 模式下命中深度上限时置 true）。
+   * 此时目录内的深层文件未被扫描，无法确认其子树是否含活跃（同步中）文件，
+   * 因此该目录及其所有祖先都**不能**被断言为「整棵子树无活跃文件」→ orphan-dir 判定须跳过（🟡#7）。
+   * 缺省 false（仅 full-vault 且达到深度边界的目录会置 true）。
+   */
+  depthTruncated?: boolean;
+  /**
    * 命中来源层（v2.2 新增）：'parent' = 来自同步根的父目录直接子项；
    * 'vault' = 来自 vault 自身目录（同步根顶层 + 整棵子树）。仅用于 UI 溯源与审计，
    * 不影响孤儿判定逻辑。由 walkRemoteTree 在创建节点时设置；纯函数测试中可省略（缺省 undefined）。
@@ -128,7 +146,14 @@ export interface ScannedNode {
 export async function walkRemoteTree(
   lister: RemoteLister,
   opts: DeepScanOptions,
-): Promise<{ nodes: ScannedNode[]; scannedNodes: number; scannedBytes: number; truncated: boolean; errors: { path: string; message: string }[] }> {
+): Promise<{
+  nodes: ScannedNode[];
+  scannedNodes: number;
+  scannedBytes: number;
+  truncated: boolean;
+  errors: { path: string; message: string }[];
+  warnings: string[];
+}> {
   const parentDir = normalizeRemote(opts.parentDir);
   const remoteRoot = normalizeRemote(opts.remoteRoot);
   const ignoreRegs = compileIgnoreGlobs(opts.ignoreGlobs);
@@ -139,6 +164,7 @@ export async function walkRemoteTree(
 
   const out: ScannedNode[] = [];
   const errors: { path: string; message: string }[] = [];
+  const warnings: string[] = [];
   const visited = new Set<string>(); // 去重（防止同一目录被多次入队）
   let scannedBytes = 0;
   let truncated = false;
@@ -150,29 +176,73 @@ export async function walkRemoteTree(
 
   // —— 起步：parentDir 直接子项先入队（depth 记 0，让「vault 在父目录里」与「vault 内部」分流显示）——
   if (parentDir && parentDir !== '/' && parentDir !== remoteRoot) {
+    // 🔴 本轮修复（孤儿扫描 0 结果根因）：百度 openapi 的 listDir 在沙箱根（如 /apps/bdnsync）
+    // 常因 errno=-9 返回空 / 不可列，导致 walkRemoteTree 在父目录层 0 节点 → classify 0 候选 →
+    // 弹窗静默关闭「无需清理」。这里在 listDir 返回空（或抛错）时改用 search 接口兜底，
+    // 反向枚举「vault 名 + 下划线 + 时间戳」的疑似孤儿备份目录。
+    let parentRows: RemoteDirRow[] = [];
+    let listDirFailed = false;
     try {
-      const top = await lister.listDir(parentDir);
-      for (const e of top) {
-        const abs = remoteJoin(parentDir, e.name);
-        if (visited.has(abs)) continue;
-        visited.add(abs);
-        const rel = relFromRoot(remoteRoot, abs); // 父目录通常不是 remoteRoot 的子，返回 ''
-        const d = rel ? depthFromRoot(rel) : 0;
-        out.push({
-          absPath: abs,
-          name: e.name,
-          isDir: e.isDir,
-          bytes: e.size ?? 0,
-          mtime: e.mtime ?? 0,
-          relPath: rel,
-          depth: d,
-          childrenListed: false, // parentDir 顶层不展开子项（parent-only 语义）
-          origin: 'parent', // 来自同步根父目录直接子项
-        });
-      }
+      parentRows = await lister.listDir(parentDir);
     } catch (e) {
+      listDirFailed = true;
       errors.push({ path: parentDir, message: e instanceof Error ? e.message : String(e) });
     }
+    // 空结果 或 抛错 → 尝试 search 兜底（仅当 lister 提供 search 能力时）
+    if (parentRows.length === 0 && lister.search) {
+      try {
+        // 先父目录限定，再由 api.search 内部自动升级全盘（孤儿可能在网盘其它位置）
+        const hits = await lister.search(`${opts.vaultName}_`, parentDir);
+        // 只取「是目录 + 命中孤儿命名（≥1 段时间戳）」的条目；
+        // 注意：search 可能命中父目录之外（全盘）的真实路径，abs 用 e.path 而非拼 parentDir
+        const found = hits.filter((h) => {
+          if (!h.isDir) return false;
+          const parsed = parseOrphanSegments(h.name, opts.vaultName);
+          return parsed.matched && parsed.segments >= 1;
+        });
+        if (found.length > 0) {
+          parentRows = found;
+          warnings.push(
+            `父目录 ${parentDir} 通过 list 接口读取为空/失败（可能 errno=-9），已改用「搜索」接口兜底，找回 ${found.length} 个疑似孤儿目录`,
+          );
+        } else if (listDirFailed) {
+          warnings.push(
+            `父目录 ${parentDir} 读取失败，且「搜索」兜底也未找到任何孤儿目录（可能路径/账号变更，可用下方手动录入）`,
+          );
+        } else if (parentRows.length === 0) {
+          // listDir 返回空（未抛错，如百度沙箱根静默 -9 被吞）且搜索也未命中 → 明确告知
+          warnings.push(
+            `父目录 ${parentDir} 的 list 返回空结果（疑似百度沙箱根不可列 errno=-9 被静默吞掉），且「搜索」兜底未命中，请用下方手动录入或检查同步根设置`,
+          );
+        }
+      } catch (e2) {
+        errors.push({
+          path: `${parentDir} (search fallback)`,
+          message: e2 instanceof Error ? e2.message : String(e2),
+        });
+      }
+    }
+    for (const e of parentRows) {
+      // 优先使用 lister 返回的真实绝对路径（search 全盘兜底可能命中父目录之外的位置），
+      // 否则兜底命中的目录会被错误拼到 parentDir 之下导致路径失真。
+      const abs = e.path && e.path.startsWith('/') ? e.path : remoteJoin(parentDir, e.name);
+      if (visited.has(abs)) continue;
+      visited.add(abs);
+      const rel = relFromRoot(remoteRoot, abs); // 父目录通常不是 remoteRoot 的子，返回 ''
+      const d = rel ? depthFromRoot(rel) : 0;
+      out.push({
+        absPath: abs,
+        name: e.name,
+        isDir: e.isDir,
+        bytes: e.size ?? 0,
+        mtime: e.mtime ?? 0,
+        relPath: rel,
+        depth: d,
+        childrenListed: false, // parentDir 顶层不展开子项（parent-only 语义）
+        origin: 'parent', // 来自同步根父目录直接子项
+      });
+    }
+    opts.onProgress?.({ scannedNodes: out.length, scannedBytes, truncated, currentPath: parentDir, phase: 'parent' });
   }
 
   // —— 入队 remoteRoot 直接子项（parent-only 模式到此为止）——
@@ -185,7 +255,7 @@ export async function walkRemoteTree(
             truncated = true;
             break;
           }
-          const abs = remoteJoin(remoteRoot, e.name);
+          const abs = e.path && e.path.startsWith('/') ? e.path : remoteJoin(remoteRoot, e.name);
           if (visited.has(abs)) continue;
           visited.add(abs);
           const rel = relFromRoot(remoteRoot, abs);
@@ -226,11 +296,13 @@ export async function walkRemoteTree(
     }
   }
 
-  // —— 进度回调（首次）——
+  // —— 进度回调（父目录层 + vault 顶层列表完成）——
   opts.onProgress?.({
     scannedNodes: out.length,
     scannedBytes,
     truncated,
+    currentPath: remoteRoot,
+    phase: 'walking',
   });
 
   // —— 并发展开队列（仅目录；full-vault 才入队，scoped 不入队）——
@@ -252,12 +324,20 @@ export async function walkRemoteTree(
     }
     // 该目录的子项确实被拉取过 → childrenListed=true（byParent 无子项时才能判「空目录」）
     if (item.node) item.node.childrenListed = true;
+    // 实时进度：每展开一个目录就上报当前路径，便于 UI 显示"扫到哪一层"（U1 反馈强化）
+    opts.onProgress?.({
+      scannedNodes: out.length,
+      scannedBytes,
+      truncated,
+      currentPath: item.absPath,
+      phase: 'walking',
+    });
     for (const r of rows) {
       if (out.length >= maxNodes) {
         truncated = true;
         break;
       }
-      const abs = remoteJoin(item.absPath, r.name);
+      const abs = r.path && r.path.startsWith('/') ? r.path : remoteJoin(item.absPath, r.name);
       if (visited.has(abs)) continue;
       visited.add(abs);
       const rel = relFromRoot(remoteRoot, abs);
@@ -285,6 +365,12 @@ export async function walkRemoteTree(
       }
       // 子目录决定是否继续入队（继续受 maxDepth + 全局预算控制）
       if (r.isDir) {
+        const reachedDepthLimit = opts.mode === 'full-vault' && d >= maxDepth && isFinite(maxDepth);
+        if (reachedDepthLimit) {
+          // 命中 maxDepth 上限：该目录的子树不再展开，其深层活跃文件无法被扫描，
+          // 后续分类器须据此跳过其孤儿目录判定（🟡#7）
+          node.depthTruncated = true;
+        }
         const shouldEnqueue =
           opts.mode === 'full-vault' && (d < maxDepth || !isFinite(maxDepth));
         if (shouldEnqueue) queue.push({ absPath: abs, relPath: rel, depth: d, node });
@@ -322,8 +408,10 @@ export async function walkRemoteTree(
     scannedNodes: out.length,
     scannedBytes,
     truncated,
+    currentPath: undefined,
+    phase: 'done',
   });
-  return { nodes: out, scannedNodes: out.length, scannedBytes, truncated, errors };
+  return { nodes: out, scannedNodes: out.length, scannedBytes, truncated, errors, warnings };
 }
 
 // ---------- 主入口：classifyOrphans ----------
@@ -341,6 +429,11 @@ export interface ClassifyOptions {
   isActive?: (relPath: string) => boolean | Promise<boolean>;
   /** 忽略 glob（与 walkRemoteTree 共用；可省略，但若两者都传需一致） */
   ignoreGlobs?: string[];
+  /** 本地 sync index 是否可信。换账号 / 索引重置 / 读取失败时 index 为空，
+   *  此时「索引依赖型」孤儿判定（orphan-file / orphan-dir）会把整库文件误判为可删除。
+   *  设 false 时仅保留「命名型备份目录」(backup-dir，不依赖索引) 的判定，避免误删整个 vault。
+   *  默认 true（信任索引）。🔴#4 */
+  trustIndex?: boolean;
 }
 
 export async function classifyOrphans(
@@ -348,6 +441,8 @@ export async function classifyOrphans(
   opts: ClassifyOptions,
 ): Promise<OrphanFinding[]> {
   const ignoreRegs = compileIgnoreGlobs(opts.ignoreGlobs);
+  // 🔴#4：索引不可信（为空/读取失败）时，索引依赖型孤儿判定会整库误标，仅保留命名型备份目录判定。
+  const trustIndex = opts.trustIndex !== false;
   const findings: OrphanFinding[] = [];
   // 按 absPath 索引，便于「目录下是否有 active 文件」判断
   const byParent = new Map<string, ScannedNode[]>();
@@ -383,11 +478,27 @@ export async function classifyOrphans(
     }
   }
 
+  // 🟡#7：任何因 maxDepth 而被截断子树的目录，其自身及全部祖先都无法断言「子树无活跃文件」，
+  // 列入 unsafeDirs，孤儿目录判定时跳过，避免把含深层活跃内容的目录误标为可删。
+  const unsafeDirs = new Set<string>();
+  for (const n of scanned) {
+    if (!n.depthTruncated) continue;
+    let p: string | undefined = n.absPath;
+    while (p && p !== '/') {
+      unsafeDirs.add(p);
+      p = remoteParent(p);
+    }
+  }
+
   for (const n of scanned) {
     // 1. ignore-globs 命中 → 跳过（直接忽略）
     if (isIgnored(n.relPath, ignoreRegs)) continue;
     // 2. 备份目录：名字匹配 vaultName + N 段时间戳 → 即便深度更深也算
     if (n.isDir) {
+      // 🟢 硬排除插件基础设施目录（.bdnsync / .bdnsync-base / .bdnsync-merge-draft /
+      // .bdnsync-backup 等）：它们是插件自身目录，绝不参与孤儿判定，避免被误标为可删
+      // （与 pickOrphans 的 PLUGIN_INFRA_HARD_EXCLUDE 单一事实源保持一致）。
+      if (PLUGIN_INFRA_HARD_EXCLUDE.has(n.name)) continue;
       // 主同步根（无时间戳）一定不是 orphan
       // 「vaultName」直接命中时 segments=0 / risk=0；调用方必须自己剔除
       const parsed = parseOrphanSegments(n.name, opts.vaultName);
@@ -412,7 +523,12 @@ export async function classifyOrphans(
         continue;
       }
       // 非备份目录：判断是否 orphan-dir（空 / 整棵子树无 active 文件）
+      // 🔴#4：索引不可信时不依赖索引判定孤儿目录，避免整库误标为可删除
+      if (!trustIndex) continue;
       const kids = byParent.get(n.absPath) ?? [];
+      // 🟡#8：判定「是否为空 / 是否含活跃文件」时，排除被忽略的子项（.DS_Store、用户 ignore-globs 等）。
+      // 否则「仅含被忽略文件」的目录会被当成空目录或整棵孤儿误标。
+      const realKids = kids.filter((k) => !isIgnored(k.relPath, ignoreRegs));
       // 🔴 安全护栏（vault 根误删）：relPath==='' 的目录位于 remoteRoot 之外，
       // 其中唯一会被展开出子项的节点就是「vault 根自身」（父目录层列出、子项来自
       // remoteRoot 列表）。本地索引为空（换账号 / 索引重置 / 读取失败）时整库文件都判
@@ -423,7 +539,9 @@ export async function classifyOrphans(
       if (!n.relPath) continue;
       // 子树内存在同步中的文件（传递性）→ 不能删
       if (protectedDirs.has(n.absPath)) continue;
-      if (kids.length === 0) {
+      if (realKids.length === 0) {
+        // 仅含被忽略子项的目录：无法断言为空（用户可能刻意忽略其内容），跳过不判（🟡#8）
+        if (kids.length > 0) continue;
         // 只有「实际列出过子项且确认为空」才判空目录孤儿；
         // 未展开的目录（childrenListed=false，如 parent-only 顶层 / scoped 非展开目录 /
         // full-vault 深度边界目录）无法断言为空 → 不判，避免把真实目录误报为孤儿。
@@ -443,8 +561,10 @@ export async function classifyOrphans(
           origin: n.origin,
         });
       } else {
+        // 🟡#7：子树因 maxDepth 截断，无法确认深层是否含活跃文件 → 跳过，避免误标
+        if (unsafeDirs.has(n.absPath)) continue;
         // 非空且整棵子树无 active 文件（protectedDirs 不含本目录）→ 全部子项均为孤儿
-        const bytes = kids.reduce((s, k) => s + (k.isDir ? 0 : k.bytes), 0);
+        const bytes = realKids.reduce((s, k) => s + (k.isDir ? 0 : k.bytes), 0);
         findings.push({
           kind: 'orphan-dir',
           fullPath: n.absPath,
@@ -455,7 +575,7 @@ export async function classifyOrphans(
           bytes,
           mtime: n.mtime,
           risk: 0,
-          reason: `目录内 ${kids.length} 项均不在 sync index 中`,
+          reason: `目录内 ${realKids.length} 项均不在 sync index 中`,
           segments: 0,
           origin: n.origin,
         });
@@ -465,6 +585,8 @@ export async function classifyOrphans(
     // 3. 文件：relPath 为空说明不在 vault 内（属于父目录或外部），跳过
     if (!n.relPath) continue;
     if (isIgnored(n.relPath, ignoreRegs)) continue;
+    // 🔴#4：索引不可信时不依赖索引判定孤儿文件，避免整库误标为可删除
+    if (!trustIndex) continue;
     // active? → 跳过
     if (opts.isActive) {
       let active = false;
@@ -582,6 +704,7 @@ export async function runDeepScan(
     vaultName: classifyOpts.vaultName,
     isActive: classifyOpts.isActive,
     ignoreGlobs,
+    trustIndex: classifyOpts.trustIndex,
   });
   return {
     findings,
@@ -590,5 +713,6 @@ export async function runDeepScan(
     truncated: walked.truncated,
     durationMs: Date.now() - t0,
     errors: walked.errors,
+    warnings: walked.warnings,
   };
 }

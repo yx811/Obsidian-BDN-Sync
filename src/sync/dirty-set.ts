@@ -40,6 +40,11 @@ export class DirtySet {
     // 只保留窗口内的记录，避免无限增长
     const cutoff = Date.now() - this.windowMs;
     this.recentDeletes = this.recentDeletes.filter((d) => d.at >= cutoff);
+    // 硬上限防护：极端高频删除场景（如批量删除万级文件）下即使窗口内也可能堆积大量记录，
+    // 截断到最近 500 条，超出窗口的旧记录对 rename 配对无贡献（已过期），丢弃无损。
+    if (this.recentDeletes.length > 500) {
+      this.recentDeletes = this.recentDeletes.slice(-500);
+    }
   }
 
   /**

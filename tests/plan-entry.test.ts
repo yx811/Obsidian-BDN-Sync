@@ -199,7 +199,9 @@ describe('planEntry — bidirectional', () => {
 });
 
 describe('planEntry — force-upload (local is truth)', () => {
-  it('skips identical files', () => {
+  // 🔴#1 回归：强制上传即「本地为真相直接覆盖」，不再比较哈希。即便与远端完全一致，
+  // 也必须 upload（重新覆盖），否则用户点「强制上传」却得到「无变更」。
+  it('overwrites even when identical to remote (local is truth)', () => {
     const a = first('a.md', {
       ...base,
       L: fs('a.md', 'h1'),
@@ -207,7 +209,7 @@ describe('planEntry — force-upload (local is truth)', () => {
       S: null,
       direction: 'force-upload',
     });
-    expect(a.type).toBe('skip');
+    expect(a.type).toBe('upload');
   });
   it('uploads any local file not identical to remote', () => {
     const a = first('a.md', {
@@ -218,6 +220,16 @@ describe('planEntry — force-upload (local is truth)', () => {
       direction: 'force-upload',
     });
     expect(a.type).toBe('upload');
+  });
+  it('skips empty local file (Baidu cannot store 0-byte files)', () => {
+    const a = first('empty.md', {
+      ...base,
+      L: fs('empty.md', 'd41d8cd98f00b204e9800998ecf8427e', { size: 0 }),
+      R: null,
+      S: null,
+      direction: 'force-upload',
+    });
+    expect(a.type).toBe('skip');
   });
   it('deletes remote-only files', () => {
     const a = first('a.md', {

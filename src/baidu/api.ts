@@ -435,10 +435,13 @@ export class BaiduApi {
   private async request(
     url: string,
     init: { method?: string; headers?: Record<string, string>; body?: ArrayBuffer | string } = {},
-    opts: { skipAuth?: boolean } = {},
+    opts: { skipAuth?: boolean; skipThrottle?: boolean } = {},
   ): Promise<RawResp> {
     if (!opts.skipAuth) this.ensureAuth();
-    await this.throttle();
+    // 大流量数据面（分片上传 / 整文件下载）不参与 QPS 节流：百度限流主要针对
+    // 元数据接口（list/precreate/create 等）。若按 550ms 逐请求限速数据面，
+    // 全局共享 lastRequestAt 会把大文件分片上传/批量下载压成近似串行龟速。
+    if (!opts.skipThrottle) await this.throttle();
     try {
       const resp = await requestUrl({
         url,
@@ -712,7 +715,7 @@ export class BaiduApi {
    */
   private async openRequest(
     url: string,
-    opts: { method?: string; params?: Record<string, string>; retried?: boolean } = {},
+    opts: { method?: string; params?: Record<string, string>; retried?: boolean; skipThrottle?: boolean } = {},
   ): Promise<BaiduApiResponse> {
     const token = await this.accessToken();
     const sep = url.includes('?') ? '&' : '?';
@@ -720,12 +723,16 @@ export class BaiduApi {
     const headers = { 'User-Agent': PCS_UA };
     const resp =
       opts.method === 'POST'
-        ? await this.request(fullUrl, {
-            method: 'POST',
-            headers,
-            body: this.formBody(opts.params || {}),
-          })
-        : await this.request(fullUrl, { method: 'GET', headers });
+        ? await this.request(
+            fullUrl,
+            {
+              method: 'POST',
+              headers,
+              body: this.formBody(opts.params || {}),
+            },
+            { skipThrottle: opts.skipThrottle },
+          )
+        : await this.request(fullUrl, { method: 'GET', headers }, { skipThrottle: opts.skipThrottle });
     const data = safeJson(resp) as BaiduApiResponse;
     const errno = Number(data?.errno);
     if ((resp.status === 401 || AUTH_ERRNOS.includes(errno)) && !opts.retried) {
@@ -945,10 +952,25 @@ export class BaiduApi {
 
   // ---------- 目录列表 ----------
 
-  /** 列出目录（单层）。errno -9/-7（不存在）返回空数组。网络抖动/限流自动重试 */
-  async listDir(dir: string): Promise<RemoteRawEntry[]> {
+  /**
+   * 列出目录（单层）。
+   * 默认行为：errno -9/-7（不存在/不可列）静默返回空数组（同步链路依赖此语义，
+   * 把"目录不存在"当作"空"处理，避免同步中断）。
+   * strict=true：errno -9/-7 改为**抛错**——供孤儿扫描等需要区分「真空 vs 读取失败」
+   * 的调用方使用，否则空结果被当真会导致"网盘里明明有孤儿却扫描为 0"。
+   */
+  async listDir(dir: string, o: { strict?: boolean } = {}): Promise<RemoteRawEntry[]> {
     this.ensureAuth();
     const out: RemoteRawEntry[] = [];
+    const fail = (errno: number, raw: unknown): RemoteRawEntry[] => {
+      if (o.strict) {
+        throw new BaiduApiError(errno, errnoMessage(errno, `列出目录 ${dir} 失败（strict）`), {
+          code: errnoToCode(errno),
+          raw,
+        });
+      }
+      return out;
+    };
     if (this.auth.mode === 'openapi') {
       let start = 0;
       for (;;) {
@@ -961,7 +983,7 @@ export class BaiduApi {
           { label: `listDir ${dir}` },
         );
         const errno = Number(data?.errno ?? 0);
-        if (errno === -9 || errno === -7) return out;
+        if (errno === -9 || errno === -7) return fail(errno, data);
         if (errno !== 0)
           throw new BaiduApiError(errno, errnoMessage(errno, `列出目录 ${dir} 失败`), {
             code: errnoToCode(errno),
@@ -983,7 +1005,7 @@ export class BaiduApi {
       );
       const data = safeJson<BaiduListResp>(resp);
       const errno = Number(data?.errno ?? 1);
-      if (errno === -9 || errno === -7) return out;
+      if (errno === -9 || errno === -7) return fail(errno, data);
       if (errno !== 0)
         throw new BaiduApiError(errno, errnoMessage(errno, `列出目录 ${dir} 失败`), {
           code: errnoToCode(errno),
@@ -1228,10 +1250,14 @@ export class BaiduApi {
       headers = { 'User-Agent': PCS_UA };
       const resp = await transientRetry(
         () =>
-          this.request(`${dlink}${sep}access_token=${encodeURIComponent(token)}`, {
-            method: 'GET',
-            headers,
-          }),
+          this.request(
+            `${dlink}${sep}access_token=${encodeURIComponent(token)}`,
+            {
+              method: 'GET',
+              headers,
+            },
+            { skipThrottle: true },
+          ),
         { label: `download ${path}` },
       );
       // 直链失败时百度可能返回 JSON 错误体（如 errno=31326 容量不足、errno=-20 文件不存在），
@@ -1260,9 +1286,10 @@ export class BaiduApi {
       return new Uint8Array(resp.arrayBuffer);
     }
     headers = this.webHeaders();
-    let resp = await transientRetry(() => this.request(dlink, { method: 'GET', headers }), {
-      label: `download ${path}`,
-    });
+    let resp = await transientRetry(
+      () => this.request(dlink, { method: 'GET', headers }, { skipThrottle: true }),
+      { label: `download ${path}` },
+    );
     if (resp.status >= 400 || resp.arrayBuffer.byteLength === 0) {
       // Web UA 失败时切换 PCS UA 重试
       resp = await this.request(dlink, {
@@ -1411,7 +1438,7 @@ export class BaiduApi {
         ];
         for (const v of variants) {
           try {
-            const resp = await this.request(url, v.init);
+            const resp = await this.request(url, v.init, { skipThrottle: true });
             const data: BaiduApiResponse =
               safeJson<BaiduApiResponse>(resp) ?? ({} as BaiduApiResponse);
             const errno = Number(data?.error_code ?? data?.errno ?? 0);
@@ -1768,28 +1795,84 @@ export class BaiduApi {
     await this.fileManager('rename', path, '', newName);
   }
 
-  /** 云端搜索（返回匹配条目，按名称模糊匹配） */
-  async search(keyword: string, dir = '/'): Promise<RemoteRawEntry[]> {
+  /**
+   * 云端搜索（按名称模糊匹配）。
+   * openapi 模式：优先走官方搜索接口 `rest/2.0/xpan/multimedia?method=search`（POST，
+   * 支持目录条目），dir 限定命中为空时自动升级为**全盘搜索**（dir=/，recursion=1）——
+   * 覆盖「孤儿备份目录在沙箱根（/apps/<app>，list 常因 errno=-9 不可列）但 list 读不到」
+   * 的兜底场景；两路都空时再试 web 兼容接口 file?method=search（GET）一次。
+   * cookie 模式：保持 web 端接口（/api/search，补 recursion 递归参数）。
+   */
+  async search(
+    keyword: string,
+    dir = '/',
+    o: { recursive?: boolean; limit?: number } = {},
+  ): Promise<RemoteRawEntry[]> {
     this.ensureAuth();
+    const recursive = o.recursive !== false ? 1 : 0;
+    const limit = Math.max(1, Math.min(o.limit || 500, 500));
     const out: RemoteRawEntry[] = [];
+    const seen = new Set<string>();
+    const pushList = (list: BaiduRawEntry[]): void => {
+      for (const it of list) {
+        const p = String(it.path || '');
+        if (seen.has(p)) continue;
+        seen.add(p);
+        out.push(mapEntry(it));
+      }
+    };
     if (this.auth.mode === 'openapi') {
-      const data: BaiduApiResponse = await this.openRequest(
-        `https://pan.baidu.com/rest/2.0/xpan/file?method=search&dir=${encodeURIComponent(dir)}&key=${encodeURIComponent(keyword)}&limit=50&web=1`,
-        { method: 'GET' },
-      );
-      const errno = Number(data?.errno ?? 0);
-      if (errno !== 0 && errno !== -9) return out;
-      const list: BaiduRawEntry[] = Array.isArray(data?.list) ? data.list : [];
-      for (const it of list) out.push(mapEntry(it));
+      // 第一路：官方搜索接口（POST，能返回目录条目）。dir 限定 → 空则全盘。
+      for (const dirTry of [dir || '/', '/']) {
+        try {
+          const data = await this.openRequest(
+            'https://pan.baidu.com/rest/2.0/xpan/multimedia?method=search',
+            {
+              method: 'POST',
+              params: {
+                key: keyword,
+                dir: dirTry,
+                recursion: String(recursive),
+                limit: String(limit),
+                web: '1',
+              },
+            },
+          );
+          const errno = Number(data?.errno ?? 0);
+          if (errno === 0) {
+            const list: BaiduRawEntry[] = Array.isArray(data?.list) ? data.list : [];
+            pushList(list);
+            if (out.length > 0) break; // 命中即停；空则升级全盘
+          }
+        } catch {
+          // 限流/网络抖动 → 尝试下一路（全盘），最终仍空时再试 web 兼容接口
+        }
+      }
+      // 第二路：web 兼容接口（GET 全盘）兜底
+      if (out.length === 0) {
+        try {
+          const data = await this.openRequest(
+            `https://pan.baidu.com/rest/2.0/xpan/file?method=search&dir=${encodeURIComponent('/')}&key=${encodeURIComponent(keyword)}&recursion=1&limit=${limit}&web=1`,
+            { method: 'GET' },
+          );
+          const errno = Number(data?.errno ?? 0);
+          if (errno === 0 || errno === -9) {
+            const list: BaiduRawEntry[] = Array.isArray(data?.list) ? data.list : [];
+            pushList(list);
+          }
+        } catch {
+          /* 忽略，返回已收集结果 */
+        }
+      }
       return out;
     }
-    const url = `https://pan.baidu.com/api/search?dir=${encodeURIComponent(dir)}&key=${encodeURIComponent(keyword)}&num=50&web=1&channel=dubox&clienttype=0`;
+    const url = `https://pan.baidu.com/api/search?dir=${encodeURIComponent(dir || '/')}&key=${encodeURIComponent(keyword)}&recursion=${recursive}&num=500&web=1&channel=dubox&clienttype=0`;
     const resp = await this.request(url, { method: 'GET', headers: this.webHeaders() });
     const data = safeJson<BaiduListResp>(resp);
     const errno = Number(data?.errno ?? 0);
     if (errno !== 0 && errno !== -9) return out;
     const list: BaiduRawEntry[] = Array.isArray(data?.list) ? data.list : [];
-    for (const it of list) out.push(mapEntry(it));
+    pushList(list);
     return out;
   }
 }

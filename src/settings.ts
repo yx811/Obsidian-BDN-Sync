@@ -280,8 +280,8 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const headerIcon = header.createDiv({ cls: 'bdnsync-setting-header-icon' });
     setIcon(headerIcon, 'cloud', 24);
     const headerText = header.createDiv({ cls: 'bdnsync-setting-header-title' });
-    headerText.createEl('h2', { text: 'BDNSync' });
-    headerText.createEl('p', { text: '百度网盘同步设置' });
+    headerText.createEl('h2', { text: 'BDNS Sync' });
+    headerText.createEl('p', { text: '百度网盘同步设置', cls: 'bdnsync-setting-header-subtitle' });
 
     // 未配置认证时显示引导
     if (!this.plugin.hasAuth()) {
@@ -1446,9 +1446,10 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const s = this.plugin.settings;
     new Setting(container)
       .setName('分片大小')
-      .setDesc('大文件分片上传的单片大小')
+      .setDesc('大文件分片上传的单片大小。分片越大分片请求越少，上传越快（8-32 MB 推荐）')
       .addDropdown((d) => {
         d.addOption('4', '4 MB');
+        d.addOption('8', '8 MB');
         d.addOption('16', '16 MB');
         d.addOption('32', '32 MB');
         d.setValue(String(s.chunkSizeMB));
@@ -1488,12 +1489,14 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(container)
       .setName('请求间隔（毫秒）')
-      .setDesc('内置 QPS 节流，避免触发网盘限流。默认 550')
+      .setDesc(
+        '元数据接口（列表/预创建/合并等）的 QPS 节流，避免触发网盘限流。200-300 为推荐值；分片上传与文件下载不参与此节流（已优化为全速）',
+      )
       .addText((t) => {
         t.setValue(String(s.requestIntervalMs));
         t.onChange(async (v) => {
           const n = parseInt(v, 10);
-          if (!Number.isNaN(n) && n >= 200 && n <= 5000) {
+          if (!Number.isNaN(n) && n >= 50 && n <= 5000) {
             s.requestIntervalMs = n;
             await this.plugin.saveSettings();
           }

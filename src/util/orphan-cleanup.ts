@@ -112,6 +112,12 @@ export interface RemoteDirRow {
 /** 远端递归列出接口（由 BaiduApi 实现）。单层列出，仅用于"估算孤儿是否有数据"——不必深递归。 */
 export interface RemoteLister {
   listDir(remoteDir: string): Promise<RemoteDirRow[]>;
+  /**
+   * 可选：云端搜索兜底。当 `listDir(父目录)` 因 errno=-9（沙箱根不可列）等返回空 / 抛错时，
+   * 由 scan 引擎改用 `search("${vaultName}_", parentDir)` 反向枚举 sandbox 内疑似孤儿备份目录。
+   * 由 BaiduApi.search 实现；不实现时（如测试 fake lister）扫描引擎退化为"父目录层只读 listDir"。
+   */
+  search?(keyword: string, dir: string): Promise<RemoteDirRow[]>;
 }
 
 /** 远端删除接口 */
@@ -194,32 +200,40 @@ export function pickOrphans(
  * 失败容错：单目录扫不到时记 0，不抛出。
  * 审计 #10：仅含嵌套目录（直接子项全为目录）时 fileCount 可能为 0，这里把
  * 「有任意子项」也视为有数据（fileCount 至少 1），避免按字节过滤时把非空孤儿判空。
+ * 性能优化：批量候选时用并发（3 路）替代串行，减少大量候选时的总等待时间。
  */
 export async function measureOrphans(
   lister: RemoteLister,
   items: OrphanEntry[],
 ): Promise<OrphanEntry[]> {
-  const out: OrphanEntry[] = [];
-  for (const it of items) {
-    try {
-      const rows = await lister.listDir(it.fullPath);
-      let files = 0;
-      let bytes = 0;
-      for (const r of rows) {
-        if (!r.isDir) {
-          files += 1;
-          bytes += r.size ?? 0;
+  // 并发测量：3 路（与 orphan-scan 默认并发一致），避免大量候选时串行等待
+  const concurrency = 3;
+  const results = new Array<OrphanEntry>(items.length);
+  let idx = 0;
+  const worker = async () => {
+    while (idx < items.length) {
+      const i = idx++;
+      const it = items[i];
+      try {
+        const rows = await lister.listDir(it.fullPath);
+        let files = 0;
+        let bytes = 0;
+        for (const r of rows) {
+          if (!r.isDir) {
+            files += 1;
+            bytes += r.size ?? 0;
+          }
         }
+        if (rows.length > 0 && files === 0) files = 1;
+        results[i] = { ...it, fileCount: files, totalBytes: bytes };
+      } catch {
+        results[i] = { ...it, fileCount: 0, totalBytes: 0, measureError: true };
       }
-      if (rows.length > 0 && files === 0) files = 1; // 有子项（哪怕全为目录）即视为有数据
-      out.push({ ...it, fileCount: files, totalBytes: bytes });
-    } catch {
-      // 列出失败也要返回，让用户在 UI 看到（用 0 占位）；
-      // 同时置 measureError=true，UI 据此显式标「测量失败」而非误导性的「0 文件 · 0 B」
-      out.push({ ...it, fileCount: 0, totalBytes: 0, measureError: true });
     }
-  }
-  return out;
+  };
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -254,6 +268,14 @@ export async function deleteOrphans(
   const retries = Math.max(0, opts.retries ?? 2);
   const delayMs = Math.max(0, opts.delayMs ?? 300);
   for (const it of items) {
+    // 🟡#6 防御性护栏：插件基础设施目录（.bdnsync / .bdnsync-base / .bdnsync-merge-draft /
+    // .bdnsync-backup 等）无论调用方如何传入，一律拒绝删除，避免误删导致插件瘫痪。
+    // 即便上层 UI 已过滤，这里作为最后一道硬门禁（纵深防御）。
+    const baseName = it.fullPath.split('/').pop() ?? it.name;
+    if (PLUGIN_INFRA_HARD_EXCLUDE.has(baseName)) {
+      failed.push({ path: it.fullPath, error: '插件基础设施目录，已拒绝删除（安全护栏）' });
+      continue;
+    }
     let lastErr = '';
     let lastErrno: number | undefined;
     let done = false;

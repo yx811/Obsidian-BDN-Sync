@@ -1,7 +1,7 @@
 {
   "id": "bdnsync",
   "name": "BDNSync",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "minAppVersion": "1.13.7",
   "description": "百度网盘同步：双模式连接（Cookie 仅下载/列表/删除；OpenAPI 设备码扫码授权支持完整上传）、三向冲突合并、墓碑删除同步、实时/自动/手动三种同步模式、AES-256-GCM 端到端加密、断点续传。",
   "author": "Game811",

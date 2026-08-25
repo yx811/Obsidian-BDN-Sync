@@ -16,6 +16,7 @@ function baseResult(over: Partial<SyncResult> = {}): SyncResult {
     errors: 0,
     bytesUp: 0,
     bytesDown: 0,
+    dirsCreated: 0,
     errorMessages: [],
     ...over,
   };

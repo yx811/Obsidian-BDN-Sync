@@ -5,6 +5,8 @@ import type { DataAdapter, ListedFiles, Stat } from 'obsidian';
 export class MemDataAdapter implements DataAdapter {
   /** 绝对路径（带前导 /） → 内容（文本或二进制） */
   private files = new Map<string, Uint8Array>();
+  /** 显式创建的目录（含空目录，用于验证空文件夹同步路径） */
+  private folders = new Set<string>();
 
   /** 构造时可选预置一批文件（path → 文本） */
   constructor(seed?: Record<string, string>) {
@@ -18,6 +20,7 @@ export class MemDataAdapter implements DataAdapter {
   private existsSync(path: string): boolean {
     const p = norm(path);
     if (this.files.has(p)) return true;
+    if (this.folders.has(p)) return true;
     // 目录存在性：是否有任意文件以该前缀开头
     const dirPrefix = p.endsWith('/') ? p : `${p}/`;
     for (const k of this.files.keys()) if (k.startsWith(dirPrefix)) return true;
@@ -33,6 +36,9 @@ export class MemDataAdapter implements DataAdapter {
     const content = this.files.get(p);
     if (content !== undefined) {
       return { type: 'file', size: content.length, ctime: 0, mtime: Date.now() };
+    }
+    if (this.folders.has(p)) {
+      return { type: 'folder', size: 0, ctime: 0, mtime: Date.now() };
     }
     if (this.existsSync(p)) {
       return { type: 'folder', size: 0, ctime: 0, mtime: Date.now() };
@@ -58,10 +64,25 @@ export class MemDataAdapter implements DataAdapter {
         files.push(k);
       }
     }
+    // 显式目录（含空目录）：作为直接子项列出
+    for (const f of this.folders) {
+      if (prefix && !f.startsWith(prefix)) continue;
+      let rest = f.slice(prefix.length);
+      if (rest.startsWith('/')) rest = rest.slice(1);
+      if (!rest) continue;
+      const slash = rest.indexOf('/');
+      if (slash >= 0) folders.add(rest.slice(0, slash));
+      else folders.add(rest);
+    }
     return {
       files: [...files].sort(),
       folders: [...folders].sort(),
     };
+  }
+
+  /** 测试辅助：创建（空）目录，模拟 Obsidian 的 TFolder 创建 */
+  createFolder(path: string): void {
+    this.folders.add(norm(path));
   }
 
   async read(path: string): Promise<string> {

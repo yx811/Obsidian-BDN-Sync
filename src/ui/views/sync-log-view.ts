@@ -38,6 +38,9 @@ export class SyncLogView extends ItemView {
   private statBar!: HTMLElement;
   private unsub: (() => void) | null = null;
   private pendingRender = false;
+  /** 🟡#16：跨实时重渲染保留的「已展开」行集合（按 entry id）。
+   *  新日志到达触发整体重建时，已展开的行不会因 DOM 重建而折叠。 */
+  private expandedIds = new Set<string>();
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -332,7 +335,10 @@ export class SyncLogView extends ItemView {
     row.className = `bdnsync-log-row bdnsync-log-level-${log.level}${log.deleted ? ' bdnsync-log-row-tomb' : ''}`;
     row.tabIndex = 0;
     row.setAttribute('role', 'button');
-    row.setAttribute('aria-expanded', 'false');
+    // 🟡#16：恢复该行的持久化展开状态，避免实时重渲染后已展开的行被折叠
+    const isOpen = this.expandedIds.has(log.id);
+    row.setAttribute('aria-expanded', String(isOpen));
+    if (isOpen) row.classList.add('is-expanded');
     row.setAttribute('aria-label', '展开日志详情');
 
     // 左侧级别色条
@@ -384,15 +390,18 @@ export class SyncLogView extends ItemView {
       this.downloadFile(`log-${log.id}.txt`, this.logger.exportTextOne(log), 'text/plain'),
     );
 
-    // 详情面板（默认折叠，点击整行展开）
+    // 详情面板（默认折叠，点击整行展开；已展开的行按持久化状态恢复，🟡#16）
     const details = row.createDiv({ cls: 'bdnsync-log-details' });
-    details.style.display = 'none';
+    details.style.display = isOpen ? 'block' : 'none';
     this.renderDetails(details, log);
 
     const toggle = () => {
       const expanded = row.classList.toggle('is-expanded');
       row.setAttribute('aria-expanded', String(expanded));
       details.style.display = expanded ? 'block' : 'none';
+      // 🟡#16：更新持久化集合，使后续重渲染能恢复展开态
+      if (expanded) this.expandedIds.add(log.id);
+      else this.expandedIds.delete(log.id);
     };
     row.addEventListener('click', (e) => {
       // 点击行内操作按钮时不触发折叠
@@ -409,7 +418,7 @@ export class SyncLogView extends ItemView {
     return row;
   }
 
-  /** 展开态详情：结构化字段 + 内容提炼（结论 / 上下文 / 折叠技术堆栈） */
+  /** 展开态详情：结构化字段 + 内容提炼（结论 / 上下文 / 折叠技术堆栈 / 原始消息） */
   private renderDetails(container: HTMLElement, log: SyncLogEntry): void {
     const grid = container.createDiv({ cls: 'bdnsync-log-detail-grid' });
     this.addDetailField(grid, '发生时间', this.formatFullTime(log.time));
@@ -417,7 +426,23 @@ export class SyncLogView extends ItemView {
     this.addDetailField(grid, '严重程度', LEVEL_LABEL[log.level]);
     this.addDetailField(grid, '来源模块', MODULE_LABEL[log.module]);
     this.addDetailField(grid, '业务类型', this.typeLabel(log.type));
-    if (log.path) this.addDetailField(grid, '相关路径', log.path, true);
+    if (log.path) {
+      const pathField = this.addDetailField(grid, '相关路径', log.path, true, true);
+      // 路径点击 → 在 Obsidian 主区域打开对应文件/笔记
+      pathField.classList.add('bdnsync-log-path-clickable');
+      pathField.addEventListener('click', () => {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const p = log.path!;
+        const af = this.app.vault.getAbstractFileByPath(p);
+        if (af) void this.app.workspace.openLinkText(p, '/', false);
+        else new Notice(`BDNSync：路径不存在或已被删除：${p}`);
+      });
+    }
+    // errno 解析（如果 message 里出现 "errno=N" 形式，识别并显示人话说明）
+    const errnoHit = this.extractErrno(log.message);
+    if (errnoHit !== null) {
+      this.addDetailField(grid, '错误码', `errno=${errnoHit}（${this.errnoHint(errnoHit)}）`);
+    }
     if (log.deleted) {
       const st = log.deletedAt
         ? `已标记删除（${this.formatRelative(log.deletedAt)}标记）`
@@ -449,6 +474,37 @@ export class SyncLogView extends ItemView {
       const pre = d.createEl('pre', { cls: 'bdnsync-log-stack-pre' });
       pre.textContent = parsed.stack.join('\n');
     }
+
+    // 原始消息全文：默认折叠，用户主动展开时查看（区别于"内容提炼"）
+    const raw = section.createEl('details', { cls: 'bdnsync-log-raw' });
+    raw.createEl('summary', { text: '原始消息（全文）' });
+    const pre = raw.createEl('pre', { cls: 'bdnsync-log-raw-pre' });
+    pre.textContent = log.message;
+  }
+
+  /** 从日志文本中提取 errno=N（百度/Node 错误常见形式） */
+  private extractErrno(msg: string): number | null {
+    const m = /errno[=:]?\s*(-?\d+)/i.exec(msg);
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    return isNaN(n) ? null : n;
+  }
+
+  /** 百度网盘 OpenAPI 常见 errno 速查（与 README 「errno 速查」一致） */
+  private errnoHint(n: number): string {
+    const map: Record<number, string> = {
+      [-9]: '文件不存在',
+      [-7]: '文件或目录名不合法',
+      [2]: '参数错误',
+      [10]: '创建文件失败',
+      [12]: '部分失败（批量中单条）',
+      [31034]: '接口调用频率超限（百度 QPS 限制）',
+      [31039]: '操作频繁（被风控）',
+      [31355]: '上传/同步限流',
+      [102]: '沙箱根被越过（调用方 bug）',
+      [404]: '网盘路径不存在',
+    };
+    return map[n] ?? '未知错误码（百度网盘 OpenAPI 文档）';
   }
 
   private addDetailField(
@@ -456,13 +512,15 @@ export class SyncLogView extends ItemView {
     label: string,
     value: string,
     mono = false,
-  ): void {
+    clickable = false,
+  ): HTMLElement {
     const item = grid.createDiv({ cls: 'bdnsync-log-detail-field' });
     item.createSpan({ cls: 'bdnsync-log-detail-label', text: label });
     const v = item.createSpan({
-      cls: `bdnsync-log-detail-value${mono ? ' is-mono' : ''}`,
+      cls: `bdnsync-log-detail-value${mono ? ' is-mono' : ''}${clickable ? ' is-clickable' : ''}`,
     });
     v.textContent = value;
+    return v;
   }
 
   private typeLabel(t: SyncLogEntry['type']): string {

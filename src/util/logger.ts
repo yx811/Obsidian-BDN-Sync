@@ -9,6 +9,7 @@
 
 import type { LogFilter, LogLevel, LogModule, SyncLogEntry } from '../types';
 import { LogStore } from './log-store';
+import { redactSecrets } from '../baidu/api';
 
 /** 级别严重程度权重（越大越重要） */
 const LEVEL_WEIGHT: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -111,6 +112,9 @@ export class Logger {
     } else {
       msg = message;
     }
+    // 🔴#5 脱敏：凭证明文（access_token / BDUSS / STOKEN …）可能随错误对象或字符串进入日志，
+    // 落盘 / 控制台镜像前必须脱敏，避免敏感信息写入磁盘日志文件或泄露到开发者工具。
+    msg = redactSecrets(msg);
 
     const entry: SyncLogEntry = {
       id: genId(),
@@ -162,16 +166,26 @@ export class Logger {
 
   private enforceCapacity(): void {
     const max = Math.max(1, this.opts.maxEntries);
-    while (this.index.size > max) {
-      let tombstonedKey: string | null = null;
-      let firstKey: string | null = null;
+    if (this.index.size <= max) return;
+    const toDrop = this.index.size - max;
+    let dropped = 0;
+    // 第一轮：优先淘汰墓碑条目（O(n) 单次扫描，不再每条淘汰都全表遍历，🟢 性能）
+    if (toDrop > 0) {
       for (const [k, e] of this.index) {
-        if (firstKey === null) firstKey = k;
-        if (tombstonedKey === null && e.deleted) tombstonedKey = k;
+        if (dropped >= toDrop) break;
+        if (e.deleted) {
+          this.index.delete(k);
+          dropped += 1;
+        }
       }
-      const dropKey = tombstonedKey ?? firstKey;
-      if (dropKey === null) break;
-      this.index.delete(dropKey);
+    }
+    // 第二轮：从最旧（Map 插入序 = 时间序）起淘汰剩余超出部分
+    if (dropped < toDrop) {
+      for (const k of this.index.keys()) {
+        if (dropped >= toDrop) break;
+        this.index.delete(k);
+        dropped += 1;
+      }
     }
   }
 
@@ -190,10 +204,20 @@ export class Logger {
     return { removedDays: 0, removedEntries: 0 };
   }
 
-  /** 物理清空所有条目（不可恢复）：内存清空 + 今天缓冲清空（磁盘历史由 retention 自然淘汰） */
+  /** 物理清空所有条目（不可恢复）：内存清空 + 今天缓冲清空（磁盘历史由 retention/自然淘汰） */
   clearAll(): void {
     this.index.clear();
     this.store?.resetTodayBuffer();
+  }
+
+  /** 单条软删除（两阶段删除的第一步，🟡#14 补齐墓碑机制入口）：
+   *  置 deleted=true + deletedAt，并在所在日期分片落盘。之后由 purge 按宽限期物理清除。 */
+  deleteEntry(id: string): void {
+    const e = this.index.get(id);
+    if (!e || e.deleted) return;
+    const tomb: SyncLogEntry = { ...e, deleted: true, deletedAt: Date.now() };
+    this.index.set(id, tomb);
+    this.store?.tombstoneEntry(tomb);
   }
 
   /** 整合筛选：时间范围 / 级别 / 模块 / 业务类型 / 关键字（正则）/ 含墓碑 / 排序 */
@@ -314,6 +338,7 @@ export function parseLogMessage(raw: string): ParsedLogMessage {
   const context: string[] = [];
   const stack: string[] = [];
   const STACK_CAP = 30; // 技术堆栈最多保留 30 帧，避免超长 dump
+  const CONTEXT_CAP = 60; // 🟢 上下文行数上限，避免极长 message 撑爆展开视图
   for (let i = 1; i < lines.length; i++) {
     const ln = lines[i].replace(/\s+$/, '');
     const trimmed = ln.trim();
@@ -325,7 +350,7 @@ export function parseLogMessage(raw: string): ParsedLogMessage {
     // 跳过与结论重复的 "Error: xxx" 标题行（堆栈首行常与结论重复）
     const deErr = trimmed.replace(/^Error:\s*/i, '');
     if (deErr && deErr === summary) continue;
-    context.push(trimmed);
+    if (context.length < CONTEXT_CAP) context.push(trimmed); // 超出部分直接丢弃
   }
   return { summary, context, stack };
 }
@@ -333,11 +358,12 @@ export function parseLogMessage(raw: string): ParsedLogMessage {
 function isValidEntry(e: unknown): e is SyncLogEntry {
   if (!e || typeof e !== 'object') return false;
   const o = e as Record<string, unknown>;
-  return (
-    typeof o.time === 'number' &&
-    typeof o.type === 'string' &&
-    typeof o.message === 'string' &&
-    typeof o.level === 'string' &&
-    typeof o.module === 'string'
-  );
+  if (typeof o.time !== 'number') return false;
+  if (typeof o.type !== 'string') return false;
+  if (typeof o.message !== 'string') return false;
+  // 🟡#11：level / module 必须在枚举内，否则导出会写出 undefined 标签（MODULE_LABEL[level] 越界）。
+  // 损坏或旧版日志里出现非法枚举时直接丢弃该条，避免污染内存索引与导出结果。
+  if (typeof o.level !== 'string' || !(o.level in LEVEL_WEIGHT)) return false;
+  if (typeof o.module !== 'string' || !(o.module in MODULE_LABEL)) return false;
+  return true;
 }

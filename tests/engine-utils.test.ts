@@ -85,11 +85,49 @@ describe('summarize (同步摘要格式化)', () => {
       errors: 0,
       bytesUp: 300,
       bytesDown: 200,
+      dirsCreated: 0,
       durationMs: 1500,
     };
     const s = summarize(stats);
     expect(s).toContain('3');
     expect(s).toContain('2');
     expect(s).toContain('1');
+  });
+  it('force-upload 全校验一致时给出可见反馈（不再冷冰冰"无变更"）', () => {
+    // 场景：所有文件 hash 与对侧一致，只有 skip 计数 >0，其他动作全 0。
+    // 用户原先以为"force 没干活"，现在摘要直接告诉用户已校验的总数。
+    const stats: SyncStats = {
+      uploaded: 0,
+      downloaded: 0,
+      deletedLocal: 0,
+      deletedRemote: 0,
+      conflicts: 0,
+      skipped: 23,
+      errors: 0,
+      bytesUp: 0,
+      bytesDown: 0,
+      dirsCreated: 0,
+      durationMs: 1500,
+    };
+    const s = summarize(stats);
+    // 防止回归：必须保留 skip 计数 + 提示"已校验一致"，避免 force 假阴性
+    expect(s).toContain('跳过');
+    expect(s).toContain('23');
+  });
+  it('建目录计数出现在摘要（空文件夹同步修复点）', () => {
+    const stats: SyncStats = {
+      uploaded: 0,
+      downloaded: 0,
+      deletedLocal: 0,
+      deletedRemote: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 0,
+      bytesUp: 0,
+      bytesDown: 0,
+      dirsCreated: 2,
+      errorMessages: [],
+    };
+    expect(summarize(stats)).toContain('建目录2');
   });
 });

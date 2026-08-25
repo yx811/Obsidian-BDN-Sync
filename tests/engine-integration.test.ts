@@ -333,8 +333,8 @@ describe('引擎集成：force 方向（破坏性修复）', () => {
       isDir: false,
     });
     const res = (await h.engine.fullSync('manual', 'force-upload')) as SyncResult;
-    expect(res.uploaded).toBe(0); // 本地文件已与云端一致，无新增上传
-    expect(res.skipped).toBe(1); // seed.md 两端一致 → 跳过
+    expect(res.uploaded).toBe(1); // seed.md（🔴#1：force = 本地为真相，无条件覆盖上传，即使内容一致）
+    expect(res.skipped).toBe(0); // 不再因「内容一致」而跳过
     expect(res.deletedRemote).toBe(1); // extra.md（云端多余，本地无 → 删除）
     expect(h.fakeApi['nodes'].has('/apps/bdnsync/TestVault/extra.md')).toBe(false);
     // 本地 seed.md 仍完好
@@ -360,8 +360,8 @@ describe('引擎集成：force 方向（破坏性修复）', () => {
     // 本地单独新增一个云端没有的文件（本地多余，应被删除）
     h.vault.putBinary('localonly.md', enc('should-be-deleted'));
     const res = (await h.engine.fullSync('manual', 'force-download')) as SyncResult;
-    expect(res.downloaded).toBe(1); // cloud.md
-    expect(res.skipped).toBe(1); // seed.md 两端一致 → 跳过
+    expect(res.downloaded).toBe(2); // cloud.md + seed.md（🔴#1：force = 云端为真相，即使内容一致也覆盖下载）
+    expect(res.skipped).toBe(0); // 不再因「内容一致」跳过
     expect(res.deletedLocal).toBe(1); // localonly.md（本地多余，云端无 → 删除）
     expect(h.vault.getBinary('localonly.md')).toBeUndefined();
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -461,5 +461,65 @@ describe('引擎集成：quickSync 大规模删除保护（B1 回归）', () => 
     // skip-deletes → 云端 f0..f39 必须保留（未被删除）
     expect(h.fakeApi['nodes'].has('/apps/bdnsync/TestVault/f0.md')).toBe(true);
     expect(h.fakeApi['nodes'].has('/apps/bdnsync/TestVault/f39.md')).toBe(true);
+  });
+});
+
+describe('引擎集成：空文件夹同步（放宽限制修复点）', () => {
+  beforeEach(() => {
+    h = harness();
+  });
+
+  it('本地空文件夹 → fullSync 补建到云端并计入 dirsCreated', async () => {
+    h.vault.createFolder('Empty');
+    const res = (await h.engine.fullSync('manual')) as SyncResult;
+    expect(res.ok).toBe(true);
+    expect(res.dirsCreated).toBe(1);
+    const dirPaths = [...h.fakeApi['nodes'].keys()].filter(
+      (k) => h.fakeApi['nodes'].get(k)?.isDir,
+    );
+    expect(dirPaths).toContain('/apps/bdnsync/TestVault/Empty');
+  });
+
+  it('嵌套空文件夹 → 全部补建', async () => {
+    h.vault.createFolder('A');
+    h.vault.createFolder('A/B');
+    h.vault.createFolder('A/B/C');
+    const res = (await h.engine.fullSync('manual')) as SyncResult;
+    expect(res.dirsCreated).toBe(3);
+    const dirPaths = [...h.fakeApi['nodes'].keys()].filter(
+      (k) => h.fakeApi['nodes'].get(k)?.isDir,
+    );
+    expect(dirPaths).toContain('/apps/bdnsync/TestVault/A');
+    expect(dirPaths).toContain('/apps/bdnsync/TestVault/A/B');
+    expect(dirPaths).toContain('/apps/bdnsync/TestVault/A/B/C');
+  });
+
+  it('非空目录（有文件）不重复计入 dirsCreated（文件上传已隐式建父目录）', async () => {
+    h.vault.putBinary('Notes/note.md', enc('hi'));
+    const res = (await h.engine.fullSync('manual')) as SyncResult;
+    // Notes 目录因 note.md 上传已建，不应再单独计入
+    expect(res.dirsCreated).toBe(0);
+    expect(res.uploaded).toBe(1);
+  });
+
+  it('ensureRemoteDirs 创建目录并幂等（dirCache 命中不重复建节点）', async () => {
+    const r1 = await h.engine.ensureRemoteDirs(['X/Y']);
+    expect(r1.created).toBe(1);
+    const dirs1 = [...h.fakeApi['nodes'].keys()].filter(
+      (k) => h.fakeApi['nodes'].get(k)?.isDir,
+    );
+    expect(dirs1).toContain('/apps/bdnsync/TestVault/X/Y');
+    const r2 = await h.engine.ensureRemoteDirs(['X/Y']); // 重复：dirCache 命中
+    expect(r2.created).toBe(1); // 仍计数（不报错），但云端节点不重复
+    const dirs2 = [...h.fakeApi['nodes'].keys()].filter(
+      (k) => h.fakeApi['nodes'].get(k)?.isDir,
+    );
+    expect(dirs2.length).toBe(dirs1.length);
+  });
+
+  it('沙箱根之上不创建（safeMkdir 护栏，errno=102 修复点）', async () => {
+    await h.engine.ensureRemoteDirs(['/apps', '/apps/bdnsync']);
+    const dirPaths = [...h.fakeApi['nodes'].keys()];
+    expect(dirPaths.some((k) => k === '/apps' || k === '/apps/bdnsync')).toBe(false);
   });
 });

@@ -22,8 +22,11 @@ export class StatusBar {
   private textEl: HTMLElement | null = null;
   private dotEl: HTMLElement | null = null;
   private conflictBadge: HTMLElement | null = null;
+  /** 重试队列独立徽章（之前与 conflict 共用一个 DOM 元素导致互相覆盖、显示错位） */
+  private retryBadge: HTMLElement | null = null;
   private revertTimer: number | null = null;
   private conflictCount = 0;
+  private retryCount = 0;
   private state: StatusState = 'idle';
   private tooltip = 'BDNSync：点击打开快速操作';
 
@@ -53,6 +56,9 @@ export class StatusBar {
     this.dotEl = this.el.createSpan({ cls: 'bdnsync-status-dot' });
     this.conflictBadge = this.el.createSpan({ cls: 'bdnsync-status-conflict-badge' });
     this.conflictBadge.style.display = 'none';
+    // 独立 retry 徽章：避免与 conflict 互相覆盖
+    this.retryBadge = this.el.createSpan({ cls: 'bdnsync-status-retry-badge' });
+    this.retryBadge.style.display = 'none';
 
     this.el.addEventListener('click', (e) => {
       e.preventDefault();
@@ -158,17 +164,25 @@ export class StatusBar {
     }
   }
 
-  /** 方案1：展示失败重试队列中待重试的任务数（角标） */
+  /** 方案1：展示失败重试队列中待重试的任务数（独立徽章，与 conflict 徽章互不覆盖） */
   setRetryCount(n: number): void {
-    if (!this.conflictBadge) return;
+    this.retryCount = n;
+    if (!this.retryBadge) return;
     if (n > 0) {
-      this.conflictBadge.style.display = '';
-      this.conflictBadge.setText(String(n));
-      this.conflictBadge.setAttribute('title', `${n} 个任务待重试`);
+      this.retryBadge.style.display = '';
+      this.retryBadge.setText(String(n));
+      this.retryBadge.setAttribute('title', `${n} 个任务待重试`);
       this.setAria(`BDNSync：${n} 个同步任务待重试`);
-    } else if (this.conflictCount === 0) {
-      this.conflictBadge.style.display = 'none';
+    } else {
+      this.retryBadge.style.display = 'none';
     }
+  }
+
+  /** 强制同步两个徽章：读外部权威值后一次性刷新。供 main.ts 在 ConflictModal onClose 等关键节点
+   *  调用，避免徽章与真实状态脱节。 */
+  forceSyncBadges(conflictN: number, retryN: number): void {
+    this.setConflicts(conflictN);
+    this.setRetryCount(retryN);
   }
 
   private openQuickActions(): void {

@@ -1,4 +1,4 @@
-﻿// 同步引擎：三方对比（本地 / 云端 / 上次同步）、决策矩阵、墓碑、乐观锁竞态检测、断点续传
+// 同步引擎：三方对比（本地 / 云端 / 上次同步）、决策矩阵、墓碑、乐观锁竞态检测、断点续传
 
 import { type App } from 'obsidian';
 import { BaiduApiError } from '../baidu/api';
@@ -34,6 +34,7 @@ import {
   sleep,
   randomId,
   shouldShowNotice,
+  remoteJoin,
 } from '../util/misc';
 
 type Action =
@@ -70,11 +71,12 @@ const NOTHING: SyncResult = {
   downloaded: 0,
   deletedLocal: 0,
   deletedRemote: 0,
-  conflicts: -0,
+  conflicts: 0,
   skipped: 0,
   errors: 0,
   bytesUp: 0,
   bytesDown: 0,
+  dirsCreated: 0,
   errorMessages: [],
 };
 
@@ -184,6 +186,9 @@ export type MassDeleteAsker = (info: {
 
 export class SyncEngine {
   private syncing = false;
+  /** 取消标志：用户在同步过程中可请求中止（如插件卸载前 / 主动取消）。
+   *  在文件级 action 处理入口与各阶段衔接处检查，命中即停止发起新工作并中止提交。 */
+  private cancelled = false;
   private resolver = new ConflictResolver();
   /**
    * 文件哈希缓存（path → {mtime,size,hash}）。
@@ -251,6 +256,11 @@ export class SyncEngine {
 
   isBusy(): boolean {
     return this.syncing;
+  }
+
+  /** 请求取消当前同步（仅设置标志，由执行循环在阶段/文件边界检查后安全中止）。 */
+  cancel(): void {
+    this.cancelled = true;
   }
 
   /** 统一的 UI 通知出口（经 onNotice 回调解耦 Obsidian Notice，便于测试 mock） */
@@ -416,6 +426,8 @@ export class SyncEngine {
     filter: PathFilter,
     lastSync: Record<string, FileState>,
     onProgress?: (n: number) => void,
+    /** 输出参数：收集所有「非排除、需镜像」的本地目录（相对 root），供空文件夹补建使用 */
+    localDirs?: Set<string>,
   ): Promise<Map<string, FileState>> {
     const out = new Map<string, FileState>();
     const visited = new Set<string>();
@@ -470,10 +482,15 @@ export class SyncEngine {
         // 隐藏目录与 .obsidian 的判定必须基于最后一段，而非整条路径
         const name = baseName(rel);
         if (name === '.obsidian') {
-          if (this.s().syncConfigDir) await walk(rel);
+          if (this.s().syncConfigDir) {
+            localDirs?.add(rel);
+            await walk(rel);
+          }
           continue;
         }
         if (this.s().skipHiddenFiles && name.startsWith('.')) continue;
+        // 记录需镜像的本地目录（空文件夹补建的载体；非空目录的上传也会隐式建父目录）
+        localDirs?.add(rel);
         await walk(rel);
       }
     };
@@ -642,6 +659,9 @@ export class SyncEngine {
         if (samples.length < 12) samples.push({ path: a.path, op: 'conflict' });
       } else if (a.type === 'skip') {
         skip++;
+        // 已校验一致的文件也进样例，让确认弹窗直观显示「本次会跳过哪些（无变更）」，
+        // 避免用户看到「无变更」却不知到底核对了哪些文件（🟢 启用此前未使用的 'skip' 样例映射）
+        if (samples.length < 12) samples.push({ path: a.path, op: 'skip' });
       }
     }
     return {
@@ -676,7 +696,14 @@ export class SyncEngine {
       return null;
     }
 
-    this.syncing = true;
+    // 每次同步开始重置「下载校验连续失败」计数与取消标志，避免跨 run 累积
+    // （🟡#1：原仅在 quickSync 重置，fullSync 漏重置会导致旧 run 失败数复用到新 run）。
+    this.downloadVerifyFails = 0;
+    this.cancelled = false;
+    // reentrant（由 quickSync 委托）时 syncing 已由调用方持有，此处不重复开关，
+    // 否则 fullSync 在 finally 中置 false 会让「委托方仍持有锁」的窗口期出现 syncing=false，
+    // 导致并发的增量同步误判空闲而重入（🟡#3 协调）。
+    if (!reentrant) this.syncing = true;
     const stats: SyncStats = {
       uploaded: 0,
       downloaded: 0,
@@ -687,6 +714,7 @@ export class SyncEngine {
       errors: 0,
       bytesUp: 0,
       bytesDown: 0,
+      dirsCreated: 0,
       errorMessages: [],
     };
     const conflictReport: ConflictReportEntry[] = [];
@@ -700,9 +728,15 @@ export class SyncEngine {
       this.statusBar.setSyncing('正在扫描远程目录…');
       const remoteTree = await this.adapter.listTree();
       this.statusBar.setSyncing('正在扫描本地文件…');
-      const localScan = await this.scanLocal(filter, localIndex.files, (n) => {
-        this.statusBar.setSyncing(`正在扫描本地文件…（已扫描 ${n}）`);
-      });
+      const localDirs = new Set<string>(); // 收集本地目录，供空文件夹补建
+      const localScan = await this.scanLocal(
+        filter,
+        localIndex.files,
+        (n) => {
+          this.statusBar.setSyncing(`正在扫描本地文件…（已扫描 ${n}）`);
+        },
+        localDirs,
+      );
 
       // 崩溃/断线安全：本地文件已落盘但索引未提交时，下次同步会把它们误判为「新文件」
       // 导致重复上传或错误冲突。启动对账：用云端 hash 校准这些「孤儿文件」的锚点。
@@ -715,7 +749,10 @@ export class SyncEngine {
       let actions: Action[];
       let mode: 'merge' | 'cloud' | 'local' = 'merge';
 
-      if (isFirst && localScan.size > 0 && remoteTree.size > 0) {
+      // 首次同步保护：仅在「双向同步」且确属首次时才询问「以哪侧为真相」。
+      // force 方向已明确真相（force-upload=本地、force-download=云端），不可再弹询问，
+      // 否则「选云端」会把 force-upload 反转为 force-download，造成误删本地（🔴#2）。
+      if (isFirst && direction === 'bidirectional' && localScan.size > 0 && remoteTree.size > 0) {
         // 首次同步保护
         const choice = await this.askFirstSync(localScan.size, remoteTree.size);
         if (choice === 'cancel') {
@@ -781,6 +818,7 @@ export class SyncEngine {
       const pendingRemoteDeletes: string[] = [];
 
       const doDownload = async (a: Extract<Action, { type: 'download' }>) => {
+        if (this.cancelled) return; // 用户取消：停止发起新下载（🟡#2）
         try {
           // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
           const entry = remoteTree.get(a.path)!;
@@ -856,9 +894,31 @@ export class SyncEngine {
       };
 
       const doUpload = async (a: Extract<Action, { type: 'upload' }>, bytes?: Uint8Array) => {
+        if (this.cancelled) return; // 用户取消：停止发起新上传（🟡#2）
         try {
           const content = bytes ?? (await this.readLocalFile(a.path));
           if (!content) throw new BaiduApiError(0, `本地文件读取失败：${a.path}`);
+          // 百度物理上无法存储 0 字节文件：扫描后文件被清空（TOCTOU）时跳过上传，
+          // 记入索引（空文件策略与 planEntry 一致），避免 upload 接口报错空转
+          if (content.length === 0) {
+            const hash = md5Hex(content);
+            const lst = await this.vadapter().stat(a.path).catch(() => null);
+            const st: FileState = {
+              path: a.path,
+              mtime: a.local?.mtime ?? lst?.mtime ?? Date.now(),
+              size: 0,
+              hash,
+              byDevice: this.s().deviceId,
+              vv: bumpVV(a.local?.vv, this.s().deviceId),
+            };
+            finalStates.set(a.path, st);
+            remoteChanges.set(a.path, { ...st, remoteSize: 0, fsId: '' });
+            this.cacheHash(a.path, { mtime: st.mtime, size: 0, hash });
+            await this.store.putBase(hash, content);
+            stats.uploaded++;
+            this.statusBar.setProgress(stats.downloaded, stats.uploaded);
+            return;
+          }
           await this.throttleBandwidth(content.length);
           const hash = a.local ? a.local.hash : md5Hex(content);
           const res = await this.adapter.upload(a.path, content, {
@@ -1014,6 +1074,7 @@ export class SyncEngine {
       // 5) 本地删除
       for (const a of actions as Action[]) {
         if (a.type !== 'delete-local') continue;
+        if (this.cancelled) break; // 用户取消：停止本地删除（🟡#2）
         try {
           const bytes = await this.readLocalFile(a.path);
           if (bytes && this.s().autoBackup) this.bufferBackup(a.path, bytes);
@@ -1036,7 +1097,10 @@ export class SyncEngine {
 
       // 6) 远程删除（批量）
       for (const a of actions as Action[]) {
-        if (a.type === 'delete-remote') pendingRemoteDeletes.push(a.path);
+        if (a.type === 'delete-remote') {
+          if (this.cancelled) continue; // 用户取消：跳过远程删除（🟡#2）
+          pendingRemoteDeletes.push(a.path);
+        }
       }
       if (pendingRemoteDeletes.length > 0) {
         try {
@@ -1051,6 +1115,39 @@ export class SyncEngine {
         } catch (e) {
           stats.errors++;
           stats.errorMessages.push(`云端删除失败: ${errText(e)}`);
+        }
+      }
+
+      // 🟡#2 用户取消：所有阶段动作已停止发起，不提交索引（避免持久化半完成状态），直接返回取消。
+      if (this.cancelled) {
+        engineLog('info', '同步被用户取消，已中止索引提交');
+        return { ok: false, cancelled: true, ...stats };
+      }
+
+      // 6.5) 空文件夹补建：本地存在、远端缺失的「空目录」，调用 ensureDir 补建到云端。
+      // 此前同步链路只处理文件（scanLocal 只产出文件、listTree 只记录文件），
+      // 导致本地空文件夹永远不会出现在云端。这里把「本地/远端都没有任何文件子孙」的目录显式建出来，
+      // 即放松同步限制（原不同步空目录 → 现在允许空目录同步）。
+      // 非空目录（含文件）会随文件上传隐式建父目录，故不计入 dirsCreated（避免统计虚高），
+      // 且对它们再走一次幂等 ensureDir 也无副作用（命中缓存即短路）。
+      if (localDirs.size > 0) {
+        // 真正需要显式补建的空目录：本地与远端都没有任何文件子孙的目录。
+        const isEmptyDir = (rel: string): boolean => {
+          const prefix = `${rel}/`;
+          for (const f of localScan.keys()) if (f.startsWith(prefix)) return false;
+          for (const f of remoteTree.keys()) if (f.startsWith(prefix)) return false;
+          return true;
+        };
+        const missing = [...localDirs].filter(isEmptyDir).sort();
+        if (missing.length) this.statusBar.setSyncing(`正在补建 ${missing.length} 个空目录…`);
+        for (const rel of missing) {
+          const remoteDir = remoteJoin(this.adapter.root, rel);
+          try {
+            await this.adapter.ensureDir(remoteDir);
+            stats.dirsCreated = (stats.dirsCreated ?? 0) + 1;
+          } catch (e) {
+            engineLog('warn', `空目录补建失败 ${rel}: ${errText(e)}`);
+          }
         }
       }
 
@@ -1171,7 +1268,8 @@ export class SyncEngine {
         errorMessages: [...stats.errorMessages, msg],
       };
     } finally {
-      this.syncing = false;
+      // reentrant 时 syncing 由委托方（quickSync）持有，此处不动，避免提前释放锁（🟡#3）
+      if (!reentrant) this.syncing = false;
     }
   }
 
@@ -1795,6 +1893,7 @@ export class SyncEngine {
     if (!settings.bduss && !settings.cookies && !settings.accessToken) return NOTHING;
 
     this.syncing = true;
+    this.cancelled = false;
     // 声明提前到 try 之外，使 catch（顶层异常）仍能拿到「本次已成功落盘的文件」集合
     const finalStates = new Map<string, FileState>();
     try {
@@ -1806,7 +1905,8 @@ export class SyncEngine {
       if (!remoteIndex) {
         // 从未建立索引 → 退化为完整同步（保持 busy 锁，用 reentrant 委托，避免重入被 busy 检查吞掉）
         await this.fullSync('manual', 'bidirectional', true);
-        return NOTHING;
+        // 完整同步已覆盖这批路径 → 标记为已处理，让上层清空脏集合（🔴#3）
+        return { ...NOTHING, successPaths: paths };
       }
 
       const remoteChanges = new Map<string, FileState>();
@@ -1824,8 +1924,10 @@ export class SyncEngine {
       // 改用 api.move 保留云端 fs_id。纯本地 rename 且云端从无该文件时，下方仍走普通上传。
       const localMissing: string[] = []; // 本地已不存在（可能 rename 的源）
       const localPresent = new Map<string, { hash: string; bytes: Uint8Array }>();
+      // 在循环外创建 PathFilter，避免每个路径重复实例化（审计：性能）
+      const quickFilter = new PathFilter(settings);
       for (const p of paths) {
-        if (new PathFilter(settings).isExcluded(p)) continue;
+        if (quickFilter.isExcluded(p)) continue;
         const b = await this.readLocalFile(p);
         if (b) localPresent.set(p, { hash: md5Hex(b), bytes: b });
         else if (localIndex.files[p] && !localIndex.files[p].deleted) localMissing.push(p);
@@ -1885,7 +1987,7 @@ export class SyncEngine {
       }
 
       for (const path of paths) {
-        if (new PathFilter(settings).isExcluded(path)) continue;
+        if (quickFilter.isExcluded(path)) continue;
         // 跳过已作为重命名识别的源/目标（已在上方处理）
         if (renamedSources.has(path) || renamedSet.has(path)) continue;
         const bytes = await this.readLocalFile(path);
@@ -1898,6 +2000,23 @@ export class SyncEngine {
             // 本地与云端同时变更 → 交给完整同步合并（保持 busy 锁，reentrant 委托）
             needsFullSync = true;
             break;
+          }
+          // 百度物理上无法存储 0 字节文件：空文件跳过物理上传，仅记录索引
+          if (bytes.length === 0) {
+            const st: FileState = {
+              path,
+              mtime: Date.now(),
+              size: 0,
+              hash,
+              byDevice: settings.deviceId,
+              vv: bumpVV(S?.vv ?? R?.vv, settings.deviceId),
+            };
+            remoteChanges.set(path, { ...st, remoteSize: 0, fsId: '' });
+            finalStates.set(path, st);
+            this.cacheHash(path, { mtime: st.mtime, size: 0, hash });
+            await this.store.putBase(hash, bytes);
+            uploaded++;
+            continue;
           }
           this.statusBar.setSyncing(`正在上传 ${path.split('/').pop()}…`);
           const res = await this.adapter.upload(path, bytes);
@@ -1940,10 +2059,12 @@ export class SyncEngine {
         // 检测到本地/云端并发修改，交还完整同步做三方合并（保持 busy 锁，reentrant 委托）
         this.statusBar.setSyncing('检测到并发修改，转交完整同步合并…');
         await this.fullSync('manual', 'bidirectional', true);
-        return NOTHING;
+        // 完整同步已覆盖这批路径 → 标记为已处理，让上层清空脏集合（🔴#3）
+        return { ...NOTHING, successPaths: paths };
       }
 
-      if (remoteChanges.size === 0) return NOTHING;
+      // 本批路径经评估均与远端一致（无新增/修改/删除）→ 已确认同步，清空脏集合（🔴#3）
+      if (remoteChanges.size === 0) return { ...NOTHING, successPaths: paths };
 
       // 增量同步的「大规模删除保护」：fullSync 有 checkDeleteGuard 兜底，但增量路径
       // 直接走 deleteRemote，若 remoteRoot 误指空目录 / 凭据换账号（旧库内容云端全缺），
@@ -1998,6 +2119,7 @@ export class SyncEngine {
         errors: 0,
         bytesUp: 0,
         bytesDown: 0,
+        dirsCreated: 0,
         errorMessages: [],
       };
       await this.commitRemoteIndex(remoteIndex, remoteChanges, new Set(), uploadedThisRun, {
@@ -2031,8 +2153,12 @@ export class SyncEngine {
         errors: 0,
         bytesUp: 0,
         bytesDown: 0,
+        dirsCreated: 0,
         errorMessages: [],
-        successPaths: Array.from(finalStates.keys()),
+        // 成功路径：整批均已评估处理（变更已落盘 / 未变更已确认一致 / 排除项无需动作），
+        // 因此 successPaths 取完整输入 paths，让上层一次性清空脏集合（🔴#3）。
+        // 仅 catch（中途抛异常）才用 finalStates.keys() 只保留真正成功落盘的部分。
+        successPaths: paths,
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2049,6 +2175,7 @@ export class SyncEngine {
         errors: 1,
         bytesUp: 0,
         bytesDown: 0,
+        dirsCreated: 0,
         errorMessages: [msg],
         // 顶层异常前循环中已成功落盘的文件仍视为成功，避免它们被无意义重传
         successPaths: Array.from(finalStates.keys()),
@@ -2059,6 +2186,38 @@ export class SyncEngine {
   }
 
   // ---------------- 流式代理归属校验（安全纵深防御） ----------------
+
+  /**
+   * 增量补建本地目录到远端（供 watcher 的 TFolder 创建/移动事件调用）。
+   *
+   * 百度允许空目录存在（mkdir 可行），但此前同步链路只处理文件，
+   * 导致「新建空文件夹 / 移动空文件夹」永远不会出现在云端。这里显式 ensureDir：
+   *   - 幂等（adapter 带 dirCache + safeMkdir 已存在即短路），重复调用安全；
+   *   - 受沙箱根护栏保护（safeMkdir 永不在 /apps 之上 mkdir，errno=102 修复点）；
+   *   - 失败不影响文件同步，仅记录错误，便于排查。
+   */
+  async ensureRemoteDirs(
+    relPaths: string[],
+  ): Promise<{ created: number; skipped: number; errors: string[] }> {
+    const errors: string[] = [];
+    let created = 0;
+    let skipped = 0;
+    for (const rel of relPaths) {
+      if (!rel || rel === '') {
+        skipped++;
+        continue;
+      }
+      const remoteDir = remoteJoin(this.adapter.root, rel);
+      try {
+        await this.adapter.ensureDir(remoteDir);
+        created++;
+        engineLog('info', `空目录已补建到云端：${rel}`);
+      } catch (e) {
+        errors.push(`空目录补建失败 ${rel}: ${errText(e)}`);
+      }
+    }
+    return { created, skipped, errors };
+  }
 
   /**
    * 校验给定 fsId/path 是否属于当前 vault 的远程索引。
@@ -2189,6 +2348,7 @@ export class SyncEngine {
         errors: 0,
         bytesUp: 0,
         bytesDown: 0,
+        dirsCreated: 0,
         errorMessages: [],
       };
       await this.commitRemoteIndex(remoteIndex, remoteChanges, new Set(), new Map(), {
@@ -2347,11 +2507,17 @@ export function summarize(s: SyncStats): string {
   const parts: string[] = [];
   if (s.uploaded) parts.push(`↑${s.uploaded}`);
   if (s.downloaded) parts.push(`↓${s.downloaded}`);
+  if (s.dirsCreated) parts.push(`建目录${s.dirsCreated}`);
   if (s.deletedLocal) parts.push(`删本地${s.deletedLocal}`);
   if (s.deletedRemote) parts.push(`删云端${s.deletedRemote}`);
+  if (s.skipped) parts.push(`跳过${s.skipped}`);
   if (s.conflicts) parts.push(`冲突${s.conflicts}`);
   if (s.errors) parts.push(`错误${s.errors}`);
-  if (parts.length === 0) return '无变更';
+  if (parts.length === 0) {
+    // 审计：在 force-*/bidirectional 场景下，"无变更"会让用户怀疑点击没生效。
+    // 显式带上"已校验 N 个文件均与对侧一致"反馈，让"跳过"的语义透明化。
+    return s.skipped ? `无操作（已校验 ${s.skipped} 个文件均与对侧一致）` : '无变更';
+  }
   return parts.join(' ');
 }
 
@@ -2387,10 +2553,14 @@ export function planEntry(
   const actions: Action[] = [];
 
   // ---- 单向覆盖：跳过三方裁决，直接按「哪一侧是真相」派活 ----
+  // 强制同步语义：以一侧为唯一真相，直接覆盖对侧。不再比较哈希——否则「内容已相同」时
+  // 会退化为 skip，用户点击「强制上传」却得到「无变更」（🔴#1）。本地不存在即代表对侧应删除。
   if (direction === 'force-upload') {
-    if (L && R && R.hash && L.hash === R.hash) actions.push({ type: 'skip', path, local: L });
-    else if (L) actions.push({ type: 'upload', path, local: L });
-    else if (R) {
+    if (L) {
+      // 百度物理上无法存储 0 字节文件：空文件恒无法上传，按 skip 处理避免报错空转
+      if (L.size === 0) actions.push({ type: 'skip', path, local: L });
+      else actions.push({ type: 'upload', path, local: L });
+    } else if (R) {
       // 云端有、本地没有 → 本地是真相，删掉云端多余文件
       actions.push({
         type: 'delete-remote',
@@ -2401,8 +2571,7 @@ export function planEntry(
     return actions;
   }
   if (direction === 'force-download') {
-    if (L && R && R.hash && L.hash === R.hash) actions.push({ type: 'skip', path, local: L });
-    else if (R) actions.push({ type: 'download', path, remoteState: R, remoteSize });
+    if (R) actions.push({ type: 'download', path, remoteState: R, remoteSize });
     else if (L) {
       // 本地有、云端没有 → 云端是真相，删掉本地多余文件
       actions.push({ type: 'delete-local', path, last: S ?? L });
