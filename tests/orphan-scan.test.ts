@@ -159,6 +159,31 @@ describe('walkRemoteTree：预算保护', () => {
     expect(r.truncated).toBe(true);
   });
 
+  it('F3 回归：maxBytes 在遍历中实时截断（不再等遍历结束后才标记）', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [
+        f('big1.bin', false, 100),
+        f('big2.bin', false, 100),
+        f('big3.bin', false, 100),
+        f('big4.bin', false, 100),
+      ],
+    };
+    const r = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 250, // big1(100)+big2(200) 未超；big3 后累计 300 > 250 → 立即截断
+      concurrency: 1,
+    });
+    expect(r.nodes.length).toBe(3); // big1/big2/big3 已加入，big3 触达预算即停；big4 未进入
+    expect(r.truncated).toBe(true);
+    expect(r.scannedBytes).toBe(300);
+  });
+
   it('并发 2 时 pumpOne worker 池至少处理 2 个并发任务', async () => {
     let maxInflight = 0;
     let inflight = 0;
@@ -289,7 +314,7 @@ describe('classifyOrphans：三类分类', () => {
     expect(out.length).toBe(0); // active 文件被排除
   });
 
-  it('孤儿目录：vault 内空目录 → orphan-dir', async () => {
+  it('孤儿目录：vault 内空目录（已实际展开子项）→ orphan-dir', async () => {
     const nodes: ScannedNode[] = [
       {
         absPath: `${REMOTE_ROOT}/empty-folder`,
@@ -299,6 +324,7 @@ describe('classifyOrphans：三类分类', () => {
         mtime: 0,
         relPath: 'empty-folder',
         depth: 1,
+        childrenListed: true, // walk 引擎确实 listDir 过该目录且为空
       },
     ];
     const out = await classifyOrphans(nodes, {
@@ -307,6 +333,91 @@ describe('classifyOrphans：三类分类', () => {
     });
     expect(out.length).toBe(1);
     expect(out[0].kind).toBe('orphan-dir');
+  });
+
+  it('F6 回归：未实际展开子项的目录（childrenListed=false）不判 orphan-dir（防止 parent-only 把真实 vault 目录误报为空）', async () => {
+    const nodes: ScannedNode[] = [
+      {
+        absPath: `${REMOTE_ROOT}`,
+        name: VAULT,
+        isDir: true,
+        bytes: 0,
+        mtime: 0,
+        relPath: '',
+        depth: 0,
+        childrenListed: false, // parent-only 下只列了父目录一层，没进 vault 内部
+      },
+    ];
+    const out = await classifyOrphans(nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+    });
+    expect(out.length).toBe(0); // 未知内容 ≠ 空目录，不得误报
+  });
+
+  it('F2 回归：含嵌套活动文件的目录（Notes/Archive/active.md）不判 orphan-dir', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [f('Notes', true), f('a.md', false, 10)],
+      [`${REMOTE_ROOT}/Notes`]: [f('Archive', true)],
+      [`${REMOTE_ROOT}/Notes/Archive`]: [f('active.md', false, 20)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 2,
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: (p) => p === 'Notes/Archive/active.md',
+    });
+    // Notes / Archive 的子树内存在 active 文件 → 不得判孤儿目录
+    expect(out.some((x) => x.name === 'Notes' && x.kind === 'orphan-dir')).toBe(false);
+    expect(out.some((x) => x.name === 'Archive' && x.kind === 'orphan-dir')).toBe(false);
+    // 真正的孤儿文件仍被识别
+    expect(out.some((x) => x.name === 'a.md' && x.kind === 'orphan-file')).toBe(true);
+  });
+
+  it('F1 回归：基础设施目录（.bdnsync 等）用裸 glob 硬排除，目录条目本身不入候选', async () => {
+    const map: Record<string, RemoteDirRow[]> = {
+      [PARENT]: [],
+      [REMOTE_ROOT]: [
+        f('.bdnsync', true),
+        f('.bdnsync-base', true),
+        f('.bdnsync-merge-draft', true),
+        f('Notes', true),
+        f('a.md', false, 50),
+      ],
+      [`${REMOTE_ROOT}/.bdnsync`]: [f('index.json', false, 10)],
+      [`${REMOTE_ROOT}/Notes`]: [f('b.md', false, 10)],
+    };
+    const walked = await walkRemoteTree(makeLister(map), {
+      parentDir: PARENT,
+      remoteRoot: REMOTE_ROOT,
+      vaultName: VAULT,
+      mode: 'full-vault',
+      maxDepth: 0,
+      maxNodes: 100,
+      maxBytes: 0,
+      concurrency: 2,
+      // 与 main.ts 硬排除一致：必须是裸 glob（`X/**` 只覆盖子项，覆盖不了目录条目本身）
+      ignoreGlobs: ['.bdnsync', '.bdnsync-base', '.bdnsync-merge-draft', '.bdnsync-backup'],
+    });
+    const out = await classifyOrphans(walked.nodes, {
+      vaultName: VAULT,
+      isActive: () => false,
+    });
+    // 基础设施目录不入节点、不入候选（不进入 .bdnsync 内部遍历）
+    expect(walked.nodes.map((n) => n.name)).not.toContain('.bdnsync');
+    expect(walked.nodes.map((n) => n.name)).not.toContain('.bdnsync-base');
+    expect(out.some((x) => x.name.startsWith('.bdnsync'))).toBe(false);
+    // 真正的孤儿文件仍被识别
+    expect(out.some((x) => x.name === 'a.md' && x.kind === 'orphan-file')).toBe(true);
   });
 
   it('忽略 glob：命中即整棵子树跳过', async () => {

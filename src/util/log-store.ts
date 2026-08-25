@@ -6,7 +6,7 @@
 //   3. 清理策略：保留最近 retentionDays 天；purge 时删除过期日期目录，并按墓碑宽限期物理清除；
 //   4. 模块/级别维度：每条 entry 自带 module / level，检索层（Logger）据此过滤。
 
-import type { DataAdapter } from 'obsidian';
+import type { DataAdapter, ListedFiles } from 'obsidian';
 import type { SyncLogEntry } from '../types';
 
 /** 把时间戳格式化为 YYYY-MM-DD（本地时区，使用 Date 方法而非手动计算） */
@@ -64,7 +64,7 @@ export class LogStore {
     const now = Date.now();
     const minDate = cutoff > 0 ? this.shiftDays(dayKey(now), -cutoff) : '0000-00-00';
 
-    let listed: any = {};
+    let listed: ListedFiles = { files: [], folders: [] };
     try {
       listed = await this.adapter.list(this.logsDir);
     } catch {

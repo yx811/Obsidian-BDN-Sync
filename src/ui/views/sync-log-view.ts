@@ -9,15 +9,6 @@ import { createIconButton, createModalHeader, showConfirmModal, setIcon, type Ic
 
 export const VIEW_TYPE_BDNSYNC_LOG = 'bdnsync-log';
 
-const TYPE_LABEL: Record<SyncLogEntry['type'], string> = {
-  upload: '上传',
-  download: '下载',
-  delete: '删除',
-  conflict: '冲突',
-  error: '错误',
-  info: '信息',
-};
-
 const LEVELS: LogLevel[] = ['debug', 'info', 'warn', 'error'];
 const MODULES: LogModule[] = [
   'general',
@@ -311,8 +302,9 @@ export class SyncLogView extends ItemView {
     for (const e of filtered) {
       const d = new Date(e.time);
       const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)!.push(e);
+      const bucket = groups.get(key) ?? [];
+      bucket.push(e);
+      groups.set(key, bucket);
     }
     // 日期组排序（与整体排序方向一致）
     const groupKeys = Array.from(groups.keys()).sort((a, b) =>
@@ -320,7 +312,7 @@ export class SyncLogView extends ItemView {
     );
 
     for (const dayKeyStr of groupKeys) {
-      const entries = groups.get(dayKeyStr)!;
+      const entries = groups.get(dayKeyStr) ?? [];
       const groupEl = this.listContainer.createDiv({ cls: 'bdnsync-log-group' });
       const header = groupEl.createDiv({ cls: 'bdnsync-log-group-header' });
       header.createSpan({ text: dayKeyStr, cls: 'bdnsync-log-group-date' });
@@ -339,20 +331,20 @@ export class SyncLogView extends ItemView {
     const row = document.createElement('div');
     row.className = `bdnsync-log-row bdnsync-log-level-${log.level}${log.deleted ? ' bdnsync-log-row-tomb' : ''}`;
     // 左侧级别色条
-    const bar = row.createSpan({ cls: `bdnsync-log-levelbar bdnsync-log-levelbar-${log.level}` });
+    row.createSpan({ cls: `bdnsync-log-levelbar bdnsync-log-levelbar-${log.level}` });
 
     const content = row.createDiv({ cls: 'bdnsync-log-row-content' });
 
     const head = content.createDiv({ cls: 'bdnsync-log-row-head' });
-    const levelBadge = head.createSpan({
+    head.createSpan({
       cls: `bdnsync-log-badge bdnsync-log-badge-${log.level}`,
       text: LEVEL_LABEL[log.level],
     });
-    const modBadge = head.createSpan({
+    head.createSpan({
       cls: 'bdnsync-log-module',
       text: MODULE_LABEL[log.module],
     });
-    const time = head.createSpan({
+    head.createSpan({
       cls: 'bdnsync-log-time',
       text: new Date(log.time).toLocaleString(),
     });

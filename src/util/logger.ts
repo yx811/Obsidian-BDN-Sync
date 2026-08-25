@@ -7,7 +7,7 @@
 //  - 整合筛选：时间范围 / 级别 / 模块 / 业务类型 / 关键字（支持正则）/ 含墓碑 / 排序
 //  - 导出：筛选结果 → 纯文本 或 JSON；支持单条导出与复制
 
-import type { LogFilter, LogLevel, LogModule, LogSort, SyncLogEntry } from '../types';
+import type { LogFilter, LogLevel, LogModule, SyncLogEntry } from '../types';
 import { LogStore } from './log-store';
 
 /** 级别严重程度权重（越大越重要） */

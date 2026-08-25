@@ -1557,16 +1557,8 @@ export default class BDNSyncPlugin extends Plugin {
       return;
     }
 
-    // 1) 跑扫描（按 settings.orphanScanMode 选择管线），拿到 findings + stats
-    let scanResult: DeepScanResult;
-    try {
-      scanResult = await this.runOrphanScan({ vaultName, parentDir, remoteRoot });
-    } catch (e) {
-      new Notice(`BDNSync：扫描失败 — ${e instanceof Error ? e.message : String(e)}`);
-      return;
-    }
-
-    // 2) 把 findings + 扫描上下文一并交给 modal（modal 不再自己跑 scan）
+    // 1) 构造弹窗并立即打开：先展示「正在扫描…」，扫描在后台执行（U1 修复：
+    //    不再在打开弹窗前 await 扫描，避免大库扫描期间 UI 长时间无响应/卡死）
     const lister = this.makeOrphanLister();
     const deleter = this.makeOrphanDeleter();
     const modal = new OrphanCleanupModal(this.app, vaultName, parentDir, lister, deleter, {
@@ -1575,15 +1567,11 @@ export default class BDNSyncPlugin extends Plugin {
       bulkConfirmThreshold: this.settings.bulkDeleteConfirm,
       useRecycleBin: this.settings.orphanUseRecycleBin !== false,
       scanMode: this.settings.orphanScanMode,
-      findings: scanResult.findings,
-      scanStats: {
-        scannedNodes: scanResult.scannedNodes,
-        scannedBytes: scanResult.scannedBytes,
-        truncated: scanResult.truncated,
-        durationMs: scanResult.durationMs,
-        errors: scanResult.errors,
-      },
       onComplete: (r) => {
+        // 扫描结果从 modal 取（startDeepScan 完成时回填 lastScan；取消/失败时可能为空）
+        const scanResult = modal.lastScan;
+        const findings = scanResult?.findings ?? [];
+        const stats = scanResult?.stats;
         // 任何结果（取消/完成/失败）都更新 lastOrphanScanAt，作为下次 24h 限频基准
         this.settings.lastOrphanScanAt = Date.now();
         void this.saveSettings();
@@ -1596,24 +1584,24 @@ export default class BDNSyncPlugin extends Plugin {
         void this.store
           .loadLocalIndex()
           .then(async (idx) => {
-            const counts = this.countFindingsByKind(scanResult.findings);
+            const counts = this.countFindingsByKind(findings);
             idx.lastOrphanReport = [
               {
                 at: Date.now(),
                 scannedParent: parentDir,
-                total: scanResult.findings.length,
+                total: findings.length,
                 selected: r.selectedCount,
                 ok: r.okPaths ?? [],
                 failed: r.failedPaths ?? [],
                 mode: opts.autoMode ? 'auto' : 'manual',
                 summary: {
                   scanMode: this.settings.orphanScanMode,
-                  nodesScanned: scanResult.scannedNodes,
-                  bytesScanned: scanResult.scannedBytes,
+                  nodesScanned: stats?.scannedNodes ?? 0,
+                  bytesScanned: stats?.scannedBytes ?? 0,
                   backupDirCount: counts.backupDir,
                   orphanFileCount: counts.orphanFile,
                   orphanDirCount: counts.orphanDir,
-                  truncated: scanResult.truncated,
+                  truncated: stats?.truncated ?? false,
                   useRecycleBin: this.settings.orphanUseRecycleBin !== false,
                 },
               },
@@ -1629,12 +1617,14 @@ export default class BDNSyncPlugin extends Plugin {
             'cleanup',
             'info',
             'warn',
-            `扫描模式 ${this.settings.orphanScanMode}，发现 ${scanResult.findings.length} 个候选，清理完成（含 ${r.failedCount} 条失败，详见面板失败列表）`,
+            `扫描模式 ${this.settings.orphanScanMode}，发现 ${findings.length} 个候选，清理完成（含 ${r.failedCount} 条失败，详见面板失败列表）`,
           );
         }
       },
     });
     modal.open();
+    // 2) 后台执行深度扫描：弹窗先显示「正在扫描…」，完成后回填列表（U1 修复）
+    void modal.startDeepScan(() => this.runOrphanScan({ vaultName, parentDir, remoteRoot }));
   }
 
   /**
@@ -1654,11 +1644,14 @@ export default class BDNSyncPlugin extends Plugin {
     const ignoreGlobs = [
       ...(s.excludePatterns || []),
       ...(s.orphanExtraIgnoreGlobs || []),
-      // 永远排除插件自身基础设施目录（即使用户改坏设置也不会误删索引）
-      '.bdnsync/**',
-      '.bdnsync-base/**',
-      '.bdnsync-merge-draft/**',
-      '.bdnsync-backup/**',
+      // 永远排除插件自身基础设施目录（即使用户改坏设置也不会误删索引）。
+      // 关键：必须用「裸 glob」（如 `.bdnsync`）而非 `.bdnsync/**` ——
+      // globToRegExp 对裸项生成 `^\.bdnsync(/.*)?$`，同时覆盖「目录条目本身」与「整棵子树」；
+      // 若只写 `X/**`，目录条目 X 本身不命中忽略，会被误判为 orphan-dir 甚至被删除（F1 回归）。
+      '.bdnsync',
+      '.bdnsync-base',
+      '.bdnsync-merge-draft',
+      '.bdnsync-backup',
     ];
 
     // 准备 LocalIndex 交叉校验：路径 → 是否 active

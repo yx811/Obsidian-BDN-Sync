@@ -8,10 +8,8 @@ import type {
   VaultSnapshot,
   SyncPlanPreview,
   ConflictReportEntry,
-  SyncLogEntry,
-  LogLevel,
-  LogFilter,
   OrphanFinding,
+  DeepScanResult,
 } from '../types';
 import { conflictKindText } from '../sync/conflict-resolver';
 import type { LocalStore } from '../storage/local-store';
@@ -33,7 +31,6 @@ import {
   createModalHeader,
   createProgressBar,
   createSection,
-  makeResizable,
   setIcon,
   showConfirmModal,
 } from './components';
@@ -1084,6 +1081,8 @@ export class OrphanCleanupModal extends Modal {
   private deleteBtn?: HTMLButtonElement;
   /** v2 设置：删除是否先送回收站（默认 true；false 时 modal 会提示「仍需到网盘回收站手动清空」） */
   private useRecycleBin = true;
+  /** v2.1：最后一次成功扫描的结果快照（main.ts 的 onComplete 审计从此处读取 findings/stats）。 */
+  lastScan: { findings: OrphanFinding[]; stats: NonNullable<OrphanCleanupModal['scanStats']> } | null = null;
 
   constructor(
     app: App,
@@ -1142,6 +1141,16 @@ export class OrphanCleanupModal extends Modal {
       this.recomputeSummary();
       this.renderBody();
       this.renderFooter();
+      // F4 修复：目录类候选（backup-dir / orphan-dir）缺省 bytes=0，后台补齐大小后重渲
+      // 注意：闭包内 this.scanStats 的收窄会丢失，这里先用局部常量捕获。
+      const statsAtOpen = this.scanStats;
+      void this.measureDirFindings(this.findings).then((measured) => {
+        this.findings = measured;
+        if (statsAtOpen) this.lastScan = { findings: this.findings, stats: statsAtOpen };
+        this.recomputeSummary();
+        this.renderBody();
+        this.renderFooter();
+      });
       return;
     }
     void this.scan();
@@ -1176,6 +1185,76 @@ export class OrphanCleanupModal extends Modal {
     this.footerEl = shell.createDiv({ cls: 'bdnsync-modal-foot' });
   }
 
+  /** v2.1：主入口调用的「后台深度扫描」入口。先展示「正在扫描…」，扫描完成后回填列表。
+   *  U1 修复：扫描不再阻塞弹窗打开（main.ts 先 open 再调本方法），用户能实时看到进度状态。 */
+  async startDeepScan(scanFn: () => Promise<DeepScanResult>): Promise<void> {
+    this.phase = 'scanning';
+    this.renderBody();
+    this.renderFooter();
+    try {
+      const result = await scanFn();
+      // F4 修复：目录类候选缺省 bytes=0，测量补齐后再展示
+      const measured = await this.measureDirFindings(result.findings);
+      this.findings = measured;
+      this.scanStats = {
+        scannedNodes: result.scannedNodes,
+        scannedBytes: result.scannedBytes,
+        truncated: result.truncated,
+        durationMs: result.durationMs,
+        errors: result.errors,
+      };
+      this.lastScan = { findings: this.findings, stats: this.scanStats };
+      this.phase = 'ready';
+      // 按 risk ≥ 1 默认勾选；orphan-file/orphan-dir（risk=0）默认不勾（保守）
+      for (const f of this.findings) {
+        if (f.risk >= 1) this.selected.add(f.fullPath);
+      }
+      this.recomputeSummary();
+      this.renderBody();
+      this.renderFooter();
+    } catch (e) {
+      this.phase = 'done';
+      this.bodyEl.empty();
+      this.bodyEl.createEl('p', {
+        cls: 'bdnsync-modal-subtitle',
+        text: `扫描失败：${e instanceof Error ? e.message : String(e)}`,
+      });
+      this.footerEl.empty();
+      this.footerEl
+        .createEl('button', { text: '关闭', cls: 'bdnsync-btn' })
+        .addEventListener('click', () => this.close());
+    }
+  }
+
+  /** F4 修复：目录类候选（backup-dir / orphan-dir）缺省 bytes=0，用单层测量（measureOrphans）补齐。 */
+  private async measureDirFindings(findings: OrphanFinding[]): Promise<OrphanFinding[]> {
+    const dirs = findings.filter((f) => f.kind !== 'orphan-file' && f.bytes === 0);
+    if (dirs.length === 0) return findings;
+    const measured = await measureOrphans(
+      this.lister,
+      dirs.map<OrphanEntry>((f) => ({
+        fullPath: f.fullPath,
+        name: f.name,
+        segments: f.segments,
+        risk: f.risk,
+        mtime: f.mtime,
+        fileCount: 0,
+        totalBytes: 0,
+      })),
+    );
+    const byPath = new Map(measured.map((m) => [m.fullPath, m]));
+    return findings.map((f) => {
+      if (f.kind === 'orphan-file' || f.bytes > 0) return f;
+      const m = byPath.get(f.fullPath);
+      if (!m || m.measureError) return f;
+      return { ...f, bytes: m.totalBytes };
+    });
+  }
+
+  /**
+   * @deprecated v2.1 起真实流程由 main.ts 预扫 + startDeepScan 驱动；本方法仅保留
+   * 向后兼容（无 findings 传入时兜底走 legacy 1 层扫描 + 测量）。后续版本可删除。
+   */
   private async scan(): Promise<void> {
     try {
       const rows: RemoteDirRow[] = await this.lister.listDir(this.parentDir);
@@ -1444,10 +1523,19 @@ export class OrphanCleanupModal extends Modal {
         });
         btn.style.fontSize = '12px';
         btn.addEventListener('click', () => {
-          for (const f of list) this.selected.add(f.fullPath);
-          this.recomputeSummary();
-          this.renderBody();
-          this.renderFooter();
+          // X1 修复：孤儿文件/孤儿目录为 risk=0 低风险候选（基于 sync index 判定，
+          // 可能存在误报），一键全组勾选前先弹确认，防止误删。
+          const isLowRiskGroup = g.key !== 'backupDir';
+          void (async () => {
+            if (isLowRiskGroup) {
+              const ok = await this.confirmLowRiskSelect(g.text, list.length);
+              if (!ok) return;
+            }
+            for (const f of list) this.selected.add(f.fullPath);
+            this.recomputeSummary();
+            this.renderBody();
+            this.renderFooter();
+          })();
         });
       }
     }
@@ -1473,6 +1561,8 @@ export class OrphanCleanupModal extends Modal {
     const sourceItems = [
       '这些目录并非当前 BDNSync 写入；可能是旧版本残留 / 手动网盘操作 / 其它同步插件并发冲突累积。',
       '预防建议：避免在网盘 Web 端直接重命名 vault 根；同一时间不要让两个同步工具写入同一父目录。',
+      // F5 提示：孤儿文件/孤儿目录基于本地同步索引（LocalIndex）判定，索引未全量时可能误列
+      '孤儿文件 / 孤儿目录依据本地同步索引判定：若索引刚重置或尚未全量同步，可能误列，删除前请核对预览清单。',
     ];
     for (const s of sourceItems) {
       source.createEl('div', { text: s, cls: 'bdnsync-orphan-source-hint-row' });
@@ -1494,7 +1584,12 @@ export class OrphanCleanupModal extends Modal {
     });
     for (const f of findings) {
       const row = groupEl.createDiv({ cls: 'bdnsync-orphan-row' });
-      const cb = row.createEl('input', { type: 'checkbox' });
+      // X3：为复选框提供 aria-label，便于读屏器（路径 + 类别 + 风险）
+      const kindText = kindLabel === 'backup-dir' ? '备份目录' : kindLabel === 'orphan-file' ? '孤儿文件' : '孤儿目录';
+      const cb = row.createEl('input', {
+        type: 'checkbox',
+        attr: { 'aria-label': `勾选 ${kindText}：${f.name}（风险 ${f.risk}）` },
+      });
       cb.checked = this.selected.has(f.fullPath);
       cb.addEventListener('change', () => {
         if (cb.checked) this.selected.add(f.fullPath);
@@ -1541,7 +1636,11 @@ export class OrphanCleanupModal extends Modal {
   /** v1 legacy 单行渲染（保留向后兼容） */
   private renderLegacyRow(container: HTMLElement, it: OrphanEntry): void {
     const row = container.createDiv({ cls: 'bdnsync-orphan-row' });
-    const cb = row.createEl('input', { type: 'checkbox' });
+    // X3：为复选框提供 aria-label，便于读屏器
+    const cb = row.createEl('input', {
+      type: 'checkbox',
+      attr: { 'aria-label': `勾选备份目录：${it.name}（风险 ${it.risk}）` },
+    });
     cb.checked = this.selected.has(it.fullPath);
     cb.addEventListener('change', () => {
       if (cb.checked) this.selected.add(it.fullPath);
@@ -1616,7 +1715,8 @@ export class OrphanCleanupModal extends Modal {
     if (this.useRecycleBin) {
       recycleHint.textContent = '✓ 删除模式：先送回收站（可逆）—— 永久删除请到网盘 Web 端回收站手动清空。';
     } else {
-      recycleHint.textContent = '⚠ 删除模式：永久删除（百度网盘限制，仍会送回收站，需到 Web 端手动清空）';
+      // X2 修复：明确「百度 API 无跳过回收站接口」，避免用户误以为关闭该选项即真正永久删除
+      recycleHint.textContent = '⚠ 删除模式：永久删除（百度网盘限制：仍会进回收站，需到网盘 Web 端回收站手动清空）';
       recycleHint.style.color = '#c97';
     }
     const deleteBtn = this.footerEl.createEl('button', {
@@ -1709,15 +1809,42 @@ export class OrphanCleanupModal extends Modal {
   /**
    * 修复 #80 缺陷 3：全选 / 清除选择。直接改写 selected 集合后重渲 body+footer，
    * 保证复选框勾选态、头部计数、底部按钮三者一致。
+   * X1 修复：若候选里包含 risk=0 项（孤儿文件/孤儿目录），「全选」前先弹确认——
+   * 防止一键绕过「仅预选 backup-dir」的保守默认造成误删。
    */
   private toggleSelectAll(select: boolean): void {
     this.selected.clear();
     if (select) {
+      const hasLowRisk = [...this.iterActive()].some((it) => it.risk === 0);
+      if (hasLowRisk) {
+        void this.confirmLowRiskSelect('全部候选', this.summary.total).then((ok) => {
+          if (!ok) return;
+          for (const it of this.iterActive()) this.selected.add(it.fullPath);
+          this.recomputeSummary();
+          this.renderBody();
+          this.renderFooter();
+        });
+        return;
+      }
       for (const it of this.iterActive()) this.selected.add(it.fullPath);
     }
     this.recomputeSummary();
     this.renderBody();
     this.renderFooter();
+  }
+
+  /** X1 修复：低风险批量勾选前的二次确认（孤儿文件/孤儿目录基于 sync index 判定，可能有误报）。 */
+  private confirmLowRiskSelect(label: string, count: number): Promise<boolean> {
+    if (count <= 0) return Promise.resolve(true);
+    return showConfirmModal(this.app, {
+      title: `批量勾选「${label}」`,
+      message:
+        `将选中 ${count} 个低风险候选。孤儿文件 / 孤儿目录依据本地同步索引判定，` +
+        '索引未全量或刚重置时可能存在误报。请先核对预览清单（可「复制预览清单」留档）后再继续。',
+      confirmText: '仍要勾选',
+      cancelText: '取消',
+      danger: false,
+    });
   }
 
   /** 把「当前选中的活跃条目」投影成 OrphanEntry（仅用于传给 deleteOrphans） */
