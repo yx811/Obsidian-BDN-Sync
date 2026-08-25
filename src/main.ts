@@ -59,6 +59,7 @@ import {
   pickOrphans as pickOrphansUtil,
   measureOrphans as measureOrphansUtil,
   shouldScanOrphans,
+  PLUGIN_INFRA_HARD_EXCLUDE,
   type RemoteLister,
   type RemoteDeleter,
   type RemoteDirRow,
@@ -1648,10 +1649,15 @@ export default class BDNSyncPlugin extends Plugin {
       // 关键：必须用「裸 glob」（如 `.bdnsync`）而非 `.bdnsync/**` ——
       // globToRegExp 对裸项生成 `^\.bdnsync(/.*)?$`，同时覆盖「目录条目本身」与「整棵子树」；
       // 若只写 `X/**`，目录条目 X 本身不命中忽略，会被误判为 orphan-dir 甚至被删除（F1 回归）。
-      '.bdnsync',
-      '.bdnsync-base',
-      '.bdnsync-merge-draft',
-      '.bdnsync-backup',
+      // 此处直接复用 orphan-cleanup.ts 的 PLUGIN_INFRA_HARD_EXCLUDE 单一事实源，
+      // 与 pickOrphans 的精确名称白名单保持一致，避免两处不同步。
+      ...PLUGIN_INFRA_HARD_EXCLUDE,
+      // `.obsidian` 是 Obsidian 系统配置目录，与 .bdnsync 一样由同步引擎在任意方向完全隔离
+      // （engine.ts 系统目录隔离），绝不参与用户内容同步，因此也不能作为 orphan 候选
+      // （否则 syncConfigDir 关闭时可能被误判为 orphan-dir 而遭删除）。注意：其时间戳备份型
+      // 兄弟目录 `.obsidian_20260825_140911` 不会被本 glob 命中（裸 glob `^\.obsidian(/.*)?$`
+      // 只匹配 `.obsidian` 本身与子树，不匹配 `.obsidian_<ts>`），仍可正常识别为孤儿。
+      '.obsidian',
     ];
 
     // 准备 LocalIndex 交叉校验：路径 → 是否 active

@@ -117,6 +117,12 @@ export interface ScannedNode {
    * 时为 false —— 此时「byParent 查不到子项」不代表目录为空，绝不能据此判 orphan-dir。
    */
   childrenListed: boolean;
+  /**
+   * 命中来源层（v2.2 新增）：'parent' = 来自同步根的父目录直接子项；
+   * 'vault' = 来自 vault 自身目录（同步根顶层 + 整棵子树）。仅用于 UI 溯源与审计，
+   * 不影响孤儿判定逻辑。由 walkRemoteTree 在创建节点时设置；纯函数测试中可省略（缺省 undefined）。
+   */
+  origin?: 'parent' | 'vault';
 }
 
 export async function walkRemoteTree(
@@ -161,6 +167,7 @@ export async function walkRemoteTree(
           relPath: rel,
           depth: d,
           childrenListed: false, // parentDir 顶层不展开子项（parent-only 语义）
+          origin: 'parent', // 来自同步根父目录直接子项
         });
       }
     } catch (e) {
@@ -194,6 +201,7 @@ export async function walkRemoteTree(
             relPath: rel,
             depth: d,
             childrenListed: false, // 是否真正展开子项由 pumpOne 回填
+            origin: 'vault', // 来自 vault 自身目录（同步根顶层）
           };
           // scoped/full-vault 时把目录入队（决定是否递归展开）；file 直接产出
           if (e.isDir) {
@@ -264,6 +272,7 @@ export async function walkRemoteTree(
         relPath: rel,
         depth: d,
         childrenListed: false,
+        origin: 'vault', // 来自 vault 子树（full-vault 递归展开）
       };
       out.push(node);
       if (!r.isDir) {
@@ -398,6 +407,7 @@ export async function classifyOrphans(
               ? `高风险：${parsed.segments} 段重复时间戳叠加（典型「反复累积」现象）`
               : `中等风险：单段时间戳（${parsed.segments} 段）`,
           segments: parsed.segments,
+          origin: n.origin,
         });
         continue;
       }
@@ -422,6 +432,7 @@ export async function classifyOrphans(
           risk: 0,
           reason: '空目录',
           segments: 0,
+          origin: n.origin,
         });
       } else {
         // 非空且整棵子树无 active 文件（protectedDirs 不含本目录）→ 全部子项均为孤儿
@@ -438,6 +449,7 @@ export async function classifyOrphans(
           risk: 0,
           reason: `目录内 ${kids.length} 项均不在 sync index 中`,
           segments: 0,
+          origin: n.origin,
         });
       }
       continue;
@@ -468,6 +480,7 @@ export async function classifyOrphans(
       risk: 0,
       reason: '文件不在 sync index 中',
       segments: 0,
+      origin: n.origin,
     });
   }
 
@@ -537,6 +550,7 @@ export function mergeFindings(
           ? `高风险：${e.segments} 段时间戳段叠加（parent-only 命中）`
           : `中等风险：${e.segments} 段时间戳段（parent-only 命中）`,
       segments: e.segments,
+      origin: 'parent',
     });
   }
   return out.sort((a, b) => {

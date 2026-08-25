@@ -18,7 +18,22 @@
 const TS_SEG = /^\d{8}_\d{6}$/;
 
 /**
+ * 孤儿备份目录的「命名基」候选列表。
+ * 除了 vault 真名外，还需覆盖常见的「时间戳型备份目录」命名基：
+ *   - `.obsidian`  → 识别 `.obsidian_20260825_140911`（vault 自身目录下的 Obsidian 配置备份）
+ *   - `.bdnsync`   → 识别 `.bdnsync_20260825_011832`（vault 自身目录下、带时间戳的备份型目录）
+ *
+ * 注意：插件自身**仍在有效期的基础设施备份**目录（.bdnsync / .bdnsync-base /
+ * .bdnsync-merge-draft / .bdnsync-backup）**不在本列表**——它们由 PLUGIN_INFRA_HARD_EXCLUDE
+ * 精确名称白名单在 pickOrphans / ignoreGlobs 处硬排除，绝不会进入候选。
+ * 关键区分：时间戳孤儿用「下划线 `_`」衔接（`.bdnsync_2026…`），插件基础设施用「中划线 `-`」
+ * （`.bdnsync-base` 等），二者字符不同，白名单精确名称即可彻底保护有效期内的插件备份。
+ */
+const ORPHAN_NAME_BASES = (vaultName: string): string[] => [vaultName, '.obsidian', '.bdnsync'];
+
+/**
  * 分析一个目录名是否像"孤儿备份"。
+ * 依次尝试所有「命名基」（vault 名 / .obsidian / .bdnsync），命中任一基 + 严格时间戳段即判定。
  * @returns segments：剥离后的尾段时间戳段数。>=1 即认定为疑似孤儿。
  */
 export function parseOrphanSegments(
@@ -26,32 +41,39 @@ export function parseOrphanSegments(
   vaultName: string,
 ): { matched: boolean; segments: number; risk: 0 | 1 | 2 } {
   if (!vaultName) return { matched: false, segments: 0, risk: 0 };
-  if (!dirName.startsWith(vaultName)) return { matched: false, segments: 0, risk: 0 };
-
-  const tail = dirName.slice(vaultName.length);
-  // 完全同名（无任何后缀）—— 仅当 vaultName 自身就是孤儿候选时算"低风险"
-  // 但通常用户主同步目录就叫这个名字，调用方必须把它从候选中剔除。
-  if (tail === '') {
-    return { matched: true, segments: 0, risk: 0 };
+  for (const base of ORPHAN_NAME_BASES(vaultName)) {
+    if (!base) continue;
+    if (!dirName.startsWith(base)) continue;
+    const tail = dirName.slice(base.length);
+    // 完全同名（无任何后缀）—— 仅当 base 自身就是孤儿候选时算"低风险"（segments=0）；
+    // 调用方必须把它从候选中剔除（bare base 不算孤儿，例如真实的 .obsidian / .bdnsync 配置目录）。
+    if (tail === '') return { matched: true, segments: 0, risk: 0 };
+    // 期望 tail 严格为 '_YYYYMMDD_HHMMSS' 重复 1..N 次，没有多余字符。
+    // 关键：必须是下划线 `_` 紧接时间戳；插件基础设施目录（.bdnsync-base / .bdnsync-merge-draft
+    // / .bdnsync-backup）用中划线 `-`，不会命中本规则（也已被白名单硬排除），
+    // 因此「仍在有效期的插件备份目录」永远不会被错判为孤儿。
+    if (!tail.startsWith('_')) continue;
+    const parts = tail.slice(1).split('_'); // "20260824_231304_20260824_231304" → ["20260824","231304","20260824","231304"]
+    // 必须由完整 _YYYYMMDD_HHMMSS 段构成，且整段没有多余（数组长度必为偶数且可整 2）
+    if (parts.length < 2 || parts.length % 2 !== 0) continue;
+    // 重新按 2 段配对
+    let n = 0;
+    let ok = true;
+    for (let i = 0; i < parts.length; i += 2) {
+      const date = parts[i];
+      const time = parts[i + 1];
+      if (!TS_SEG.test(date + '_' + time)) {
+        ok = false;
+        break;
+      }
+      n++;
+    }
+    if (!ok) continue;
+    // 风险分级：≥2 段叠加（典型"反复累积"）= 高；1 段 = 中
+    const risk: 0 | 1 | 2 = n >= 2 ? 2 : 1;
+    return { matched: true, segments: n, risk };
   }
-  // 期望 tail 严格为 '_YYYYMMDD_HHMMSS' 重复 1..N 次，没有多余字符
-  if (!tail.startsWith('_')) return { matched: false, segments: 0, risk: 0 };
-  const parts = tail.slice(1).split('_'); // "20260824_231304_20260824_231304" → ["20260824","231304","20260824","231304"]
-  // 必须由完整 _YYYYMMDD_HHMMSS 段构成，且整段没有多余（数组长度必为偶数且可整 2）
-  if (parts.length < 2 || parts.length % 2 !== 0) {
-    return { matched: false, segments: 0, risk: 0 };
-  }
-  // 重新按 2 段配对
-  let n = 0;
-  for (let i = 0; i < parts.length; i += 2) {
-    const date = parts[i];
-    const time = parts[i + 1];
-    if (!TS_SEG.test(date + '_' + time)) return { matched: false, segments: 0, risk: 0 };
-    n++;
-  }
-  // 风险分级：≥2 段叠加（典型"反复累积"）= 高；1 段 = 中
-  const risk: 0 | 1 | 2 = n >= 2 ? 2 : 1;
-  return { matched: true, segments: n, risk };
+  return { matched: false, segments: 0, risk: 0 };
 }
 
 /** 扫描出的孤儿目录条目 */
@@ -106,12 +128,32 @@ export interface RemoteDeleter {
 }
 
 /**
+ * 插件自身基础设施目录（仍在有效期、绝对不可删除）：精确名称白名单硬排除。
+ *
+ * 设计要点（用户明确要求：绝不碰有效期内的插件备份）：
+ *   - 用「精确名称」而非「前缀」排除。插件基础设施目录用**中划线**命名
+ *     （.bdnsync / .bdnsync-base / .bdnsync-merge-draft / .bdnsync-backup），
+ *     而时间戳孤儿备份用**下划线**命名（.bdnsync_20260825_011832）。
+ *   - 精确名称排除既能彻底保护 `.bdnsync-backup` 等有效期内的插件备份，
+ *     又不会误伤「.bdnsync_<时间戳>」这类应被识别并清理的孤儿。
+ *   - 该集合与 main.ts 的 ignoreGlobs（裸 glob 覆盖条目自身 + 整棵子树）双保险，
+ *     即使调用方漏传 ignoreGlobs，这里也兜住。
+ */
+export const PLUGIN_INFRA_HARD_EXCLUDE = new Set<string>([
+  '.bdnsync', //            同步索引 / 分片目录（核心基础设施）
+  '.bdnsync-base', //       祖先快照目录
+  '.bdnsync-merge-draft', // 冲突合并草稿目录
+  '.bdnsync-backup', //     插件自身保留期备份目录（有效期内绝不删除）
+]);
+
+/**
  * 给定远端 listDir 单层结果，过滤出"疑似孤儿"目录条目。
  * 注意：调用方负责只传「remoteRoot 父目录的 1 层」结果，且排除主同步目录名本身（vaultName 精确等于 dirName）。
  *
- * 硬排除（v2 深化）：所有 `.bdnsync` / `.bdnsync-*` 前缀目录一律不视为孤儿候选——
+ * 硬排除（v2 深化）：PLUGIN_INFRA_HARD_EXCLUDE 精确名称集合内的目录一律不视为孤儿候选——
  * 它们是插件自身的基础设施（索引 `.bdnsync`、祖先快照 `.bdnsync-base`、合并草稿
- * `.bdnsync-merge-draft` 等），即使 vaultName 恰好以 `.bdnsync` 开头也不会被误判。
+ * `.bdnsync-merge-draft`、保留期备份 `.bdnsync-backup`），仍在有效期内，绝不可删除。
+ * bare base 目录（如同名的 `.obsidian` / `.bdnsync` 配置目录，尾段时间戳数 = 0）也不算孤儿。
  */
 export function pickOrphans(
   entries: RemoteDirRow[],
@@ -120,10 +162,12 @@ export function pickOrphans(
   const out: OrphanEntry[] = [];
   for (const e of entries) {
     if (!e.isDir) continue;
-    // 硬排除插件基础设施目录
-    if (e.name === '.bdnsync' || e.name.startsWith('.bdnsync-')) continue;
+    // 硬排除插件基础设施目录（精确名称；见上方说明）
+    if (PLUGIN_INFRA_HARD_EXCLUDE.has(e.name)) continue;
     const parsed = parseOrphanSegments(e.name, vaultName);
     if (!parsed.matched) continue;
+    // bare base 目录（同名无时间戳，如真实的 .obsidian / .bdnsync 配置目录）不算孤儿
+    if (parsed.segments < 1) continue;
     // 严格剔除主同步根目录本身（同名无时间戳）
     if (e.name === vaultName) continue;
     out.push({

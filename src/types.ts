@@ -165,6 +165,13 @@ export interface OrphanFinding {
   /** 一句话原因（人类可读，UI 上 hover 显示） */
   reason: string;
   /**
+   * 命中来源层（v2.2 新增，用于 UI 溯源徽标与审计）：
+   *   - 'parent'：命中于「同步根的父目录」直接子项（旧孤儿扫描的主战场）
+   *   - 'vault' ：命中于「vault 自身目录」下（含同步根顶层与整棵子树，full-vault / scoped 模式）
+   * 可选字段以兼容旧索引；缺省按 'parent' 处理。
+   */
+  origin?: 'parent' | 'vault';
+  /**
    * 仅当 kind === 'backup-dir'：命中规则匹配的「时间戳段」数（1 = 中风险；≥2 = 高风险）。
    * 仅当 kind === 'orphan-file' 或 'orphan-dir'：未使用（置 0）。
    */

@@ -1174,7 +1174,7 @@ export class OrphanCleanupModal extends Modal {
     const shell = contentEl.createDiv({ cls: 'bdnsync-modal-shell' });
     const subtitle = this.opts.autoMode
       ? `同步结束巡检：候选保留天数 ${this.opts.retentionDays ?? 0}（超过该天数才进入）`
-      : `扫描父目录：${this.parentDir}`;
+      : `扫描范围：父目录 ${this.parentDir} + vault 自身目录（含子树，消除扫描盲区）`;
     createModalHeader(shell, {
       title: this.opts.autoMode ? '发现疑似孤儿备份' : '扫描并清理网盘备份',
       icon: 'trash-2',
@@ -1619,6 +1619,11 @@ export class OrphanCleanupModal extends Modal {
           ? 'warning'
           : 'info';
       createBadge(meta, kindBadge, kindStyle);
+      // v2.2：来源层徽标（父目录层 / vault 自身层），让用户一眼看清孤儿项来自哪一层
+      if (f.origin) {
+        const originText = f.origin === 'parent' ? '父目录层' : 'vault 自身层';
+        createBadge(meta, originText, 'info');
+      }
       if (kindLabel === 'backup-dir' && f.segments > 0) {
         const riskLabel = f.risk === 2 ? '高风险' : f.risk === 1 ? '中等' : '低';
         createBadge(meta, `风险 ${riskLabel}`, f.risk === 2 ? 'error' : f.risk === 1 ? 'warning' : 'info');
@@ -1767,6 +1772,7 @@ export class OrphanCleanupModal extends Modal {
             ` | 段=${f.segments}` +
             ` | 字节=${f.bytes}` +
             ` | mtime=${f.mtime ? formatTime(f.mtime) : '0'}` +
+            ` | 来源=${f.origin ?? 'parent'}` +
             (f.relPath ? ` | rel=${f.relPath}` : ''),
         );
       }

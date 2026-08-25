@@ -459,3 +459,80 @@ function mkOrphan(name: string): OrphanEntry {
     totalBytes: 0,
   };
 }
+
+describe('parseOrphanSegments：vault 自身目录下的命名基（.obsidian / .bdnsync）', () => {
+  it('.obsidian + 单段时间戳 → 命中（中风险）', () => {
+    const r = parseOrphanSegments('.obsidian_20260825_140911', VAULT);
+    expect(r.matched).toBe(true);
+    expect(r.segments).toBe(1);
+    expect(r.risk).toBe(1);
+  });
+
+  it('.obsidian + 2 段时间戳 → 命中（高风险）', () => {
+    const r = parseOrphanSegments('.obsidian_20260825_140911_20260825_140911', VAULT);
+    expect(r.matched).toBe(true);
+    expect(r.segments).toBe(2);
+    expect(r.risk).toBe(2);
+  });
+
+  it('.bdnsync + 单段时间戳 → 命中（中风险）', () => {
+    const r = parseOrphanSegments('.bdnsync_20260825_011832', VAULT);
+    expect(r.matched).toBe(true);
+    expect(r.segments).toBe(1);
+    expect(r.risk).toBe(1);
+  });
+
+  it('bare base（.obsidian / .bdnsync，无时间戳）→ 仅同名匹配 segments=0，不算孤儿', () => {
+    expect(parseOrphanSegments('.obsidian', VAULT).matched).toBe(true);
+    expect(parseOrphanSegments('.obsidian', VAULT).segments).toBe(0);
+    expect(parseOrphanSegments('.bdnsync', VAULT).matched).toBe(true);
+    expect(parseOrphanSegments('.bdnsync', VAULT).segments).toBe(0);
+  });
+
+  it('插件基础设施目录（中划线）不被误判：.bdnsync-backup / .bdnsync-base 均不匹配', () => {
+    expect(parseOrphanSegments('.bdnsync-backup', VAULT).matched).toBe(false);
+    expect(parseOrphanSegments('.bdnsync-base', VAULT).matched).toBe(false);
+    expect(parseOrphanSegments('.bdnsync-merge-draft', VAULT).matched).toBe(false);
+  });
+
+  it('下划线时间戳孤儿与中划线插件备份严格区分：.bdnsync-backup_2026… 不命中', () => {
+    // 关键安全：有效期内的插件备份（中划线）绝不被错判为孤儿
+    expect(parseOrphanSegments('.bdnsync-backup_20260825_011832', VAULT).matched).toBe(false);
+  });
+});
+
+describe('pickOrphans：vault 自身目录孤儿识别 + 插件基础设施白名单', () => {
+  it('vault 自身目录下的 .obsidian_<ts> / .bdnsync_<ts> 被识别为候选', () => {
+    const entries: RemoteDirRow[] = [
+      row('.obsidian_20260825_140911', true, 0),
+      row('.bdnsync_20260825_011832', true, 0),
+      row('Obsidian Vault_20260825_120000', true, 0),
+    ];
+    const out = pickOrphans(entries, VAULT);
+    expect(out.length).toBe(3);
+    expect(out.map((o) => o.name).sort()).toEqual([
+      '.bdnsync_20260825_011832',
+      '.obsidian_20260825_140911',
+      'Obsidian Vault_20260825_120000',
+    ]);
+  });
+
+  it('插件基础设施目录（精确名称白名单）绝不进入候选', () => {
+    const entries: RemoteDirRow[] = [
+      row('.bdnsync', true, 0),
+      row('.bdnsync-base', true, 0),
+      row('.bdnsync-merge-draft', true, 0),
+      row('.bdnsync-backup', true, 0),
+      // 即便带时间戳的「.bdnsync_<ts>」应被识别，但「.bdnsync-backup」固定名仍被排除
+      row('.bdnsync-backup', true, 0),
+    ];
+    const out = pickOrphans(entries, VAULT);
+    expect(out.length).toBe(0);
+  });
+
+  it('bare base 配置目录（.obsidian / .bdnsync 无后缀）不被当作孤儿', () => {
+    const entries: RemoteDirRow[] = [row('.obsidian', true, 0), row('.bdnsync', true, 0)];
+    const out = pickOrphans(entries, VAULT);
+    expect(out.length).toBe(0);
+  });
+});

@@ -441,6 +441,86 @@ describe('classifyOrphans：三类分类', () => {
   });
 });
 
+describe('classifyOrphans：vault 自身目录命名基（.obsidian / .bdnsync）+ 来源标记', () => {
+  it('.obsidian_<ts> 在 vault 根下被识别为 backup-dir，且 origin=vault', async () => {
+    const nodes: ScannedNode[] = [
+      {
+        absPath: `${REMOTE_ROOT}/.obsidian_20260825_140911`,
+        name: '.obsidian_20260825_140911',
+        isDir: true,
+        bytes: 0,
+        mtime: 0,
+        relPath: '.obsidian_20260825_140911',
+        depth: 1,
+        origin: 'vault',
+      },
+    ];
+    const out = await classifyOrphans(nodes, { vaultName: VAULT });
+    expect(out.length).toBe(1);
+    expect(out[0].kind).toBe('backup-dir');
+    expect(out[0].segments).toBe(1);
+    expect(out[0].origin).toBe('vault');
+  });
+
+  it('.bdnsync_<ts> 在 vault 根下被识别为 backup-dir，且 origin=vault', async () => {
+    const nodes: ScannedNode[] = [
+      {
+        absPath: `${REMOTE_ROOT}/.bdnsync_20260825_011832`,
+        name: '.bdnsync_20260825_011832',
+        isDir: true,
+        bytes: 0,
+        mtime: 0,
+        relPath: '.bdnsync_20260825_011832',
+        depth: 1,
+        origin: 'vault',
+      },
+    ];
+    const out = await classifyOrphans(nodes, { vaultName: VAULT });
+    expect(out.length).toBe(1);
+    expect(out[0].kind).toBe('backup-dir');
+    expect(out[0].origin).toBe('vault');
+  });
+
+  it('父目录层孤儿（parent-only 命中）origin=parent 透传到 finding', async () => {
+    const nodes: ScannedNode[] = [
+      {
+        absPath: `${PARENT}/Obsidian Vault_20240101_000000`,
+        name: 'Obsidian Vault_20240101_000000',
+        isDir: true,
+        bytes: 0,
+        mtime: 0,
+        relPath: '',
+        depth: 0,
+        origin: 'parent',
+      },
+    ];
+    const out = await classifyOrphans(nodes, { vaultName: VAULT });
+    expect(out.length).toBe(1);
+    expect(out[0].kind).toBe('backup-dir');
+    expect(out[0].origin).toBe('parent');
+  });
+
+  it('真实 .obsidian 配置目录（无时间戳）不被当作 backup-dir（bare base segments=0）', async () => {
+    const nodes: ScannedNode[] = [
+      {
+        absPath: `${REMOTE_ROOT}/.obsidian`,
+        name: '.obsidian',
+        isDir: true,
+        bytes: 0,
+        mtime: 0,
+        relPath: '.obsidian',
+        depth: 1,
+        childrenListed: true,
+        origin: 'vault',
+      },
+    ];
+    const out = await classifyOrphans(nodes, { vaultName: VAULT, isActive: () => false });
+    // bare base（segments=0）绝不可能是 backup-dir；即便它因未进 sync index 被归为 orphan-dir，
+    // 也不应被归为「时间戳备份目录」而误导用户。
+    expect(out.some((x) => x.kind === 'backup-dir')).toBe(false);
+  });
+});
+
 // ---------------- mergeFindings ----------------
 
 describe('mergeFindings：旧管线 + 新管线合并去重', () => {
