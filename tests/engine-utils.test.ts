@@ -28,7 +28,8 @@ describe('makeTombstone (B4 墓碑工厂)', () => {
   it('两处调用产生的结构等价，避免此前 8 处字面量复制的漂移风险', () => {
     const a = makeTombstone('p', 'd', 'h');
     const b = makeTombstone('p', 'd', 'h');
-    expect(a).toEqual(b);
+    // deletedAt 为调用时刻时间戳，两次调用可能跨毫秒边界而不同，单独归一后断言结构等价
+    expect({ ...a, deletedAt: 0 }).toEqual({ ...b, deletedAt: 0 });
   });
 });
 

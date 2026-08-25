@@ -39,6 +39,9 @@ import {
   type LogLevel,
   type LogModule,
   type SyncLogEntry,
+  type DeepScanOptions,
+  type DeepScanResult,
+  type OrphanFinding,
 } from './types';
 import {
   PathFilter,
@@ -61,6 +64,12 @@ import {
   type RemoteDirRow,
   type OrphanEntry,
 } from './util/orphan-cleanup';
+import {
+  walkRemoteTree,
+  classifyOrphans,
+  runDeepScan,
+  type ClassifyOptions,
+} from './util/orphan-scan';
 import { sealSecretsInPlace, unsealSecretsInPlace } from './security/secrets';
 import { RetryQueue } from './sync/retry-queue';
 import { DirtySet } from './sync/dirty-set';
@@ -1540,19 +1549,40 @@ export default class BDNSyncPlugin extends Plugin {
     const vaultName = this.app.vault.getName();
     const remoteRoot = this.settings.remoteRoot || `/apps/bdnsync/${vaultName}`;
     const parentDir = remoteParent(remoteRoot);
-    // 严格 1 层扫描边界：父目录必须是 ≥2 段的绝对路径（不能就是根）
+    // 严格扫描边界：父目录必须是 ≥2 段的绝对路径（不能就是根）
     if (!parentDir || parentDir === '/' || parentDir === remoteRoot) {
       new Notice(
-        'BDNSync：同步根目录位于网盘根，无法严格 1 层扫描。请先在设置「同步目录」中指定 /apps/bdnsync/<vault 名>。',
+        'BDNSync：同步根目录位于网盘根，无法扫描。请先在设置「同步目录」中指定 /apps/bdnsync/<vault 名>。',
       );
       return;
     }
+
+    // 1) 跑扫描（按 settings.orphanScanMode 选择管线），拿到 findings + stats
+    let scanResult: DeepScanResult;
+    try {
+      scanResult = await this.runOrphanScan({ vaultName, parentDir, remoteRoot });
+    } catch (e) {
+      new Notice(`BDNSync：扫描失败 — ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    // 2) 把 findings + 扫描上下文一并交给 modal（modal 不再自己跑 scan）
     const lister = this.makeOrphanLister();
     const deleter = this.makeOrphanDeleter();
     const modal = new OrphanCleanupModal(this.app, vaultName, parentDir, lister, deleter, {
       autoMode: !!opts.autoMode,
       retentionDays: this.settings.orphanRetentionDays,
       bulkConfirmThreshold: this.settings.bulkDeleteConfirm,
+      useRecycleBin: this.settings.orphanUseRecycleBin !== false,
+      scanMode: this.settings.orphanScanMode,
+      findings: scanResult.findings,
+      scanStats: {
+        scannedNodes: scanResult.scannedNodes,
+        scannedBytes: scanResult.scannedBytes,
+        truncated: scanResult.truncated,
+        durationMs: scanResult.durationMs,
+        errors: scanResult.errors,
+      },
       onComplete: (r) => {
         // 任何结果（取消/完成/失败）都更新 lastOrphanScanAt，作为下次 24h 限频基准
         this.settings.lastOrphanScanAt = Date.now();
@@ -1562,19 +1592,30 @@ export default class BDNSyncPlugin extends Plugin {
           ? `orphan 巡检取消（已选 ${r.selectedCount}）`
           : `orphan 清理完成：成功 ${r.okCount}、失败 ${r.failedCount}（已选 ${r.selectedCount}）`;
         this.logger.log('cleanup', 'info', level, text);
-        // P0-5 审计闭环：持久化 lastOrphanReport（可溯源：时间/范围/数量/成败明细）
+        // P0-5 审计闭环：持久化 lastOrphanReport（v2 含扫描摘要）
         void this.store
           .loadLocalIndex()
           .then(async (idx) => {
+            const counts = this.countFindingsByKind(scanResult.findings);
             idx.lastOrphanReport = [
               {
                 at: Date.now(),
                 scannedParent: parentDir,
-                total: r.selectedCount + r.failedCount,
+                total: scanResult.findings.length,
                 selected: r.selectedCount,
                 ok: r.okPaths ?? [],
                 failed: r.failedPaths ?? [],
                 mode: opts.autoMode ? 'auto' : 'manual',
+                summary: {
+                  scanMode: this.settings.orphanScanMode,
+                  nodesScanned: scanResult.scannedNodes,
+                  bytesScanned: scanResult.scannedBytes,
+                  backupDirCount: counts.backupDir,
+                  orphanFileCount: counts.orphanFile,
+                  orphanDirCount: counts.orphanDir,
+                  truncated: scanResult.truncated,
+                  useRecycleBin: this.settings.orphanUseRecycleBin !== false,
+                },
               },
             ];
             await this.store.saveLocalIndex(idx);
@@ -1588,12 +1629,118 @@ export default class BDNSyncPlugin extends Plugin {
             'cleanup',
             'info',
             'warn',
-            `扫描父目录 ${parentDir}，发现 ${r.selectedCount} 个候选，清理完成（含 ${r.failedCount} 条失败，详见面板失败列表）`,
+            `扫描模式 ${this.settings.orphanScanMode}，发现 ${scanResult.findings.length} 个候选，清理完成（含 ${r.failedCount} 条失败，详见面板失败列表）`,
           );
         }
       },
     });
     modal.open();
+  }
+
+  /**
+   * 统一孤儿扫描入口。根据 settings.orphanScanMode 选择 parent-only（legacy）/ scoped / full-vault。
+   * 三个模式都返回统一的 DeepScanResult（含 findings + 扫描统计 + 错误），下游 modal 不需关心模式。
+   *
+   * 注：sync-index 交叉校验通过 LocalIndex.files —— 仅当文件在 idx.files 中且未被删除时算 active。
+   */
+  private async runOrphanScan(opts: {
+    vaultName: string;
+    parentDir: string;
+    remoteRoot: string;
+  }): Promise<DeepScanResult> {
+    const s = this.settings;
+    const mode = s.orphanScanMode;
+    // 收集忽略规则：excludePatterns（既有过滤）+ orphanExtraIgnoreGlobs（新加的）
+    const ignoreGlobs = [
+      ...(s.excludePatterns || []),
+      ...(s.orphanExtraIgnoreGlobs || []),
+      // 永远排除插件自身基础设施目录（即使用户改坏设置也不会误删索引）
+      '.bdnsync/**',
+      '.bdnsync-base/**',
+      '.bdnsync-merge-draft/**',
+      '.bdnsync-backup/**',
+    ];
+
+    // 准备 LocalIndex 交叉校验：路径 → 是否 active
+    let activeFiles: Set<string> | null = null;
+    try {
+      const idx = await this.store.loadLocalIndex();
+      const set = new Set<string>();
+      for (const [p, st] of Object.entries(idx.files || {})) {
+        if (!st.deleted) set.add(p.replace(/\\/g, '/'));
+      }
+      activeFiles = set;
+    } catch {
+      activeFiles = null; // 读不到不阻断（宁可多判孤儿不可漏判）
+    }
+
+    const isActive: ClassifyOptions['isActive'] = (relPath) => {
+      if (!activeFiles) return false;
+      return activeFiles.has(relPath);
+    };
+
+    if (mode === 'parent-only') {
+      // 旧管线：单层扫父目录，命中 backup-dir（不进入 vault 根内部）
+      const walked = await walkRemoteTree(this.makeOrphanLister(), {
+        parentDir: opts.parentDir,
+        remoteRoot: opts.remoteRoot,
+        vaultName: opts.vaultName,
+        mode: 'parent-only',
+        maxDepth: 0,
+        maxNodes: s.orphanScanMaxNodes || 20000,
+        maxBytes: s.orphanScanMaxBytes || 0,
+        concurrency: s.orphanScanConcurrency || 3,
+        ignoreGlobs,
+      });
+      const findings = await classifyOrphans(walked.nodes, {
+        vaultName: opts.vaultName,
+        isActive,
+        ignoreGlobs,
+      });
+      return {
+        findings,
+        scannedNodes: walked.scannedNodes,
+        scannedBytes: walked.scannedBytes,
+        truncated: walked.truncated,
+        durationMs: 0,
+        errors: walked.errors,
+      };
+    }
+
+    // scoped / full-vault：走完整 walkRemoteTree + classify
+    const scanOpts: DeepScanOptions = {
+      parentDir: opts.parentDir,
+      remoteRoot: opts.remoteRoot,
+      vaultName: opts.vaultName,
+      mode,
+      maxDepth: s.orphanScanMaxDepth || 0,
+      maxNodes: s.orphanScanMaxNodes || 20000,
+      maxBytes: s.orphanScanMaxBytes || 0,
+      concurrency: s.orphanScanConcurrency || 3,
+      ignoreGlobs,
+    };
+    return runDeepScan(this.makeOrphanLister(), scanOpts, {
+      vaultName: opts.vaultName,
+      isActive,
+      ignoreGlobs,
+    });
+  }
+
+  /** 按 kind 统计 OrphanFinding 数量（用于审计摘要） */
+  private countFindingsByKind(findings: OrphanFinding[]): {
+    backupDir: number;
+    orphanFile: number;
+    orphanDir: number;
+  } {
+    let backupDir = 0;
+    let orphanFile = 0;
+    let orphanDir = 0;
+    for (const f of findings) {
+      if (f.kind === 'backup-dir') backupDir++;
+      else if (f.kind === 'orphan-file') orphanFile++;
+      else if (f.kind === 'orphan-dir') orphanDir++;
+    }
+    return { backupDir, orphanFile, orphanDir };
   }
 
   /**
@@ -1621,12 +1768,22 @@ export default class BDNSyncPlugin extends Plugin {
     };
   }
 
-  /** orphan-cleanup 用 Deleter：直接用 live api.deleteFiles（不走 adapter；orphan 路径已是绝对路径） */
+  /** orphan-cleanup 用 Deleter：直接用 live api.deleteFiles（不走 adapter；orphan 路径已是绝对路径）
+   *  注：百度网盘 xpan OpenAPI 的「deleteFiles」本身就是移到回收站（可逆）。
+   *  真正「永久删除」需要额外调回收站清理接口（不同账户/版本差异大），
+   *  本实现选择把 useRecycleBin=false 也复用 deleteFiles —— 由 modal 显式提示
+   *  「永久删除仍需到百度网盘 Web 端清空回收站」。这样保证永远不会「假装永久」
+   *  造成用户预期之外的不可逆损失。 */
   private makeOrphanDeleter(): RemoteDeleter {
     // 显式捕获 api 引用，避免对象字面量内部 this 引用歧义
     const api = this.getApi();
     return {
       async deleteFiles(fullPaths: string[]): Promise<void> {
+        await api.deleteFiles(fullPaths);
+      },
+      // 占位：保持接口兼容；目前未实现独立「跳过回收站」路径
+      async deleteFilesPermanent(fullPaths: string[]): Promise<void> {
+        // 兜底走回收站（最安全选择）；modal 会在 UI 上显式标注「需手动清空回收站」
         await api.deleteFiles(fullPaths);
       },
     };

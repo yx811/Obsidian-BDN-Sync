@@ -11,6 +11,7 @@ import type {
   SyncLogEntry,
   LogLevel,
   LogFilter,
+  OrphanFinding,
 } from '../types';
 import { conflictKindText } from '../sync/conflict-resolver';
 import type { LocalStore } from '../storage/local-store';
@@ -1070,7 +1071,9 @@ export class ImportSettingsModal extends Modal {
  *      给出基于 errno 的诊断提示（路径不存在/部分失败/限流等），减少用户「为什么失败」的盲区。
  */
 export class OrphanCleanupModal extends Modal {
-  private items: OrphanEntry[] = [];
+  private items: OrphanEntry[] = []; // legacy 1-level 命中（保留向后兼容：若 opts.findings 不提供则自己扫）
+  private findings: OrphanFinding[] = []; // v2 三类合并命中（由 main.ts 预扫后传入）
+  private scanStats: { scannedNodes: number; scannedBytes: number; truncated: boolean; durationMs: number; errors: { path: string; message: string }[] } | null = null;
   private selected = new Set<string>(); // fullPath 集合
   private phase: 'scanning' | 'ready' | 'deleting' | 'done' = 'scanning';
   private summary = { total: 0, totalBytes: 0, selectedCount: 0, selectedBytes: 0 };
@@ -1079,6 +1082,8 @@ export class OrphanCleanupModal extends Modal {
   private footerEl!: HTMLElement;
   /** 缓存「删除选中」按钮引用，使其能在勾选变化时原地更新文案/禁用态（修复 #80 缺陷 1）。 */
   private deleteBtn?: HTMLButtonElement;
+  /** v2 设置：删除是否先送回收站（默认 true；false 时 modal 会提示「仍需到网盘回收站手动清空」） */
+  private useRecycleBin = true;
 
   constructor(
     app: App,
@@ -1102,14 +1107,43 @@ export class OrphanCleanupModal extends Modal {
         okPaths?: string[];
         failedPaths?: { path: string; error: string; errno?: number }[];
       }) => void;
+      /** v2：使用回收站（默认 true；可逆）；false = 永久删除（仍会进回收站，需用户手动清空） */
+      useRecycleBin?: boolean;
+      /** v2：本次扫描模式（仅展示用） */
+      scanMode?: 'parent-only' | 'scoped' | 'full-vault';
+      /** v2：主入口预扫的结果（提供则跳过 modal 自带的 1 层 scan，直接进入 ready） */
+      findings?: OrphanFinding[];
+      /** v2：扫描统计（与 findings 配对） */
+      scanStats?: {
+        scannedNodes: number;
+        scannedBytes: number;
+        truncated: boolean;
+        durationMs: number;
+        errors: { path: string; message: string }[];
+      };
     } = {},
   ) {
     super(app);
     this.modalEl.addClass('bdnsync-modal', 'bdnsync-orphan-modal');
+    this.useRecycleBin = opts.useRecycleBin !== false;
   }
 
   onOpen(): void {
     this.renderShell();
+    // v2 短路：若主入口已预扫，直接进入 ready；否则走 legacy 自扫
+    if (this.opts.findings && this.opts.scanStats) {
+      this.findings = [...this.opts.findings];
+      this.scanStats = this.opts.scanStats;
+      this.phase = 'ready';
+      // 按 risk ≥ 1（高 + 中）默认勾选；orphan-file/orphan-dir 默认 risk=0 → 默认不勾（保守）
+      for (const f of this.findings) {
+        if (f.risk >= 1) this.selected.add(f.fullPath);
+      }
+      this.recomputeSummary();
+      this.renderBody();
+      this.renderFooter();
+      return;
+    }
     void this.scan();
   }
 
@@ -1180,17 +1214,61 @@ export class OrphanCleanupModal extends Modal {
 
   private recomputeSummary(): void {
     let totalBytes = 0;
+    let totalCount = 0;
     let selectedBytes = 0;
-    for (const it of this.items) {
-      totalBytes += it.totalBytes;
-      if (this.selected.has(it.fullPath)) selectedBytes += it.totalBytes;
+    for (const it of this.iterActive()) {
+      totalBytes += it.bytes;
+      totalCount++;
+      if (this.selected.has(it.fullPath)) selectedBytes += it.bytes;
     }
     this.summary = {
-      total: this.items.length,
+      total: totalCount,
       totalBytes,
       selectedCount: this.selected.size,
       selectedBytes,
     };
+  }
+
+  /** 统一迭代当前阶段的「活跃条目」：v2 走 findings；v1 走 items。 */
+  private *iterActive(): Generator<{ fullPath: string; name: string; bytes: number; kind: string; risk: 0 | 1 | 2; relPath: string; reason: string; segments: number }> {
+    if (this.findings.length > 0) {
+      for (const f of this.findings) {
+        yield {
+          fullPath: f.fullPath,
+          name: f.name,
+          bytes: f.bytes,
+          kind: f.kind,
+          risk: f.risk,
+          relPath: f.relPath,
+          reason: f.reason,
+          segments: f.segments,
+        };
+      }
+      return;
+    }
+    for (const it of this.items) {
+      yield {
+        fullPath: it.fullPath,
+        name: it.name,
+        bytes: it.totalBytes,
+        kind: 'backup-dir',
+        risk: it.risk,
+        relPath: '',
+        reason: it.risk === 2 ? `高风险：${it.segments} 段时间戳段叠加` : `中等风险：${it.segments} 段时间戳段`,
+        segments: it.segments,
+      };
+    }
+  }
+
+  /** 按 kind 分组（仅 v2 有意义） */
+  private groupFindings(): { backupDir: OrphanFinding[]; orphanFile: OrphanFinding[]; orphanDir: OrphanFinding[] } {
+    const out = { backupDir: [] as OrphanFinding[], orphanFile: [] as OrphanFinding[], orphanDir: [] as OrphanFinding[] };
+    for (const f of this.findings) {
+      if (f.kind === 'backup-dir') out.backupDir.push(f);
+      else if (f.kind === 'orphan-file') out.orphanFile.push(f);
+      else if (f.kind === 'orphan-dir') out.orphanDir.push(f);
+    }
+    return out;
   }
 
   private renderBody(): void {
@@ -1282,10 +1360,15 @@ export class OrphanCleanupModal extends Modal {
     }
 
     // ready
-    if (this.items.length === 0) {
+    let activeCount = 0;
+    for (const _ of this.iterActive()) {
+      activeCount++;
+      break;
+    }
+    if (activeCount === 0) {
       this.bodyEl.createEl('p', {
         cls: 'bdnsync-modal-subtitle',
-        text: '没有发现疑似孤儿备份目录。父目录扫描范围：' + this.parentDir,
+        text: '没有发现疑似孤儿备份目录。扫描范围：' + this.parentDir,
       });
       return;
     }
@@ -1293,18 +1376,50 @@ export class OrphanCleanupModal extends Modal {
     const head = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-head' });
     head.createEl('div', {
       cls: 'bdnsync-orphan-count',
-      text: `候选 ${this.items.length} 个（合计 ${formatBytes(this.summary.totalBytes)}）`,
+      text: `候选 ${this.summary.total} 个（合计 ${formatBytes(this.summary.totalBytes)}）`,
     });
     head.createEl('div', {
       cls: 'bdnsync-orphan-count',
       text: `已选 ${this.summary.selectedCount} 个（${formatBytes(this.summary.selectedBytes)}）`,
     });
 
+    // v2 扫描统计摘要（仅当主入口传入了 scanStats 时显示）
+    if (this.scanStats) {
+      const statsLine = head.createDiv({ cls: 'bdnsync-orphan-count bdnsync-orphan-stats' });
+      statsLine.style.opacity = '0.85';
+      statsLine.style.fontSize = '12px';
+      const modeLabel =
+        this.opts.scanMode === 'parent-only'
+          ? '父目录单层'
+          : this.opts.scanMode === 'scoped'
+          ? '父目录 + vault 顶层'
+          : '深度遍历（full-vault）';
+      const parts = [
+        `扫描模式：${modeLabel}`,
+        `访问节点 ${this.scanStats.scannedNodes} 个`,
+        `累计字节 ${formatBytes(this.scanStats.scannedBytes)}`,
+      ];
+      if (this.scanStats.durationMs > 0) parts.push(`耗时 ${this.scanStats.durationMs} ms`);
+      if (this.scanStats.truncated) parts.push('⚠️ 已达节点/字节预算上限，结果可能不完整');
+      statsLine.textContent = parts.join('  ·  ');
+      if (this.scanStats.errors.length > 0) {
+        const errLine = head.createDiv({ cls: 'bdnsync-orphan-stats-err' });
+        errLine.style.color = '#c97';
+        errLine.style.fontSize = '12px';
+        errLine.textContent = `扫描期遇到 ${this.scanStats.errors.length} 个错误（前 3 条）：${this.scanStats.errors
+          .slice(0, 3)
+          .map((e) => `${e.path} (${e.message})`)
+          .join('；')}`;
+      }
+    }
+
     // 全选 / 清除选择 工具栏：便于对 4+ 个候选做批量勾选（修复 #80 缺陷 3）
     const toolbar = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-toolbar' });
     toolbar.style.display = 'flex';
     toolbar.style.gap = '8px';
     toolbar.style.margin = '8px 0';
+    toolbar.style.flexWrap = 'wrap';
+    toolbar.style.alignItems = 'center';
     const selectAllBtn = toolbar.createEl('button', { text: '全选', cls: 'bdnsync-btn' });
     selectAllBtn.style.minWidth = '64px';
     selectAllBtn.addEventListener('click', () => this.toggleSelectAll(true));
@@ -1312,44 +1427,43 @@ export class OrphanCleanupModal extends Modal {
     clearSelBtn.style.minWidth = '80px';
     clearSelBtn.addEventListener('click', () => this.toggleSelectAll(false));
 
+    // v2：按 kind 分组批量勾选（备份目录 / 孤儿文件 / 孤儿目录）
+    if (this.findings.length > 0) {
+      const groups = this.groupFindings();
+      const labels: Array<{ key: 'backupDir' | 'orphanFile' | 'orphanDir'; text: string }> = [
+        { key: 'backupDir', text: `勾选备份目录 (${groups.backupDir.length})` },
+        { key: 'orphanFile', text: `勾选孤儿文件 (${groups.orphanFile.length})` },
+        { key: 'orphanDir', text: `勾选孤儿目录 (${groups.orphanDir.length})` },
+      ];
+      for (const g of labels) {
+        const list = groups[g.key];
+        if (list.length === 0) continue;
+        const btn = toolbar.createEl('button', {
+          text: g.text,
+          cls: 'bdnsync-btn',
+        });
+        btn.style.fontSize = '12px';
+        btn.addEventListener('click', () => {
+          for (const f of list) this.selected.add(f.fullPath);
+          this.recomputeSummary();
+          this.renderBody();
+          this.renderFooter();
+        });
+      }
+    }
+
     // 候选行也展示完整绝对路径（hover 可见），避免「选中后才发现只勾到 basename」的歧义
     const list = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-list' });
-    for (const it of this.items) {
-      const row = list.createDiv({ cls: 'bdnsync-orphan-row' });
-      const cb = row.createEl('input', { type: 'checkbox' });
-      cb.checked = this.selected.has(it.fullPath);
-      cb.addEventListener('change', () => {
-        if (cb.checked) this.selected.add(it.fullPath);
-        else this.selected.delete(it.fullPath);
-        this.recomputeSummary();
-        const counts = head.querySelectorAll('.bdnsync-orphan-count');
-        if (counts[1]) {
-          counts[1].textContent = `已选 ${this.summary.selectedCount} 个（${formatBytes(this.summary.selectedBytes)}）`;
-        }
-        // 修复 #80 缺陷 1：勾选变化必须同步刷新底部「删除选中 (N)」按钮的文案与禁用态，
-        // 否则按钮数字永远停在初始值、且取消到 0 后仍可被点击。
-        this.updateFooterDeleteState();
-      });
-      const main = row.createDiv({ cls: 'bdnsync-orphan-main' });
-      main.createEl('div', {
-        cls: 'bdnsync-orphan-name',
-        text: it.name,
-        attr: { title: `完整路径：${it.fullPath}\n\n时间戳段：${it.segments}\n风险：${
-          it.risk === 2 ? '高' : it.risk === 1 ? '中' : '低'
-        }` },
-      });
-      const meta = main.createDiv({ cls: 'bdnsync-orphan-meta' });
-      const riskLabel = it.risk === 2 ? '高风险' : it.risk === 1 ? '中等' : '低';
-      createBadge(meta, `风险 ${riskLabel}`, it.risk === 2 ? 'error' : it.risk === 1 ? 'warning' : 'info');
-      createBadge(meta, `${it.segments} 段时间戳`, 'info');
-      if (it.measureError) {
-        // 修复 #80 缺陷 2：列出子项失败 ≠ 空目录，显式标「测量失败」避免误导
-        createBadge(meta, '测量失败', 'warning');
-      } else {
-        createBadge(meta, `${it.fileCount} 文件 · ${formatBytes(it.totalBytes)}`, 'info');
-      }
-      if (it.mtime) {
-        createBadge(meta, formatTime(it.mtime), 'info');
+    if (this.findings.length > 0) {
+      // v2：按 kind 分组渲染，每组带标题
+      const groups = this.groupFindings();
+      this.renderFindingGroup(list, '备份目录（vault 名 + 时间戳段）', groups.backupDir, 'backup-dir');
+      this.renderFindingGroup(list, '孤儿文件（不在 sync index 中）', groups.orphanFile, 'orphan-file');
+      this.renderFindingGroup(list, '孤儿目录（空 / 全是孤儿子项）', groups.orphanDir, 'orphan-dir');
+    } else {
+      // v1 legacy：单列表
+      for (const it of this.items) {
+        this.renderLegacyRow(list, it);
       }
     }
 
@@ -1362,6 +1476,107 @@ export class OrphanCleanupModal extends Modal {
     ];
     for (const s of sourceItems) {
       source.createEl('div', { text: s, cls: 'bdnsync-orphan-source-hint-row' });
+    }
+  }
+
+  /** v2：按组渲染一组 findings；kindLabel 用于分组标题 */
+  private renderFindingGroup(
+    container: HTMLElement,
+    title: string,
+    findings: OrphanFinding[],
+    kindLabel: 'backup-dir' | 'orphan-file' | 'orphan-dir',
+  ): void {
+    if (findings.length === 0) return;
+    const groupEl = container.createDiv({ cls: 'bdnsync-orphan-group' });
+    groupEl.createEl('div', {
+      text: `${title}（${findings.length}）`,
+      cls: 'bdnsync-orphan-group-title',
+    });
+    for (const f of findings) {
+      const row = groupEl.createDiv({ cls: 'bdnsync-orphan-row' });
+      const cb = row.createEl('input', { type: 'checkbox' });
+      cb.checked = this.selected.has(f.fullPath);
+      cb.addEventListener('change', () => {
+        if (cb.checked) this.selected.add(f.fullPath);
+        else this.selected.delete(f.fullPath);
+        this.recomputeSummary();
+        const counts = this.bodyEl.querySelectorAll('.bdnsync-orphan-count');
+        if (counts[1]) {
+          counts[1].textContent = `已选 ${this.summary.selectedCount} 个（${formatBytes(this.summary.selectedBytes)}）`;
+        }
+        this.updateFooterDeleteState();
+      });
+      const main = row.createDiv({ cls: 'bdnsync-orphan-main' });
+      const pathDisplay = f.relPath ? f.relPath : f.name;
+      main.createEl('div', {
+        cls: 'bdnsync-orphan-name',
+        text: f.name,
+        attr: {
+          title: `完整路径：${f.fullPath}\n\n相对 vault：${pathDisplay}\n深度：${f.depth}\n类别：${kindLabel}\n原因：${f.reason}`,
+        },
+      });
+      const meta = main.createDiv({ cls: 'bdnsync-orphan-meta' });
+      const kindBadge = kindLabel === 'backup-dir' ? '备份目录' : kindLabel === 'orphan-file' ? '孤儿文件' : '孤儿目录';
+      const kindStyle: 'error' | 'warning' | 'info' =
+        kindLabel === 'backup-dir' && f.risk === 2
+          ? 'error'
+          : kindLabel === 'backup-dir' && f.risk === 1
+          ? 'warning'
+          : 'info';
+      createBadge(meta, kindBadge, kindStyle);
+      if (kindLabel === 'backup-dir' && f.segments > 0) {
+        const riskLabel = f.risk === 2 ? '高风险' : f.risk === 1 ? '中等' : '低';
+        createBadge(meta, `风险 ${riskLabel}`, f.risk === 2 ? 'error' : f.risk === 1 ? 'warning' : 'info');
+        createBadge(meta, `${f.segments} 段时间戳`, 'info');
+      }
+      if (f.bytes > 0) createBadge(meta, formatBytes(f.bytes), 'info');
+      else if (kindLabel === 'orphan-dir' || kindLabel === 'backup-dir') {
+        createBadge(meta, '空 / 仅目录', 'info');
+      }
+      if (f.mtime) createBadge(meta, formatTime(f.mtime), 'info');
+      if (f.depth > 1) createBadge(meta, `深度 ${f.depth}`, 'info');
+    }
+  }
+
+  /** v1 legacy 单行渲染（保留向后兼容） */
+  private renderLegacyRow(container: HTMLElement, it: OrphanEntry): void {
+    const row = container.createDiv({ cls: 'bdnsync-orphan-row' });
+    const cb = row.createEl('input', { type: 'checkbox' });
+    cb.checked = this.selected.has(it.fullPath);
+    cb.addEventListener('change', () => {
+      if (cb.checked) this.selected.add(it.fullPath);
+      else this.selected.delete(it.fullPath);
+      this.recomputeSummary();
+      const counts = this.bodyEl.querySelectorAll('.bdnsync-orphan-count');
+      if (counts[1]) {
+        counts[1].textContent = `已选 ${this.summary.selectedCount} 个（${formatBytes(this.summary.selectedBytes)}）`;
+      }
+      // 修复 #80 缺陷 1：勾选变化必须同步刷新底部「删除选中 (N)」按钮的文案与禁用态，
+      // 否则按钮数字永远停在初始值、且取消到 0 后仍可被点击。
+      this.updateFooterDeleteState();
+    });
+    const main = row.createDiv({ cls: 'bdnsync-orphan-main' });
+    main.createEl('div', {
+      cls: 'bdnsync-orphan-name',
+      text: it.name,
+      attr: {
+        title: `完整路径：${it.fullPath}\n\n时间戳段：${it.segments}\n风险：${
+          it.risk === 2 ? '高' : it.risk === 1 ? '中' : '低'
+        }`,
+      },
+    });
+    const meta = main.createDiv({ cls: 'bdnsync-orphan-meta' });
+    const riskLabel = it.risk === 2 ? '高风险' : it.risk === 1 ? '中等' : '低';
+    createBadge(meta, `风险 ${riskLabel}`, it.risk === 2 ? 'error' : it.risk === 1 ? 'warning' : 'info');
+    createBadge(meta, `${it.segments} 段时间戳`, 'info');
+    if (it.measureError) {
+      // 修复 #80 缺陷 2：列出子项失败 ≠ 空目录，显式标「测量失败」避免误导
+      createBadge(meta, '测量失败', 'warning');
+    } else {
+      createBadge(meta, `${it.fileCount} 文件 · ${formatBytes(it.totalBytes)}`, 'info');
+    }
+    if (it.mtime) {
+      createBadge(meta, formatTime(it.mtime), 'info');
     }
   }
 
@@ -1381,11 +1596,28 @@ export class OrphanCleanupModal extends Modal {
         .addEventListener('click', () => this.close());
       return;
     }
-    if (this.items.length === 0) {
+    // ready
+    let activeCount = 0;
+    for (const _ of this.iterActive()) {
+      activeCount++;
+      break;
+    }
+    if (activeCount === 0) {
       this.footerEl
         .createEl('button', { text: '关闭', cls: 'bdnsync-btn' })
         .addEventListener('click', () => this.close());
       return;
+    }
+    // v2：底部显示「送回收站 / 永久删除」提示
+    const recycleHint = this.footerEl.createDiv({ cls: 'bdnsync-orphan-recycle-hint' });
+    recycleHint.style.fontSize = '12px';
+    recycleHint.style.opacity = '0.7';
+    recycleHint.style.margin = '0 0 4px 0';
+    if (this.useRecycleBin) {
+      recycleHint.textContent = '✓ 删除模式：先送回收站（可逆）—— 永久删除请到网盘 Web 端回收站手动清空。';
+    } else {
+      recycleHint.textContent = '⚠ 删除模式：永久删除（百度网盘限制，仍会送回收站，需到 Web 端手动清空）';
+      recycleHint.style.color = '#c97';
     }
     const deleteBtn = this.footerEl.createEl('button', {
       text: `删除选中（${this.summary.selectedCount}）`,
@@ -1394,12 +1626,73 @@ export class OrphanCleanupModal extends Modal {
     deleteBtn.disabled = this.selected.size === 0;
     deleteBtn.addEventListener('click', () => void this.confirmAndDelete());
     this.deleteBtn = deleteBtn;
+    // v2：v2 时附一个「导出预览清单」按钮，方便用户先留档再删
+    if (this.findings.length > 0) {
+      const exportBtn = this.footerEl.createEl('button', {
+        text: '复制预览清单',
+        cls: 'bdnsync-btn',
+      });
+      exportBtn.style.marginLeft = '8px';
+      exportBtn.addEventListener('click', () => void this.copyPreviewToClipboard());
+    }
     this.footerEl
       .createEl('button', {
         text: this.opts.autoMode ? '暂不处理（仅记日志）' : '取消',
         cls: 'bdnsync-btn',
       })
       .addEventListener('click', () => this.close());
+  }
+
+  /** 复制预览清单（kind / 完整路径 / 风险 / 字节 / mtime）到剪贴板 */
+  private async copyPreviewToClipboard(): Promise<void> {
+    const lines: string[] = [];
+    lines.push(`BDNSync orphan 预览清单（${new Date().toLocaleString()}）`);
+    lines.push(`扫描模式：${this.opts.scanMode ?? 'parent-only'}`);
+    lines.push(`扫描范围：父目录 ${this.parentDir} / 同步根 ${this.opts.findings?.length ?? 0} 项`);
+    if (this.scanStats) {
+      lines.push(
+        `访问节点 ${this.scanStats.scannedNodes} / 累计字节 ${this.scanStats.scannedBytes} / 耗时 ${this.scanStats.durationMs}ms` +
+          (this.scanStats.truncated ? '（已截断）' : ''),
+      );
+    }
+    lines.push('');
+    const groups = this.groupFindings();
+    const pushGroup = (title: string, list: OrphanFinding[]) => {
+      if (list.length === 0) return;
+      lines.push(`── ${title}（${list.length}） ──`);
+      for (const f of list) {
+        lines.push(
+          `[${f.kind}] ${f.fullPath}` +
+            ` | 风险=${f.risk}` +
+            ` | 段=${f.segments}` +
+            ` | 字节=${f.bytes}` +
+            ` | mtime=${f.mtime ? formatTime(f.mtime) : '0'}` +
+            (f.relPath ? ` | rel=${f.relPath}` : ''),
+        );
+      }
+      lines.push('');
+    };
+    pushGroup('备份目录', groups.backupDir);
+    pushGroup('孤儿文件', groups.orphanFile);
+    pushGroup('孤儿目录', groups.orphanDir);
+    const text = lines.join('\n');
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      new Notice(`BDNSync：已复制 ${this.findings.length} 条预览到剪贴板`);
+    } catch {
+      new Notice('BDNSync：复制失败，请手动选中');
+    }
   }
 
   /**
@@ -1420,15 +1713,33 @@ export class OrphanCleanupModal extends Modal {
   private toggleSelectAll(select: boolean): void {
     this.selected.clear();
     if (select) {
-      for (const it of this.items) this.selected.add(it.fullPath);
+      for (const it of this.iterActive()) this.selected.add(it.fullPath);
     }
     this.recomputeSummary();
     this.renderBody();
     this.renderFooter();
   }
 
+  /** 把「当前选中的活跃条目」投影成 OrphanEntry（仅用于传给 deleteOrphans） */
+  private collectSelectedAsOrphanEntries(): OrphanEntry[] {
+    if (this.findings.length > 0) {
+      return this.findings
+        .filter((f) => this.selected.has(f.fullPath))
+        .map<OrphanEntry>((f) => ({
+          fullPath: f.fullPath,
+          name: f.name,
+          segments: f.segments,
+          risk: f.risk,
+          mtime: f.mtime,
+          fileCount: 0,
+          totalBytes: f.bytes,
+        }));
+    }
+    return this.items.filter((it) => this.selected.has(it.fullPath));
+  }
+
   private async confirmAndDelete(): Promise<void> {
-    const selectedItems = this.items.filter((it) => this.selected.has(it.fullPath));
+    const selectedItems = this.collectSelectedAsOrphanEntries();
     if (selectedItems.length === 0) return;
     const threshold = this.opts.bulkConfirmThreshold ?? 50;
     if (selectedItems.length >= threshold) {
@@ -1443,6 +1754,7 @@ export class OrphanCleanupModal extends Modal {
       confirmedByUser: true,
       retries: 2,
       delayMs: 300,
+      useRecycleBin: this.useRecycleBin,
     });
     this.phase = 'done';
     this.recomputeSummary();
@@ -1450,8 +1762,9 @@ export class OrphanCleanupModal extends Modal {
     this.renderFooter();
     const ok = this.deleteResult.ok.length;
     const fail = this.deleteResult.failed.length;
+    const recycleLabel = this.useRecycleBin ? '回收站' : '永久';
     new Notice(
-      `BDNSync orphan 清理：成功 ${ok}` + (fail ? `、失败 ${fail}（见日志模块 cleanup）` : ''),
+      `BDNSync orphan 清理（${recycleLabel}）：成功 ${ok}` + (fail ? `、失败 ${fail}（见日志模块 cleanup）` : ''),
     );
   }
 
@@ -1463,24 +1776,50 @@ export class OrphanCleanupModal extends Modal {
   private async retryFailed(): Promise<void> {
     const prev = this.deleteResult;
     if (!prev || prev.failed.length === 0) return;
-    const failedItems: OrphanEntry[] = prev.failed
-      .map((f) => this.items.find((it) => it.fullPath === f.path))
-      .filter((x): x is OrphanEntry => !!x);
-    if (failedItems.length === 0) return;
+    const failedFullPaths = new Set(prev.failed.map((f) => f.path));
+    const failedItems: OrphanEntry[] = this.collectSelectedAsOrphanEntries().filter((it) =>
+      failedFullPaths.has(it.fullPath),
+    );
+    // 兼容旧路径：collectSelectedAsOrphanEntries 只返回当前 selected；这里需要从 findings/items
+    // 直接映射失败集合（防止用户在重试前取消了勾选）
+    let actualFailed: OrphanEntry[] = failedItems;
+    if (actualFailed.length === 0) {
+      const lookup = new Map<string, OrphanEntry>();
+      if (this.findings.length > 0) {
+        for (const f of this.findings) {
+          lookup.set(f.fullPath, {
+            fullPath: f.fullPath,
+            name: f.name,
+            segments: f.segments,
+            risk: f.risk,
+            mtime: f.mtime,
+            fileCount: 0,
+            totalBytes: f.bytes,
+          });
+        }
+      } else {
+        for (const it of this.items) lookup.set(it.fullPath, it);
+      }
+      actualFailed = prev.failed
+        .map((f) => lookup.get(f.path))
+        .filter((x): x is OrphanEntry => !!x);
+    }
+    if (actualFailed.length === 0) return;
 
     const threshold = this.opts.bulkConfirmThreshold ?? 50;
-    if (failedItems.length >= threshold) {
-      const ok = await this.askBulkConfirm(failedItems.length);
+    if (actualFailed.length >= threshold) {
+      const ok = await this.askBulkConfirm(actualFailed.length);
       if (!ok) return;
     }
 
     this.phase = 'deleting';
     this.renderBody();
     this.renderFooter();
-    const r = await deleteOrphans(this.deleter, failedItems, {
+    const r = await deleteOrphans(this.deleter, actualFailed, {
       confirmedByUser: true,
       retries: 3, // 重试时给更多次数，常见瞬态错误（31034/31039）第二次就能过
       delayMs: 500,
+      useRecycleBin: this.useRecycleBin,
     });
     // 合并结果：之前 ok 的保留 + 本次 ok；之前 failed 中重试 ok 的转 ok，仍 fail 的留 failed
     const okSet = new Set(r.ok);

@@ -63,6 +63,19 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       const v = src[k];
       return typeof v === 'string' && v.length <= max ? v : undefined;
     };
+    const arr = (k: string, maxLen = 256): string[] | undefined => {
+      const v = src[k];
+      if (!Array.isArray(v)) return undefined;
+      const items: string[] = [];
+      for (const item of v) {
+        if (typeof item !== 'string') continue;
+        const t = item.trim();
+        if (!t) continue;
+        items.push(t);
+        if (items.length >= maxLen) break;
+      }
+      return items;
+    };
     const num = (k: string, min: number, max: number): number | undefined => {
       const v = src[k];
       return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : undefined;
@@ -226,6 +239,23 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     if (autoPruneOrphanBackupDirs !== undefined) out.autoPruneOrphanBackupDirs = autoPruneOrphanBackupDirs;
     const orphanRetentionDays = num('orphanRetentionDays', 0, 3650);
     if (orphanRetentionDays !== undefined) out.orphanRetentionDays = orphanRetentionDays;
+    // v2：深度扫描配置
+    const orphanScanMode = str('orphanScanMode') as 'parent-only' | 'scoped' | 'full-vault' | undefined;
+    if (orphanScanMode && ['parent-only', 'scoped', 'full-vault'].includes(orphanScanMode)) {
+      out.orphanScanMode = orphanScanMode;
+    }
+    const orphanScanMaxDepth = num('orphanScanMaxDepth', 0, 32);
+    if (orphanScanMaxDepth !== undefined) out.orphanScanMaxDepth = orphanScanMaxDepth;
+    const orphanScanMaxNodes = num('orphanScanMaxNodes', 0, 1_000_000);
+    if (orphanScanMaxNodes !== undefined) out.orphanScanMaxNodes = orphanScanMaxNodes;
+    const orphanScanMaxBytes = num('orphanScanMaxBytes', 0, 1_099_511_627_776); // 1 TB
+    if (orphanScanMaxBytes !== undefined) out.orphanScanMaxBytes = orphanScanMaxBytes;
+    const orphanScanConcurrency = num('orphanScanConcurrency', 1, 8);
+    if (orphanScanConcurrency !== undefined) out.orphanScanConcurrency = orphanScanConcurrency;
+    const orphanUseRecycleBin = bool('orphanUseRecycleBin');
+    if (orphanUseRecycleBin !== undefined) out.orphanUseRecycleBin = orphanUseRecycleBin;
+    const orphanExtraIgnoreGlobs = arr('orphanExtraIgnoreGlobs');
+    if (orphanExtraIgnoreGlobs) out.orphanExtraIgnoreGlobs = orphanExtraIgnoreGlobs;
     // lastOrphanScanAt 由引擎自己维护，导入时不复制（避免基于错误时间戳的 24h 限频）
     // 故此处不读取。
 
@@ -1757,12 +1787,32 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     note.createEl('p', {
       cls: 'bdnsync-callout-text',
       text:
-        '· 范围：严格 1 层扫描（仅扫描「同步目录」的父目录直接子项），不递归，不改同步根目录配置。',
+        '· 范围（v2 增强）：可选三种模式 —— ① 父目录单层（保守，旧行为）；② 父目录 + vault 顶层（scoped）；③ 深度遍历 vault 整棵树（full-vault，可识别 vault 根下的孤儿文件如「未命名.canvas」、以及嵌套在子目录里的时间戳孤儿子目录）。',
     });
     note.createEl('p', {
       cls: 'bdnsync-callout-text',
       text:
-        '· 常见来源：① 旧版本 BDNSync 残留；② 你在网盘 Web 端手动重命名了 vault 根；③ 其它同步插件（Remotely Save / Self-hosted LiveSync 等）写入同路径时为防冲突改名前缀；④ 百度网盘客户端对 `/apps/bdnsync/<vault>/` 的并发写入；⑤ 多设备 BDNSync 并发同步竞争。',
+        '· 资源控制：full-vault 受「节点预算 + 字节预算」双重上限保护（默认 2w 节点 / 2GB），触达即停止并标记「已截断」，不会因为大库耗尽资源；并发数 1–8 可调（默认 3），避免触百度 QPS 限频。',
+    });
+    note.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text:
+        '· 忽略规则：除既有 excludePatterns 外，可叠加 orphanExtraIgnoreGlobs（glob 列表，相对路径）作为「白名单」—— 命中即整棵子树跳过；插件自身基础设施目录（.bdnsync*/）永远硬排除，绝不参与删除。',
+    });
+    note.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text:
+        '· 三类候选：① 备份目录（${vaultName}_TS[_TS...]）任意深度；② 孤儿文件（不在 sync index 的文件，可定位「未命名.canvas」型无主残留）；③ 孤儿目录（空 / 全部子项也是孤儿）。弹窗内可分组批量勾选 + 单独删除。',
+    });
+    note.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text:
+        '· 删除模式（v2）：默认「先送回收站」（可逆）；关闭 orphanUseRecycleBin 后语义上为「永久删除」—— 但百度网盘 xpan API 不提供单次「跳过回收站」接口，仍会进回收站，需用户到网盘 Web 端手动清空。modal 会显式提示，避免「看似永久实际可恢复」造成的预期偏差。',
+    });
+    note.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text:
+        '· 常见来源：① 旧版本 BDNSync 残留；② 你在网盘 Web 端手动重命名了 vault 根；③ 其它同步插件（Remotely Save / Self-hosted LiveSync 等）写入同路径时为防冲突改名前缀；④ 百度网盘客户端对 `/apps/bdnsync/<vault>/` 的并发写入；⑤ 多设备 BDNSync 并发同步竞争；⑥ 在 vault 根目录手动新建/上传的「未命名.xxx」测试文件未同步到本地。',
     });
     note.createEl('p', {
       cls: 'bdnsync-callout-text',
@@ -1811,6 +1861,119 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = parseInt(v, 10);
           s.orphanRetentionDays = Number.isFinite(n) && n >= 0 ? Math.min(3650, Math.floor(n)) : 90;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    // v2：扫描模式（parent-only / scoped / full-vault）
+    const modeLabels: Record<string, string> = {
+      'parent-only': '父目录单层（保守，旧行为）',
+      scoped: '父目录 + vault 顶层（scoped）',
+      'full-vault': '深度遍历 vault 整棵树（full-vault）',
+    };
+    new Setting(section.body)
+      .setName('扫描模式')
+      .setDesc(
+        '选择深度遍历范围。full-vault 能识别 vault 根下的孤儿文件与嵌套子目录里的孤儿子目录；scoped 仅识别顶层；parent-only 只看父目录直接子项。',
+      )
+      .addDropdown((d) => {
+        for (const k of ['parent-only', 'scoped', 'full-vault']) d.addOption(k, modeLabels[k]);
+        d.setValue(s.orphanScanMode).onChange(async (v) => {
+          if (v === 'parent-only' || v === 'scoped' || v === 'full-vault') {
+            s.orphanScanMode = v;
+            await this.plugin.saveSettings();
+          }
+        });
+      });
+
+    // v2：最大递归深度（仅 full-vault 生效；0 = 不限）
+    new Setting(section.body)
+      .setName('最大递归深度（仅 full-vault）')
+      .setDesc(
+        '限制扫描层级。0 = 不限（仍受节点/字节预算保护）。一般库用 8–10 已足够；嵌套较深可调高。',
+      )
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(s.orphanScanMaxDepth));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          s.orphanScanMaxDepth = Number.isFinite(n) && n >= 0 ? Math.min(32, Math.floor(n)) : 0;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    // v2：节点预算
+    new Setting(section.body)
+      .setName('节点预算（单次扫描最多访问的远端条目数）')
+      .setDesc(
+        '触达即停并标记「已截断」。默认 20000。万级库安全；超大库可调高，但避免一次扫描占用过多 API 配额。',
+      )
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(s.orphanScanMaxNodes));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          s.orphanScanMaxNodes = Number.isFinite(n) && n >= 0 ? Math.min(1_000_000, Math.floor(n)) : 20000;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    // v2：字节预算
+    new Setting(section.body)
+      .setName('字节预算（单次扫描累计字节数上限）')
+      .setDesc('触达即停。默认 2 GB（约 2147483648 字节）。一般无需调整；超大库可调高。')
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(s.orphanScanMaxBytes));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          s.orphanScanMaxBytes =
+            Number.isFinite(n) && n >= 0 ? Math.min(1_099_511_627_776, Math.floor(n)) : 2 * 1024 * 1024 * 1024;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    // v2：并发数
+    new Setting(section.body)
+      .setName('扫描并发数（listDir 并发上限）')
+      .setDesc('1–8。默认 3。百度 API QPS 限制较严，超过 5 容易触发 errno=31034/31039。')
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(s.orphanScanConcurrency));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          s.orphanScanConcurrency = Number.isFinite(n) && n >= 1 ? Math.min(8, Math.floor(n)) : 3;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    // v2：删除模式（回收站 vs 永久）
+    new Setting(section.body)
+      .setName('删除先送回收站（可逆）')
+      .setDesc(
+        '开启 → 删除时进入回收站，可通过网盘 Web 端恢复。关闭 → 语义上「永久删除」（实际仍会进回收站，因百度网盘 API 不提供单次跳过回收站接口；modal 会显式提示）。',
+      )
+      .addToggle((t) =>
+        t.setValue(s.orphanUseRecycleBin).onChange(async (v) => {
+          s.orphanUseRecycleBin = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    // v2：额外忽略 glob
+    new Setting(section.body)
+      .setName('额外忽略 glob（每行一个）')
+      .setDesc(
+        '叠加在已有「过滤模式」之上 —— 命中即整棵子树跳过。例：attachments/**、*.important、.trash/**。',
+      )
+      .addTextArea((t) => {
+        t.setValue((s.orphanExtraIgnoreGlobs || []).join('\n'));
+        t.onChange(async (v) => {
+          const arr = v
+            .split('\n')
+            .map((x) => x.trim())
+            .filter(Boolean);
+          s.orphanExtraIgnoreGlobs = arr;
           await this.plugin.saveSettings();
         });
       });

@@ -244,6 +244,67 @@ describe('deleteOrphans：批量 + 重试 + 失败分桶', () => {
     expect(called).toBe(true);
     expect(r.ok.length).toBe(1);
   });
+
+  it('useRecycleBin=true（默认）→ 走 deleteFiles', async () => {
+    const items = [mkOrphan('A')];
+    let calledRecycle = false;
+    let calledPermanent = false;
+    await deleteOrphans(
+      {
+        async deleteFiles() {
+          calledRecycle = true;
+        },
+        async deleteFilesPermanent() {
+          calledPermanent = true;
+        },
+      },
+      items,
+      { confirmedByUser: true, useRecycleBin: true },
+    );
+    expect(calledRecycle).toBe(true);
+    expect(calledPermanent).toBe(false);
+  });
+
+  it('useRecycleBin=false 且有 deleteFilesPermanent → 走 permanent', async () => {
+    const items = [mkOrphan('A')];
+    let calledRecycle = false;
+    let calledPermanent = false;
+    await deleteOrphans(
+      {
+        async deleteFiles() {
+          calledRecycle = true;
+        },
+        async deleteFilesPermanent() {
+          calledPermanent = true;
+        },
+      },
+      items,
+      { confirmedByUser: true, useRecycleBin: false },
+    );
+    expect(calledRecycle).toBe(false);
+    expect(calledPermanent).toBe(true);
+  });
+
+  it('useRecycleBin=false 但 deleter 无 deleteFilesPermanent → 自动降级到 deleteFiles 且失败信息附注', async () => {
+    const items = [mkOrphan('A')];
+    const deleter = {
+      async deleteFiles(): Promise<void> {
+        throw new Error('perm denied');
+      },
+      // 故意不实现 deleteFilesPermanent
+    };
+    const r = await deleteOrphans(deleter, items, {
+      confirmedByUser: true,
+      useRecycleBin: false,
+      retries: 0,
+      delayMs: 0,
+    });
+    expect(r.failed.length).toBe(1);
+    // 删除失败时：error 自动包含「永久删除 ... 已自动降级为送回收站」说明，
+    // 提示用户实际行为与语义不一致（避免静默跳过回收站）
+    expect(r.failed[0].error).toMatch(/perm denied/);
+    expect(r.failed[0].error).toMatch(/自动降级/);
+  });
 });
 
 /**

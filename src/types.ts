@@ -119,6 +119,92 @@ export interface OrphanReportEntry {
   ok: string[]; // 成功删除路径
   failed: { path: string; error: string; errno?: number }[]; // 失败路径（含 errno 用于审计追溯）
   mode: 'manual' | 'auto'; // 手动命令 / 同步后自动巡检
+  /** v2 字段：本次扫描的详情摘要（用于审计追溯），可选以便向后兼容旧索引 */
+  summary?: {
+    scanMode: 'parent-only' | 'scoped' | 'full-vault';
+    nodesScanned: number;
+    bytesScanned: number;
+    backupDirCount: number;
+    orphanFileCount: number;
+    orphanDirCount: number;
+    truncated: boolean; // 是否触达 budget 上限被截断
+    useRecycleBin: boolean;
+  };
+}
+
+/**
+ * 孤儿发现项（v2 三类合并表示）。注意与历史 OrphanEntry（仅一类「backup-dir」）
+ * 并存：本类型用于深度扫描统一表达，新管线（orphan-scan.ts）统一返回。
+ *
+ * 分类语义：
+ *   - 'backup-dir'  : 名称匹配「${vaultName}_YYYYMMDD_HHMMSS[...]」模式的目录（任意深度）
+ *   - 'orphan-file' : 不在 sync index 中的文件，且不被任何忽略规则排除（任意深度）
+ *   - 'orphan-dir'   : 不在 sync index 中的「空目录」或「全部子项也是孤儿的目录」，
+ *                     仅在 scoped/full-vault 模式下识别（parent-only 不深入递归）
+ */
+export type OrphanFindingKind = 'backup-dir' | 'orphan-file' | 'orphan-dir';
+
+export interface OrphanFinding {
+  kind: OrphanFindingKind;
+  /** 远端绝对路径（如 /apps/bdnsync/Obsidian Vault/未命名.canvas） */
+  fullPath: string;
+  /** 仅 basename */
+  name: string;
+  /** 父目录绝对路径（用于展示） */
+  parentPath: string;
+  /** 相对 remoteRoot 的路径（仅当路径在 remoteRoot 内时非空；用于过滤/分组） */
+  relPath: string;
+  /** 相对 remoteRoot 的深度（root 直接子项 = 1，root 的子项的子项 = 2，……） */
+  depth: number;
+  /** 字节数（orphan-file / orphan-dir 时 = 直接子文件字节和；backup-dir 时 = 单层测量值） */
+  bytes: number;
+  /** 最后修改时间 ms（若平台无则 0） */
+  mtime: number;
+  /** 风险等级 0=低 / 1=中 / 2=高 */
+  risk: 0 | 1 | 2;
+  /** 一句话原因（人类可读，UI 上 hover 显示） */
+  reason: string;
+  /**
+   * 仅当 kind === 'backup-dir'：命中规则匹配的「时间戳段」数（1 = 中风险；≥2 = 高风险）。
+   * 仅当 kind === 'orphan-file' 或 'orphan-dir'：未使用（置 0）。
+   */
+  segments: number;
+  /** 单层测量失败标记（仅 backup-dir / orphan-dir 模式单层列子项时使用） */
+  measureError?: boolean;
+}
+
+/** 深度扫描选项（orphan-scan.ts 主入口） */
+export interface DeepScanOptions {
+  /** 扫描根（默认 = settings.remoteRoot 父目录 + settings.remoteRoot 整棵树） */
+  parentDir: string;
+  /** 同步根（vault 在网盘上的真实目录），用于 cross-check sync index */
+  remoteRoot: string;
+  /** 当前 vault 名（用于 backup-dir 命名匹配） */
+  vaultName: string;
+  /** 'parent-only' | 'scoped' | 'full-vault' —— 已通过 settings 传入 */
+  mode: 'parent-only' | 'scoped' | 'full-vault';
+  /** 最大递归深度（0 = 不限；parent-only 时忽略） */
+  maxDepth: number;
+  /** 最大节点预算 */
+  maxNodes: number;
+  /** 最大字节预算 */
+  maxBytes: number;
+  /** 并发 listDir 数 */
+  concurrency: number;
+  /** 进度回调（每访问一个节点调一次） */
+  onProgress?: (info: { scannedNodes: number; scannedBytes: number; truncated: boolean }) => void;
+  /** 忽略规则（glob 数组）—— 相对路径匹配；返回 true 时整棵子树跳过 */
+  ignoreGlobs?: string[];
+}
+
+/** 深度扫描结果 */
+export interface DeepScanResult {
+  findings: OrphanFinding[];
+  scannedNodes: number;
+  scannedBytes: number;
+  truncated: boolean;
+  durationMs: number;
+  errors: { path: string; message: string }[];
 }
 
 export interface CumulativeStats {
@@ -349,6 +435,32 @@ export interface BDNSyncSettings {
   orphanRetentionDays: number;
   /** 上一次 orphan 扫描时间戳（毫秒），用于 24h 限频 */
   lastOrphanScanAt: number;
+
+  // —— 网盘孤儿深度扫描（v2 增强）——
+  /**
+   * 扫描模式：
+   *   - 'parent-only' ：仅扫描同步根的「父目录」直接子项（旧行为，最保守）
+   *   - 'scoped'      ：扫描「父目录 + 同步根顶层 + 顶层已知子目录」但不深入递归
+   *   - 'full-vault'  ：深度遍历「父目录 + 同步根」整棵子树（推荐；能识别 vault 根下的
+   *                     残留孤儿文件如「未命名.canvas」、以及嵌套在 .obsidian 等目录里的
+   *                     时间戳孤儿子目录如 .obsidian_20260825_011814）
+   * 注意：full-vault 受 orphanScanMaxNodes / orphanScanMaxBytes 节流保护；
+   *       命中预算上限会终止扫描并把已发现项返回，不会因为大库而无限占用资源。
+   */
+  orphanScanMode: 'parent-only' | 'scoped' | 'full-vault';
+  /** 最大递归深度（仅 full-vault 生效）。0 = 不限，但 orphanScanMaxNodes 仍是硬上限 */
+  orphanScanMaxDepth: number;
+  /** 单次扫描最多处理的远端条目数（节点预算）。默认 20000 — 万级库安全余量 */
+  orphanScanMaxNodes: number;
+  /** 单次扫描累计访问文件字节数上限（字节预算）。默认 2 GB */
+  orphanScanMaxBytes: number;
+  /** 扫描期 listDir 并发数（限速保护，避免触百度 QPS 限频） */
+  orphanScanConcurrency: number;
+  /** 删除时是否先送回收站（推荐开启，删除可逆）；关闭 = 永久删除（不可逆） */
+  orphanUseRecycleBin: boolean;
+  /** 额外的「孤儿识别忽略 glob」列表（相对路径，支持 *、**、?），叠加在已有 excludePatterns 之上
+   *  —— 用于声明「即使模型判断为孤儿，也请跳过」的安全白名单（例：attachments/**、*.important） */
+  orphanExtraIgnoreGlobs: string[];
 }
 
 export const DEFAULT_SETTINGS: BDNSyncSettings = {
@@ -426,6 +538,17 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   autoPruneOrphanBackupDirs: false,
   orphanRetentionDays: 90,
   lastOrphanScanAt: 0,
+
+  // 深度扫描 v2：默认走「full-vault」—— 完整遍历 vault 整棵树，识别 vault 根下的
+  // 孤儿文件（"未命名.canvas" 这类无主残留）与嵌套在子目录里的时间戳孤儿子目录。
+  // 预算足够大（2w 节点 / 2GB），不会因为单次大库扫满；用户可在设置里调小或切回 parent-only。
+  orphanScanMode: 'full-vault',
+  orphanScanMaxDepth: 0, // 0 = 不限
+  orphanScanMaxNodes: 20000,
+  orphanScanMaxBytes: 2 * 1024 * 1024 * 1024, // 2 GB
+  orphanScanConcurrency: 3,
+  orphanUseRecycleBin: true, // 默认回收站模式（可逆）；切 false 才走永久删除
+  orphanExtraIgnoreGlobs: [],
 };
 
 /** 远程目录条目 */

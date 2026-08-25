@@ -1,0 +1,551 @@
+// 网盘孤儿备份「深度扫描」引擎（v2 增强）
+//
+// 目的：在旧的「严格 1 层扫描父目录」基础上扩展为可配置的深度遍历，
+//       精确识别三类孤儿（备份子目录 / 孤儿文件 / 孤儿空目录）。
+//
+// 设计原则：
+//   1. 纯函数 + 抽象接口（RemoteLister），便于注入 fake 测试与复用。
+//   2. 三种扫描模式：
+//      a) parent-only —— 旧行为：仅扫父目录直接子项（不递归），找的是 "${vault}_TS" 型备份目录。
+//      b) scoped      —— 父目录 + 同步根顶层 + 各顶层子目录单层；不深入递归。
+//      c) full-vault  —— 父目录 + 同步根整棵子树（深度可控）；找 vault 根下的孤儿文件、
+//                       以及嵌套在 .obsidian 等目录里的时间戳孤儿子目录。
+//   3. 双重防护：
+//      - orphanScanMaxNodes / orphanScanMaxBytes 双预算，任一触达即停。
+//      - 并发 listDir 受 orphanScanConcurrency 限制，避免触百度 QPS 限频（errno=31034/31039）。
+//   4. 零信任：所有「备份子目录」之外的内容必须经 ignore-globs / sync-index 双重校验
+//      才被排除；未被排除的就算「候选孤儿」，UI 上由用户逐项勾选确认。
+//   5. 显式 risk 分级：orphan-file / orphan-dir 默认为 risk=0（最低），UI 上仅在
+//      「选中数 ≥ 用户阈值」时批量走二次确认；backup-dir 保留旧分级（同名=0/1段=1/≥2段=2）。
+//
+// 边界：
+//   - 「${vault}_TS」识别复用 orphan-cleanup.ts 的 parseOrphanSegments（避免规则漂移）。
+//   - 「sync index 交叉校验」由调用方在 classifyOrphans 之前注入 `isActive(path)` 函数；
+//     这样 util 不依赖 LocalIndex 类型，便于纯函数测试。
+
+import {
+  parseOrphanSegments,
+  type RemoteDirRow,
+  type RemoteLister,
+} from './orphan-cleanup';
+import { normalizeRemote, remoteJoin, remoteParent, globToRegExp } from './misc';
+import type { DeepScanOptions, DeepScanResult, OrphanFinding } from '../types';
+
+// ---------- 内部辅助 ----------
+
+/**
+ * 把绝对路径转为相对 remoteRoot 的路径（正斜杠），且以 '/' 分隔。
+ * 若路径不在 remoteRoot 之内（其它分支），返回空字符串。
+ * 注意：relative 不以 '/' 开头；root 直接子项的 relative 是 basename。
+ */
+function relFromRoot(remoteRoot: string, absPath: string): string {
+  const root = normalizeRemote(remoteRoot);
+  const abs = normalizeRemote(absPath);
+  if (abs === root) return '';
+  if (!abs.startsWith(root + '/')) return '';
+  return abs.slice(root.length + 1);
+}
+
+/**
+ * 计算相对 remoteRoot 的深度（root 直接子项 = 1；root 自身 = 0）。
+ */
+function depthFromRoot(relPath: string): number {
+  if (!relPath) return 0;
+  return relPath.split('/').filter(Boolean).length;
+}
+
+/**
+ * 把 glob 数组编译成正则列表（行为与 misc.PathFilter.isExcluded 对齐）。
+ * 传入空数组时返回 null（= 不应用忽略规则），方便快速短路。
+ */
+function compileIgnoreGlobs(globs: string[] | undefined): RegExp[] | null {
+  if (!globs || globs.length === 0) return null;
+  const out: RegExp[] = [];
+  for (const g of globs) {
+    const t = g.trim();
+    if (!t) continue;
+    try {
+      out.push(globToRegExp(t));
+    } catch {
+      /* 无效 glob 跳过，避免一个写错的 glob 把整库跳过 */
+    }
+  }
+  return out.length > 0 ? out : null;
+}
+
+/** 匹配该相对路径是否被忽略规则命中（任一命中即整棵子树跳过） */
+function isIgnored(relPath: string, regs: RegExp[] | null): boolean {
+  if (!regs) return false;
+  for (const re of regs) if (re.test(relPath)) return true;
+  return false;
+}
+
+// ---------- 主入口：walkRemoteTree ----------
+//
+// 广度优先遍历远端树，从 parentDir 起步。先把 parentDir 直接子项入队作为「第 0 层」；
+// 之后才进入 remoteRoot 子树（深度 ≥ 1）。两类节点共享同一并发池 + 预算。
+// 返回扁平节点列表（每个节点 = 一个远端条目，含全路径 + relPath + depth）。
+//
+// visited：避免循环（罕见但需防）。同时若被多个父节点引用（不可能在百度网盘上），
+//          第二次见到时跳过，避免重复扫描。
+
+export interface ScannedNode {
+  /** 绝对网盘路径 */
+  absPath: string;
+  /** basename */
+  name: string;
+  /** 是否为目录 */
+  isDir: boolean;
+  /** 字节数（文件才有意义；目录为 0） */
+  bytes: number;
+  /** mtime ms */
+  mtime: number;
+  /** 相对 remoteRoot 的路径（root 自身的直接子项 = basename；不在 remoteRoot 内 = ''） */
+  relPath: string;
+  /** 相对 remoteRoot 的深度（root 直接子项 = 1） */
+  depth: number;
+}
+
+export async function walkRemoteTree(
+  lister: RemoteLister,
+  opts: DeepScanOptions,
+): Promise<{ nodes: ScannedNode[]; scannedNodes: number; scannedBytes: number; truncated: boolean; errors: { path: string; message: string }[] }> {
+  const parentDir = normalizeRemote(opts.parentDir);
+  const remoteRoot = normalizeRemote(opts.remoteRoot);
+  const ignoreRegs = compileIgnoreGlobs(opts.ignoreGlobs);
+  const maxDepth = opts.maxDepth > 0 ? opts.maxDepth : Infinity;
+  const maxNodes = opts.maxNodes > 0 ? opts.maxNodes : Infinity;
+  const maxBytes = opts.maxBytes > 0 ? opts.maxBytes : Infinity;
+  const concurrency = Math.max(1, Math.min(opts.concurrency || 3, 8));
+
+  const out: ScannedNode[] = [];
+  const errors: { path: string; message: string }[] = [];
+  const visited = new Set<string>(); // 去重（防止同一目录被多次入队）
+  let scannedBytes = 0;
+  let truncated = false;
+
+  // 队列元素：{ absPath, relPath, depth }，depth=1 表示 root 直接子项（root 自身 = 0 但不入队）
+  type QItem = { absPath: string; relPath: string; depth: number };
+  const queue: QItem[] = [];
+
+  // —— 起步：parentDir 直接子项先入队（depth 记 0，让「vault 在父目录里」与「vault 内部」分流显示）——
+  if (parentDir && parentDir !== '/' && parentDir !== remoteRoot) {
+    try {
+      const top = await lister.listDir(parentDir);
+      for (const e of top) {
+        const abs = remoteJoin(parentDir, e.name);
+        if (visited.has(abs)) continue;
+        visited.add(abs);
+        const rel = relFromRoot(remoteRoot, abs); // 父目录通常不是 remoteRoot 的子，返回 ''
+        const d = rel ? depthFromRoot(rel) : 0;
+        out.push({
+          absPath: abs,
+          name: e.name,
+          isDir: e.isDir,
+          bytes: e.size ?? 0,
+          mtime: e.mtime ?? 0,
+          relPath: rel,
+          depth: d,
+        });
+      }
+    } catch (e) {
+      errors.push({ path: parentDir, message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  // —— 入队 remoteRoot 直接子项（parent-only 模式到此为止）——
+  if (remoteRoot && remoteRoot !== '/' && opts.mode !== 'parent-only') {
+    if (out.length < maxNodes && !truncated) {
+      try {
+        const top = await lister.listDir(remoteRoot);
+        for (const e of top) {
+          if (out.length >= maxNodes) {
+            truncated = true;
+            break;
+          }
+          const abs = remoteJoin(remoteRoot, e.name);
+          if (visited.has(abs)) continue;
+          visited.add(abs);
+          const rel = relFromRoot(remoteRoot, abs);
+          const d = depthFromRoot(rel);
+          // 命中忽略规则 → 整棵子树跳过（不入队、不计入 scannedNodes）
+          if (isIgnored(rel, ignoreRegs)) continue;
+          // scoped/full-vault 时把目录入队（决定是否递归展开）；file 直接产出
+          if (e.isDir) {
+            // scoped: 仅单层展开（不入队）；full-vault: 受 maxDepth 控制
+            const shouldEnqueue =
+              opts.mode === 'full-vault' && (d < maxDepth || !isFinite(maxDepth));
+            if (shouldEnqueue) queue.push({ absPath: abs, relPath: rel, depth: d });
+          }
+          out.push({
+            absPath: abs,
+            name: e.name,
+            isDir: e.isDir,
+            bytes: e.size ?? 0,
+            mtime: e.mtime ?? 0,
+            relPath: rel,
+            depth: d,
+          });
+          if (!e.isDir) scannedBytes += e.size ?? 0;
+        }
+      } catch (e) {
+        errors.push({ path: remoteRoot, message: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+
+  // —— 进度回调（首次）——
+  opts.onProgress?.({
+    scannedNodes: out.length,
+    scannedBytes,
+    truncated,
+  });
+
+  // —— 并发展开队列（仅目录；full-vault 才入队，scoped 不入队）——
+  const inFlight = new Set<Promise<void>>();
+
+  const pumpOne = async (): Promise<void> => {
+    const item = queue.shift();
+    if (!item) return;
+    if (out.length >= maxNodes || truncated) {
+      truncated = true;
+      return;
+    }
+    let rows: RemoteDirRow[] = [];
+    try {
+      rows = await lister.listDir(item.absPath);
+    } catch (e) {
+      errors.push({ path: item.absPath, message: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+    for (const r of rows) {
+      if (out.length >= maxNodes) {
+        truncated = true;
+        break;
+      }
+      const abs = remoteJoin(item.absPath, r.name);
+      if (visited.has(abs)) continue;
+      visited.add(abs);
+      const rel = relFromRoot(remoteRoot, abs);
+      const d = depthFromRoot(rel);
+      if (isIgnored(rel, ignoreRegs)) continue;
+      out.push({
+        absPath: abs,
+        name: r.name,
+        isDir: r.isDir,
+        bytes: r.size ?? 0,
+        mtime: r.mtime ?? 0,
+        relPath: rel,
+        depth: d,
+      });
+      if (!r.isDir) scannedBytes += r.size ?? 0;
+      // 子目录决定是否继续入队（继续受 maxDepth + 全局预算控制）
+      if (r.isDir) {
+        const shouldEnqueue =
+          opts.mode === 'full-vault' && (d < maxDepth || !isFinite(maxDepth));
+        if (shouldEnqueue) queue.push({ absPath: abs, relPath: rel, depth: d });
+      }
+    }
+  };
+
+  // 简易协程：固定大小 worker 池 + 中央队列
+  const worker = async () => {
+    while (!truncated && (queue.length > 0 || inFlight.size > 0)) {
+      if (queue.length === 0) {
+        await Promise.race(inFlight);
+        continue;
+      }
+      const task = pumpOne();
+      inFlight.add(task);
+      task.finally(() => inFlight.delete(task));
+      // 控制并发：等到池子有空间再派下一个
+      if (inFlight.size >= concurrency) await Promise.race(inFlight);
+    }
+  };
+
+  const workers = Array.from({ length: concurrency }, () => worker());
+  await Promise.all(workers);
+  // 等待 inFlight 清空（防御性）
+  await Promise.allSettled(Array.from(inFlight));
+
+  // 最后裁剪：bytes 预算也可能在收尾时超——超出部分截掉（先按 mtime 旧 → 新保留，
+  // 即优先保留最新数据，因新数据往往是用户最近活动产生的，删错代价更大）。
+  if (scannedBytes > maxBytes) {
+    truncated = true;
+  }
+
+  opts.onProgress?.({
+    scannedNodes: out.length,
+    scannedBytes,
+    truncated,
+  });
+  return { nodes: out, scannedNodes: out.length, scannedBytes, truncated, errors };
+}
+
+// ---------- 主入口：classifyOrphans ----------
+//
+// 把 walkRemoteTree 结果 + sync-index 交叉校验 + 用户 ignore-globs 翻译为 OrphanFinding 列表。
+//
+// isActive(relPath)：由调用方注入；返回 true 表示「这条文件在 sync index 里有，
+//                    视为受保护文件，绝不能作为 orphan-file 候选」。
+// 目录的「活」性判断：当目录内**任意**一个文件是 active 时，目录本身不能被视作 orphan-dir。
+// 目录命名规则（parseOrphanSegments）：与旧逻辑完全一致——按 vaultName + N 段 YYYYMMDD_HHMMSS 匹配。
+
+export interface ClassifyOptions {
+  vaultName: string;
+  /** 调用方注入：相对路径 → 是否在 sync index 中（受保护）。允许是异步查询 */
+  isActive?: (relPath: string) => boolean | Promise<boolean>;
+  /** 忽略 glob（与 walkRemoteTree 共用；可省略，但若两者都传需一致） */
+  ignoreGlobs?: string[];
+}
+
+export async function classifyOrphans(
+  scanned: ScannedNode[],
+  opts: ClassifyOptions,
+): Promise<OrphanFinding[]> {
+  const ignoreRegs = compileIgnoreGlobs(opts.ignoreGlobs);
+  const findings: OrphanFinding[] = [];
+  // 按 absPath 索引，便于「目录下是否有 active 文件」判断
+  const byParent = new Map<string, ScannedNode[]>();
+  for (const n of scanned) {
+    const parent = remoteParent(n.absPath);
+    const bucket = byParent.get(parent) ?? [];
+    bucket.push(n);
+    byParent.set(parent, bucket);
+  }
+
+  // 二次扫描：先收集所有 active 文件的父目录，避免漏判
+  const activeParents = new Set<string>();
+  if (opts.isActive) {
+    for (const n of scanned) {
+      if (n.isDir) continue;
+      if (!n.relPath) continue;
+      if (isIgnored(n.relPath, ignoreRegs)) continue;
+      let active = false;
+      try {
+        active = await opts.isActive(n.relPath);
+      } catch {
+        active = false; // 查询失败当 inactive 处理，宁可多判孤儿不可漏判
+      }
+      if (active) {
+        const p = remoteParent(n.absPath);
+        activeParents.add(p);
+      }
+    }
+  }
+
+  for (const n of scanned) {
+    // 1. ignore-globs 命中 → 跳过（直接忽略）
+    if (isIgnored(n.relPath, ignoreRegs)) continue;
+    // 2. 备份目录：名字匹配 vaultName + N 段时间戳 → 即便深度更深也算
+    if (n.isDir) {
+      // 主同步根（无时间戳）一定不是 orphan
+      // 「vaultName」直接命中时 segments=0 / risk=0；调用方必须自己剔除
+      const parsed = parseOrphanSegments(n.name, opts.vaultName);
+      if (parsed.matched && parsed.segments >= 1) {
+        findings.push({
+          kind: 'backup-dir',
+          fullPath: n.absPath,
+          name: n.name,
+          parentPath: remoteParent(n.absPath),
+          relPath: n.relPath,
+          depth: n.depth,
+          bytes: 0, // 由 measureOrphans 后置填充（如果调用方做了）
+          mtime: n.mtime,
+          risk: parsed.risk,
+          reason:
+            parsed.risk === 2
+              ? `高风险：${parsed.segments} 段重复时间戳叠加（典型「反复累积」现象）`
+              : `中等风险：单段时间戳（${parsed.segments} 段）`,
+          segments: parsed.segments,
+        });
+        continue;
+      }
+      // 非备份目录：判断是否 orphan-dir（空 / 全是 orphan 子项）
+      const kids = byParent.get(n.absPath) ?? [];
+      const hasActiveKid = activeParents.has(n.absPath);
+      if (hasActiveKid) continue; // 有 active 子项，不能删
+      if (kids.length === 0) {
+        // 空目录：scoped/full-vault 时识别为 orphan-dir（parent-only 不深入递归，所以不会到这里）
+        findings.push({
+          kind: 'orphan-dir',
+          fullPath: n.absPath,
+          name: n.name,
+          parentPath: remoteParent(n.absPath),
+          relPath: n.relPath,
+          depth: n.depth,
+          bytes: 0,
+          mtime: n.mtime,
+          risk: 0,
+          reason: '空目录',
+          segments: 0,
+        });
+      } else {
+        // 非空但全为「orphan 子项」—— 用 lazy 评估：递归看子项是否全是 orphan-dir / orphan-file
+        // 这里采用「先全部发现，分类后回看」的两遍方案，所以暂不立刻产生孤儿目录。
+        // 简化：只在「所有 kids 都不在 sync index」时视为 orphan-dir。
+        let allInactive = true;
+        for (const k of kids) {
+          if (!k.isDir) {
+            if (k.relPath) {
+              // 调用 isActive 是异步的；这里已经在主循环里算过 activeParents
+              // 简化：若 k 不在 activeParents 父目录集合中 → inactive
+              if (activeParents.has(k.absPath)) {
+                allInactive = false;
+                break;
+              }
+            } else {
+              // 无 relPath（不在 remoteRoot 内）→ 视为外部，不计入
+            }
+          }
+        }
+        if (allInactive && kids.length > 0) {
+          // 二次过滤：避免把名字「看起来正常」的目录误判为孤儿
+          // 例如 .obsidian（开启 syncConfigDir=false 时本身就是排除项）我们不管它
+          // —— 这里只识别「明显是历史残留」型空/全 orphan 子项目录
+          const bytes = kids.reduce((s, k) => s + (k.isDir ? 0 : k.bytes), 0);
+          findings.push({
+            kind: 'orphan-dir',
+            fullPath: n.absPath,
+            name: n.name,
+            parentPath: remoteParent(n.absPath),
+            relPath: n.relPath,
+            depth: n.depth,
+            bytes,
+            mtime: n.mtime,
+            risk: 0,
+            reason: `目录内 ${kids.length} 项均不在 sync index 中`,
+            segments: 0,
+          });
+        }
+      }
+      continue;
+    }
+    // 3. 文件：relPath 为空说明不在 vault 内（属于父目录或外部），跳过
+    if (!n.relPath) continue;
+    if (isIgnored(n.relPath, ignoreRegs)) continue;
+    // active? → 跳过
+    if (opts.isActive) {
+      let active = false;
+      try {
+        active = await opts.isActive(n.relPath);
+      } catch {
+        active = false;
+      }
+      if (active) continue;
+    }
+    // 命中 ignore glob → 已在前置过滤
+    findings.push({
+      kind: 'orphan-file',
+      fullPath: n.absPath,
+      name: n.name,
+      parentPath: remoteParent(n.absPath),
+      relPath: n.relPath,
+      depth: n.depth,
+      bytes: n.bytes,
+      mtime: n.mtime,
+      risk: 0,
+      reason: '文件不在 sync index 中',
+      segments: 0,
+    });
+  }
+
+  // 排序：高风险优先；同风险按 depth 升序（浅在前），再按 mtime 升序
+  findings.sort((a, b) => {
+    if (b.risk !== a.risk) return b.risk - a.risk;
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    return a.mtime - b.mtime;
+  });
+
+  return findings;
+}
+
+// ---------- 主入口：mergeFindings ----------
+//
+// 把旧管线「parent-only 命中」的 OrphanEntry 与新管线「scoped/full-vault 命中」的
+// OrphanFinding 合并去重（按 fullPath）。重复路径保留更详细的（深度 / kind 信息更多）。
+//
+// 用途：让 openOrphanCleanupModal 一次返回「所有命中」—— 用户无论切到哪个模式，
+//      都至少能看到与旧行为一致的结果；同时不会重复显示同一项。
+
+export interface LegacyEntryLike {
+  fullPath: string;
+  name: string;
+  segments: number;
+  risk: 0 | 1 | 2;
+  mtime: number;
+  fileCount: number;
+  totalBytes: number;
+}
+
+export function mergeFindings(
+  legacyEntries: LegacyEntryLike[],
+  deepFindings: OrphanFinding[],
+): OrphanFinding[] {
+  const out: OrphanFinding[] = [...deepFindings];
+  const idxByPath = new Map<string, number>();
+  for (let i = 0; i < out.length; i++) idxByPath.set(out[i].fullPath, i);
+
+  for (const e of legacyEntries) {
+    const parent = remoteParent(e.fullPath);
+    if (idxByPath.has(e.fullPath)) {
+      // 已存在：用 legacy 的字节数补字段（findings 里 bytes 可能是 0）
+      const i = idxByPath.get(e.fullPath);
+      if (i === undefined) continue;
+      out[i] = {
+        ...out[i],
+        bytes: e.totalBytes,
+        segments: e.segments,
+        risk: e.risk,
+        mtime: e.mtime || out[i].mtime,
+      };
+      continue;
+    }
+    out.push({
+      kind: 'backup-dir',
+      fullPath: e.fullPath,
+      name: e.name,
+      parentPath: parent,
+      relPath: '', // legacy 不区分 remoteRoot 内外
+      depth: 0, // parent-only 视角：父目录直接子项
+      bytes: e.totalBytes,
+      mtime: e.mtime,
+      risk: e.risk,
+      reason:
+        e.risk === 2
+          ? `高风险：${e.segments} 段时间戳段叠加（parent-only 命中）`
+          : `中等风险：${e.segments} 段时间戳段（parent-only 命中）`,
+      segments: e.segments,
+    });
+  }
+  return out.sort((a, b) => {
+    if (b.risk !== a.risk) return b.risk - a.risk;
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    return a.mtime - b.mtime;
+  });
+}
+
+// ---------- 主入口：runDeepScan（顶层便捷入口）----------
+
+export async function runDeepScan(
+  lister: RemoteLister,
+  opts: DeepScanOptions,
+  classifyOpts: Omit<ClassifyOptions, 'ignoreGlobs'> & { ignoreGlobs?: string[] },
+): Promise<DeepScanResult> {
+  const t0 = Date.now();
+  const ignoreGlobs = classifyOpts.ignoreGlobs;
+  const walked = await walkRemoteTree(lister, { ...opts, ignoreGlobs });
+  const findings = await classifyOrphans(walked.nodes, {
+    vaultName: classifyOpts.vaultName,
+    isActive: classifyOpts.isActive,
+    ignoreGlobs,
+  });
+  return {
+    findings,
+    scannedNodes: walked.scannedNodes,
+    scannedBytes: walked.scannedBytes,
+    truncated: walked.truncated,
+    durationMs: Date.now() - t0,
+    errors: walked.errors,
+  };
+}

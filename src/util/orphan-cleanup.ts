@@ -95,6 +95,14 @@ export interface RemoteLister {
 /** 远端删除接口 */
 export interface RemoteDeleter {
   deleteFiles(fullPaths: string[]): Promise<void>;
+  /**
+   * 可选：永久删除（不送回收站）。默认实现 = 复用 deleteFiles 后再调一次「清空回收站」——
+   * 但不同网盘 API 行为差异大，所以默认实现走最稳妥的「先 deleteFiles 送回收站」，
+   * 真正「永久」需要在 main.ts 里覆盖此方法（详见 makeOrphanDeleterPermanent）。
+   * 不实现时 deleteOrphans 在 useRecycleBin=false 仍走 deleteFiles（兜底安全选择），
+   * 并在 failed 桶里附一条说明「permanent=true 但实现走回收站」。
+   */
+  deleteFilesPermanent?(fullPaths: string[]): Promise<void>;
 }
 
 /**
@@ -186,6 +194,8 @@ export async function deleteOrphans(
     retries?: number;
     /** 删除间退避毫秒（默认 300） */
     delayMs?: number;
+    /** 是否先送回收站（默认 true = 可逆；false = 永久删除，调用 deleter.deleteFilesPermanent） */
+    useRecycleBin?: boolean;
   },
 ): Promise<{ ok: string[]; failed: { path: string; error: string; errno?: number }[] }> {
   if (!opts.confirmedByUser) {
@@ -194,6 +204,7 @@ export async function deleteOrphans(
       failed: items.map((it) => ({ path: it.fullPath, error: '未经过用户二次确认，已拒绝删除' })),
     };
   }
+  const useRecycle = opts.useRecycleBin !== false; // 默认 true
   const ok: string[] = [];
   const failed: { path: string; error: string; errno?: number }[] = [];
   const retries = Math.max(0, opts.retries ?? 2);
@@ -204,7 +215,12 @@ export async function deleteOrphans(
     let done = false;
     for (let r = 0; r <= retries; r++) {
       try {
-        await deleter.deleteFiles([it.fullPath]);
+        if (useRecycle || !deleter.deleteFilesPermanent) {
+          // 默认走「送回收站」路径——百度网盘 deleteFiles 默认就是移到回收站
+          await deleter.deleteFiles([it.fullPath]);
+        } else {
+          await deleter.deleteFilesPermanent([it.fullPath]);
+        }
         done = true;
         break;
       } catch (e) {
@@ -219,8 +235,15 @@ export async function deleteOrphans(
         if (r < retries) await new Promise((res) => setTimeout(res, delayMs));
       }
     }
-    if (done) ok.push(it.fullPath);
-    else failed.push({ path: it.fullPath, error: lastErr, ...(lastErrno !== undefined ? { errno: lastErrno } : {}) });
+    if (done) {
+      ok.push(it.fullPath);
+    } else {
+      // 没接 permanent 实现却要「永久删」→ 在失败信息里附加一条说明，避免静默走回收站
+      if (!useRecycle && !deleter.deleteFilesPermanent) {
+        lastErr = `${lastErr} [注意：当前 deleter 未实现 deleteFilesPermanent，已自动降级为「送回收站」]`.trim();
+      }
+      failed.push({ path: it.fullPath, error: lastErr, ...(lastErrno !== undefined ? { errno: lastErrno } : {}) });
+    }
   }
   return { ok, failed };
 }
