@@ -1,0 +1,127 @@
+# BDNSync 代码审查报告（v1.0.2）
+
+- **审查日期**：2026-08-25
+- **代码版本**：v1.0.2
+- **审查范围**：凭据安全、XSS/注入、错误处理与健壮性、代码规范一致性、文档与代码一致性
+- **方法**：静态扫描（`innerHTML` / `eval` / `console.*` / `JSON.parse` / `any`）+ 关键文件精读（`secrets.ts`、`sync-log-view.ts`、`adapter.ts`、`api.ts`、`local-store.ts`）+ 与既有审计/规范文档交叉比对
+
+---
+
+## 一、概览
+
+| 等级 | 含义 | 数量 | 处置 |
+| ---- | ---- | ---- | ---- |
+| 🔴 P0 | 确定性的安全/数据缺陷，须立即修 | 0 | — |
+| 🟠 P1 | 安全加固缺口 / 规范违反，建议本版修 | 1 | 见 §2.1 |
+| 🟡 P2 | 文档不准确，已就地修正 | 1 | 见 §2.2 |
+| 🟡 P3 | 编码规范违反（可观测性） | 1 | 见 §2.3 |
+| ⚪ P4 | 健壮性核查项（低） | 1 | 见 §2.4 |
+| ⚪ P5 | 类型收敛（低） | 1 | 见 §2.5 |
+
+> 正面确认：信封加密实现正确、4 处 `innerHTML` 均安全、无 `eval`/`new Function`、设备 ID 已用密码学随机。详见 §3。
+
+---
+
+## 二、发现明细与修改建议
+
+### §2.1 〔P1〕业务层 `console.warn` 绕过 `redactSecrets`（安全加固 + 规范）
+
+**位置**
+- `src/baidu/adapter.ts:485`（`uploadFailDiagnostics` 中 `console.warn(msg)`）
+- `src/baidu/api.ts:308`（`transientRetry` 重试提示 `console.warn(... errMsgShort(e))`）
+- `src/storage/local-store.ts:179 / 436 / 479 / 504`
+- `src/baidu/adapter.ts:535 / 543`
+
+**问题**
+1. 违反 `coding-standards.md` §4.1「禁止在业务层（`baidu/*`、`storage/*`）直接 `console.warn/error` 泄露内部状态」，也违反 §4.2「凭证相关输出必须过 `redactSecrets()`」。
+2. 现状诊断内容：`reqSummary`（step/relPath/remotePath/size/md5/ uploadid）与 `rawFields`（白名单 `errno/error_code/error_msg/request_id/path/uploadid`）均**不含**令牌，故当前未实际泄露；但 `adapter.ts:485` 的 `err=${e.message}` 与 `api.ts:308` 的 `errMsgShort(e)` 直接拼接**未经脱敏的错误串**。一旦某条 `BaiduApiError.message` 内嵌了带 `access_token=` 的请求 URL，令牌将落到控制台/持久化日志，突破「凭证脱敏」的安全承诺。属于**防御性缺口**。
+
+**明确修改建议**
+- 在 `src/util/` 或 `src/baidu/api.ts` 暴露的 `redactSecrets` 基础上，新增统一的诊断输出工具，确保**先脱敏再输出、且走 `Logger` 受日志策略管控**：
+
+  ```ts
+  // src/util/diag.ts（或并入 misc.ts）
+  import { redactSecrets } from '../baidu/api';
+
+  /** 业务层诊断输出：先脱敏，再经 Logger 落盘，杜绝凭证明文外泄 */
+  export function redactedWarn(label: string, detail?: unknown): void {
+    const tail = detail instanceof Error ? detail.message : detail == null ? '' : String(detail);
+    const safe = redactSecrets(`${label} ${tail}`);
+    // 同时保留控制台可见性（已脱敏），并写入结构化日志
+    console.warn('[BDNSync] ' + safe);
+    // 如已接入 Logger：Logger.warn({ module: 'baidu', message: safe });
+  }
+  ```
+
+- 将上述 8 处业务层 `console.warn` 逐一替换为 `redactedWarn(...)`（其中 `adapter.ts:485` 先 `redactedWarn('上传失败诊断', msg)`，`api.ts:308` 改为 `redactedWarn(\`${opts.label} 瞬时失败\`, e)`）。
+- 同时在 `eslint` 中强化 `no-console` 对 `baidu/*`、`storage/*` 的约束（或保留 `warn` 但要求经 `redactedWarn`），从工具层面防止回归。
+
+**验证**：补充一个单测，断言 `redactedWarn('x', 'access_token=SECRET')` 的输出不含 `SECRET` 且含 `<redacted>`。
+
+---
+
+### §2.2 〔P2〕安全报告 XSS 章节描述不准确（已修正）
+
+原 `security-audit-report.md` 称「唯一 `innerHTML` 使用仅渲染内置白名单图标，不拼接远程数据」，与代码不符：
+- `src/ui/views/sync-log-view.ts:364 / 367` 确用 `innerHTML` 渲染日志 `message` / `path`（可含远程文件名）。
+- 但该处经 `highlight()` **先做 HTML 转义**（`& < > "`），仅对转义文本包裹 `<mark>`，不存在注入点。
+
+已就地更新该章节，明确「4 处 `innerHTML`：3 处静态白名单 + 1 处转义后渲染」，状态仍为 ✅ 已确认安全。
+
+---
+
+### §2.3 〔P3〕业务层大量 `console.*` 违反编码规范 §4.1（可观测性）
+
+除 §2.1 列出的诊断外，`baidu/*` 与 `storage/*` 中另有若干 `console.warn` 直接输出内部状态（如 `local-store.ts` 缓存/备份失败、`adapter.ts` 分片读取失败）。建议：
+- 统一收口到 `Logger`（带 `type`/`level`/`module`），便于用户侧筛选与导出，也便于在「日志级别」设置下受控。
+- 非必要调试信息降级为 `Logger.debug`，避免常态噪音。
+
+---
+
+### §2.4 〔P4〕剩余 `JSON.parse` 健壮性核查（低）
+
+关键路径**已正确守护**，无需改动：
+- `local-store.ts:54` `readJson` → try/catch 返回 `null` ✅
+- `adapter.ts:517 / 530` `readRemoteIndex` → 外层 try + 分片内层 try，损坏即降级重建 ✅
+- `api.ts:464` `response.json()` → try/catch 抛 `BaiduApiError` ✅
+
+建议核查其余 6 处是否同样守护（多数在 try 内，复核即可）：
+`offline-pin.ts:49`、`config-merge.ts:44`、`settings.ts:1676`、`log-store.ts:93 / 165`、`components.ts:873`。若有未守护者，补 `try/catch` 并给出安全默认值（不要向上抛到同步主流程）。
+
+---
+
+### §2.5 〔P5〕`log-store.ts:67` 使用 `let listed: any`（类型收敛）
+
+```ts
+let listed: any = {};
+```
+建议收敛为 `let listed: Record<string, unknown> = {};`（或具体清单类型），避免 `any` 逃逸到后续逻辑，契合 `coding-standards.md` §2.1「禁止 `any`」。
+
+---
+
+## 三、正面确认（无需改动）
+
+- ✅ **凭据信封加密实现正确**（`src/security/secrets.ts`）：AES-256-GCM，随机 12B IV 前置、Web Crypto 自动校验 GCM Tag；主密钥存 `localStorage`（不随 vault 同步、不进 `data.json`）；解密失败安全回退为空串并交由连接校验提示重授权。
+- ✅ **XSS**：4 处 `innerHTML` 全部安全（3 处内置静态 SVG、1 处 `highlight()` 转义后渲染）。
+- ✅ **无 `eval` / `new Function` / 动态 `setTimeout(string)`**。
+- ✅ **设备 ID**：`genDeviceId()` 优先 `crypto.randomUUID()`（密码学随机），仅不可用时回退 `Math.random`。
+- ✅ **路径安全**：orphan 清理 lister 已用 `remoteJoin` 拼回绝对路径，`adapter.listRemoteDir` 的前缀剥离不影响删除路径语义。
+
+---
+
+## 四、质量门禁
+
+| 项目 | 结果 |
+| ---- | ---- |
+| `tsc --noEmit` | 0 错误 |
+| `npm run lint` | 0 错误（存量 warning 未增） |
+| `vitest` | 183 / 183 通过 |
+| `npm run build` | 成功 |
+
+---
+
+## 五、修订优先级建议
+
+`P1（脱敏+收口 Logger）` → `P3（业务层 console 收口）` → `P4（JSON.parse 复核）` → `P5（any 收敛）`
+
+> 文档类（P2 已修正）与正面确认项不计入修订。P1/P3 可借一次「诊断输出工具」重构一并完成，工作量小、收益明确，建议纳入下一提交。
