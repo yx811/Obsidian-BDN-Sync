@@ -4,7 +4,7 @@
 
 import { ItemView, WorkspaceLeaf, Notice } from 'obsidian';
 import type { LogLevel, LogFilter, LogModule, SyncLogEntry } from '../../types';
-import { LEVEL_LABEL, MODULE_LABEL, Logger } from '../../util/logger';
+import { LEVEL_LABEL, MODULE_LABEL, Logger, parseLogMessage } from '../../util/logger';
 import { createIconButton, createModalHeader, showConfirmModal, setIcon, type IconName } from '../components';
 
 export const VIEW_TYPE_BDNSYNC_LOG = 'bdnsync-log';
@@ -330,12 +330,20 @@ export class SyncLogView extends ItemView {
   private renderRow(log: SyncLogEntry): HTMLElement {
     const row = document.createElement('div');
     row.className = `bdnsync-log-row bdnsync-log-level-${log.level}${log.deleted ? ' bdnsync-log-row-tomb' : ''}`;
+    row.tabIndex = 0;
+    row.setAttribute('role', 'button');
+    row.setAttribute('aria-expanded', 'false');
+    row.setAttribute('aria-label', '展开日志详情');
+
     // 左侧级别色条
     row.createSpan({ cls: `bdnsync-log-levelbar bdnsync-log-levelbar-${log.level}` });
 
     const content = row.createDiv({ cls: 'bdnsync-log-row-content' });
 
     const head = content.createDiv({ cls: 'bdnsync-log-row-head' });
+    // 展开/折叠指示器（点击整行切换）
+    const caret = head.createSpan({ cls: 'bdnsync-log-row-caret' });
+    setIcon(caret, 'chevron-right', 13);
     head.createSpan({
       cls: `bdnsync-log-badge bdnsync-log-badge-${log.level}`,
       text: LEVEL_LABEL[log.level],
@@ -344,16 +352,21 @@ export class SyncLogView extends ItemView {
       cls: 'bdnsync-log-module',
       text: MODULE_LABEL[log.module],
     });
+    const typeIcon = head.createSpan({ cls: 'bdnsync-log-icon' });
+    // 类型图标
+    this.setRowIcon(typeIcon, log.type);
     head.createSpan({
       cls: 'bdnsync-log-time',
       text: new Date(log.time).toLocaleString(),
     });
-    const typeIcon = head.createSpan({ cls: 'bdnsync-log-icon' });
-    // 类型图标
-    this.setRowIcon(typeIcon, log.type);
 
-    const msg = content.createDiv({ cls:  'bdnsync-log-msg' });
-    msg.innerHTML = this.highlight(log.message);
+    // 折叠态：仅显示「一句话结论」（首行），避免整行堆砌冗长堆栈
+    const firstLine = log.message.split('\n')[0] ?? '';
+    const msg = content.createDiv({ cls: 'bdnsync-log-msg' });
+    msg.innerHTML = this.highlight(firstLine);
+    if (log.message.includes('\n')) {
+      msg.createSpan({ cls: 'bdnsync-log-msg-more', text: ' …' });
+    }
     if (log.path) {
       const pathEl = content.createDiv({ cls: 'bdnsync-log-path' });
       pathEl.innerHTML = this.highlight(log.path);
@@ -371,8 +384,127 @@ export class SyncLogView extends ItemView {
       this.downloadFile(`log-${log.id}.txt`, this.logger.exportTextOne(log), 'text/plain'),
     );
 
+    // 详情面板（默认折叠，点击整行展开）
+    const details = row.createDiv({ cls: 'bdnsync-log-details' });
+    details.style.display = 'none';
+    this.renderDetails(details, log);
+
+    const toggle = () => {
+      const expanded = row.classList.toggle('is-expanded');
+      row.setAttribute('aria-expanded', String(expanded));
+      details.style.display = expanded ? 'block' : 'none';
+    };
+    row.addEventListener('click', (e) => {
+      // 点击行内操作按钮时不触发折叠
+      if ((e.target as HTMLElement).closest('.bdnsync-log-row-action')) return;
+      toggle();
+    });
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        toggle();
+      }
+    });
+
     return row;
   }
+
+  /** 展开态详情：结构化字段 + 内容提炼（结论 / 上下文 / 折叠技术堆栈） */
+  private renderDetails(container: HTMLElement, log: SyncLogEntry): void {
+    const grid = container.createDiv({ cls: 'bdnsync-log-detail-grid' });
+    this.addDetailField(grid, '发生时间', this.formatFullTime(log.time));
+    this.addDetailField(grid, '相对时间', this.formatRelative(log.time));
+    this.addDetailField(grid, '严重程度', LEVEL_LABEL[log.level]);
+    this.addDetailField(grid, '来源模块', MODULE_LABEL[log.module]);
+    this.addDetailField(grid, '业务类型', this.typeLabel(log.type));
+    if (log.path) this.addDetailField(grid, '相关路径', log.path, true);
+    if (log.deleted) {
+      const st = log.deletedAt
+        ? `已标记删除（${this.formatRelative(log.deletedAt)}标记）`
+        : '已标记删除';
+      this.addDetailField(grid, '处理状态', st);
+    }
+    this.addDetailField(grid, '日志编号', log.id);
+
+    const section = container.createDiv({ cls: 'bdnsync-log-detail-section' });
+    section.createDiv({ cls: 'bdnsync-log-detail-h', text: '内容提炼' });
+
+    const parsed = parseLogMessage(log.message);
+    const concl = section.createDiv({ cls: 'bdnsync-log-detail-concl' });
+    concl.textContent = parsed.summary || '（无内容）';
+
+    if (parsed.context.length) {
+      const ctx = section.createDiv({ cls: 'bdnsync-log-detail-ctx' });
+      for (const line of parsed.context) {
+        ctx.createDiv({ cls: 'bdnsync-log-detail-ctx-line' }).textContent = line;
+      }
+    }
+
+    // 技术堆栈默认折叠，避免普通用户被冗长原始堆栈干扰（开发者排查用）
+    if (parsed.stack.length) {
+      const d = section.createEl('details', { cls: 'bdnsync-log-stack' });
+      d.createEl('summary', {
+        text: `技术堆栈（开发者排查用，共 ${parsed.stack.length} 帧）`,
+      });
+      const pre = d.createEl('pre', { cls: 'bdnsync-log-stack-pre' });
+      pre.textContent = parsed.stack.join('\n');
+    }
+  }
+
+  private addDetailField(
+    grid: HTMLElement,
+    label: string,
+    value: string,
+    mono = false,
+  ): void {
+    const item = grid.createDiv({ cls: 'bdnsync-log-detail-field' });
+    item.createSpan({ cls: 'bdnsync-log-detail-label', text: label });
+    const v = item.createSpan({
+      cls: `bdnsync-log-detail-value${mono ? ' is-mono' : ''}`,
+    });
+    v.textContent = value;
+  }
+
+  private typeLabel(t: SyncLogEntry['type']): string {
+    const map: Record<SyncLogEntry['type'], string> = {
+      upload: '上传',
+      download: '下载',
+      delete: '删除',
+      conflict: '冲突',
+      error: '错误',
+      info: '信息',
+    };
+    return map[t] ?? t;
+  }
+
+  private pad(n: number): string {
+    return String(n).padStart(2, '0');
+  }
+
+  private formatFullTime(ts: number): string {
+    const d = new Date(ts);
+    return (
+      `${d.getFullYear()}-${this.pad(d.getMonth() + 1)}-${this.pad(d.getDate())} ` +
+      `${this.pad(d.getHours())}:${this.pad(d.getMinutes())}:${this.pad(d.getSeconds())}.` +
+      `${String(d.getMilliseconds()).padStart(3, '0')}`
+    );
+  }
+
+  private formatRelative(ts: number): string {
+    const diff = Date.now() - ts;
+    const s = Math.floor(diff / 1000);
+    if (s < 60) return `${s} 秒前`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m} 分钟前`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h} 小时前`;
+    const d = Math.floor(h / 24);
+    if (d < 30) return `${d} 天前`;
+    const mo = Math.floor(d / 30);
+    if (mo < 12) return `${mo} 个月前`;
+    return `${Math.floor(mo / 12)} 年前`;
+  }
+
 
   private addRowAction(
     container: HTMLElement,

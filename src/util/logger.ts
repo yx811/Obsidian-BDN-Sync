@@ -298,6 +298,38 @@ export class Logger {
   }
 }
 
+/** 解析日志 message 文本，拆分为「一句话结论 / 关键上下文 / 技术堆栈」三段。
+ *  以 Error 记录时，Logger.log 会把 message 存为 `人类可读信息\nError: x\n    at ...`，
+ *  这里把首行作为结论，中间非堆栈行作为上下文，以 `at ` 开头的行归为技术堆栈（供开发者折叠排查）。
+ *  用于日志浏览器「展开详情」时提炼展示，避免直接堆砌冗长原始堆栈。 */
+export interface ParsedLogMessage {
+  summary: string;
+  context: string[];
+  stack: string[];
+}
+
+export function parseLogMessage(raw: string): ParsedLogMessage {
+  const lines = raw.split(/\r?\n/);
+  const summary = (lines[0] ?? '').trim();
+  const context: string[] = [];
+  const stack: string[] = [];
+  const STACK_CAP = 30; // 技术堆栈最多保留 30 帧，避免超长 dump
+  for (let i = 1; i < lines.length; i++) {
+    const ln = lines[i].replace(/\s+$/, '');
+    const trimmed = ln.trim();
+    if (!trimmed) continue;
+    if (/^\s*at\s/.test(ln)) {
+      if (stack.length < STACK_CAP) stack.push(trimmed);
+      continue;
+    }
+    // 跳过与结论重复的 "Error: xxx" 标题行（堆栈首行常与结论重复）
+    const deErr = trimmed.replace(/^Error:\s*/i, '');
+    if (deErr && deErr === summary) continue;
+    context.push(trimmed);
+  }
+  return { summary, context, stack };
+}
+
 function isValidEntry(e: unknown): e is SyncLogEntry {
   if (!e || typeof e !== 'object') return false;
   const o = e as Record<string, unknown>;
