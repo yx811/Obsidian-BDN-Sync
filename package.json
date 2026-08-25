@@ -1,0 +1,44 @@
+{
+  "name": "bdnsync",
+  "version": "1.0.2",
+  "description": "BDNSync - Baidu Netdisk sync plugin for Obsidian (WPS-like cloud doc experience)",
+  "main": "main.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yx811/Obsidian-BDN-Sync.git"
+  },
+  "homepage": "https://github.com/yx811/Obsidian-BDN-Sync",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "deploy": "node esbuild.config.mjs production && node scripts/copy-to-vault.cjs",
+    "deploy:copy": "node scripts/copy-to-vault.cjs",
+    "test": "vitest run",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "lint:fix": "eslint \"src/**/*.ts\" \"tests/**/*.ts\" --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "prepublishOnly": "tsc -noEmit -skipLibCheck && npm run lint && npm test"
+  },
+  "keywords": [
+    "obsidian",
+    "baidu",
+    "netdisk",
+    "sync"
+  ],
+  "author": "Game811",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.2",
+    "eslint": "^8.57.0",
+    "eslint-config-prettier": "^9.1.0",
+    "obsidian": "1.4.11",
+    "prettier": "^3.3.3",
+    "tslib": "2.6.2",
+    "typescript": "5.4.5",
+    "vitest": "^1.6.1"
+  }
+}
