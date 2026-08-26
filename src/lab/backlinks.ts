@@ -38,6 +38,10 @@ interface BacklinkIndex {
 const INDEX_FILE = 'lab-backlinks.json';
 const INDEX_TTL = 1000 * 60 * 30; // 30 分钟
 
+// 模块级复用：匹配 bdn:// 引用（行内或链接目标）。带 g 标志须在每次使用前重置 lastIndex。
+// 用 RegExp 构造避开单/双引号嵌套的歧义，字符类内只对 \ / ] 做必要转义。
+const BDNSYNC_REF_RE = /bdn:\/\/[^\s)\]>"']+/g;
+
 function indexKeyFsId(fsId: string): string {
   return `fs:${fsId}`;
 }
@@ -62,11 +66,9 @@ export async function buildBacklinkIndex(plugin: BDNSyncPlugin): Promise<Backlin
       }
       const lines = content.split('\n');
       lines.forEach((lineText, i) => {
-        // 匹配 bdn:// 引用（行内或链接目标）
-        // 用 RegExp 构造避开单/双引号嵌套的歧义，字符类内只对 \ / ] 做必要转义
-        const re = new RegExp(`bdn:\\/\\/[^\\s)\\]>"']+`, 'g');
+        BDNSYNC_REF_RE.lastIndex = 0;
         let m: RegExpExecArray | null;
-        while ((m = re.exec(lineText)) !== null) {
+        while ((m = BDNSYNC_REF_RE.exec(lineText)) !== null) {
           const ref = parseBdnRef(m[0]);
           if (!ref) continue;
           const rec: BacklinkRef = {

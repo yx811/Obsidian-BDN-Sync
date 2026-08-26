@@ -24,6 +24,7 @@ import {
   request as httpRequest,
 } from 'http';
 import { request as httpsRequest } from 'https';
+import type { Socket } from 'net';
 import { URL } from 'url';
 import { Platform } from 'obsidian';
 import type BDNSyncPlugin from './main';
@@ -37,6 +38,8 @@ export class StreamServer {
   private port = 0;
   private token = '';
   private plugin: BDNSyncPlugin;
+  /** 活跃 TCP 连接：server.close() 不等待/不断开已建立的 keep-alive 连接，须在 stop 时主动销毁 */
+  private connections = new Set<Socket>();
 
   constructor(plugin: BDNSyncPlugin) {
     this.plugin = plugin;
@@ -63,6 +66,11 @@ export class StreamServer {
     const tryListen = (p: number, attempt: number): Promise<void> => {
       return new Promise((resolve, reject) => {
         const srv = createServer((req, res) => this.handle(req, res));
+        // 跟踪每条入站连接，stop 时统一销毁，防止 keep-alive 连接占用端口
+        srv.on('connection', (socket: Socket) => {
+          this.connections.add(socket);
+          socket.once('close', () => this.connections.delete(socket));
+        });
         const onError = (err: NodeJS.ErrnoException) => {
           srv.removeAllListeners('error');
           if (err.code === 'EADDRINUSE' && attempt > 0) {
@@ -93,6 +101,15 @@ export class StreamServer {
       } catch {
         /* ignore */
       }
+      // 主动断开仍保持的 keep-alive 连接（Node 18.2+ 的 closeAllConnections 亦可）
+      for (const s of this.connections) {
+        try {
+          s.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.connections.clear();
       this.server = null;
       this.port = 0;
     }

@@ -1,6 +1,6 @@
 // 设置面板：卡片化、连接状态卡片、首次引导、折叠高级参数
 
-import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
+import { App, Notice, Platform, PluginSettingTab, Setting } from 'obsidian';
 import type BDNSyncPlugin from './main';
 import type { BDNSyncSettings } from './types';
 
@@ -231,6 +231,24 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     if (labHealthEnabled !== undefined) out.labHealthEnabled = labHealthEnabled;
     const labHealthWarnThreshold = num('labHealthWarnThreshold', 0, 100);
     if (labHealthWarnThreshold !== undefined) out.labHealthWarnThreshold = labHealthWarnThreshold;
+    const labGitEnabled = bool('labGitEnabled');
+    if (labGitEnabled !== undefined) out.labGitEnabled = labGitEnabled;
+    const lastGitSyncRef = str('lastGitSyncRef');
+    if (lastGitSyncRef !== undefined) out.lastGitSyncRef = lastGitSyncRef;
+    const labGitFallbackToScan = bool('labGitFallbackToScan');
+    if (labGitFallbackToScan !== undefined) out.labGitFallbackToScan = labGitFallbackToScan;
+
+    // 实验功能 10：局域网 P2P 同步
+    const labLanEnabled = bool('labLanEnabled');
+    if (labLanEnabled !== undefined) out.labLanEnabled = labLanEnabled;
+    const lanPassphrase = str('lanPassphrase');
+    if (lanPassphrase !== undefined) out.lanPassphrase = lanPassphrase;
+    const lanListenPort = num('lanListenPort', 1, 65535);
+    if (lanListenPort !== undefined) out.lanListenPort = lanListenPort;
+    const lanTargetHost = str('lanTargetHost');
+    if (lanTargetHost !== undefined) out.lanTargetHost = lanTargetHost;
+    const lanTargetPort = num('lanTargetPort', 0, 65535);
+    if (lanTargetPort !== undefined) out.lanTargetPort = lanTargetPort;
 
     // 孤儿目录清理
     const detectOrphanBackupDirs = bool('detectOrphanBackupDirs');
@@ -1310,6 +1328,8 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     this.renderLabBacklinks(container);
     this.renderLabOfflinePin(container);
     this.renderLabHealthScore(container);
+    this.renderLabGit(container);
+    this.renderLabLan(container);
 
     // ---- 一键复位：把全部实验功能子开关恢复默认（不影响主开关） ----
     const footer = container.createDiv({ cls: 'bdnsync-lab-footer' });
@@ -1327,6 +1347,14 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       s.labOfflinePinMaxMB = 200;
       s.labHealthEnabled = false;
       s.labHealthWarnThreshold = 80;
+      s.labGitEnabled = false;
+      s.lastGitSyncRef = '';
+      s.labGitFallbackToScan = true;
+      s.labLanEnabled = false;
+      s.lanPassphrase = '';
+      s.lanListenPort = 51820;
+      s.lanTargetHost = '';
+      s.lanTargetPort = 0;
       await this.plugin.saveSettings();
       this.display();
     });
@@ -1513,6 +1541,155 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             s.labHealthWarnThreshold = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+
+  /** 实验室子功能 ⑤：基于 Git 差异的增量同步（#5.9，仅桌面） */
+  private renderLabGit(container: HTMLElement): void {
+    const s = this.plugin.settings;
+    const on = !!s.labGitEnabled;
+    const desktop = Platform.isDesktop;
+    const sec = createSection(container, {
+      title: '⑤ Git 差异增量同步（仅桌面）',
+      icon: 'git-branch',
+      collapsible: true,
+      defaultOpen: on,
+    });
+    this.renderLabStatusBadge(sec.header, on);
+
+    const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
+    tip.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text: '对开启 Git 的 Vault，用 git 差异作为增量同步变更源，跳过全量文件系统扫描，大库显著提速。仅桌面端可用（依赖 git 二进制），移动端自动回退常规扫描。BDNSync 只读 Git 状态，绝不自动 commit。',
+    });
+
+    new Setting(sec.body)
+      .setName('启用 Git 差异增量')
+      .setDesc(
+        desktop
+          ? '开启后可用命令「BDNSync：Git 增量同步」触发基于 git 差异的增量同步。'
+          : '当前为移动端，Git 增量不可用，将自动回退常规同步。',
+      )
+      .addToggle((t) =>
+        t
+          .setValue(on)
+          .setDisabled(!desktop)
+          .onChange(async (v) => {
+            s.labGitEnabled = v;
+            await this.plugin.saveSettings();
+            this.refreshLabStatusBadge(sec.header, v);
+          }),
+      );
+
+    new Setting(sec.body)
+      .setName('Git 不可用时回退常规同步')
+      .setDesc('关闭后，非 Git 仓库 / 无 git 时命令会直接报错；开启则回退到常规扫描增量。')
+      .addToggle((t) =>
+        t.setValue(!!s.labGitFallbackToScan).onChange(async (v) => {
+          s.labGitFallbackToScan = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    const refLine = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
+    refLine.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text: s.lastGitSyncRef
+        ? `当前基线 ref：${s.lastGitSyncRef.slice(0, 12)}…（每次成功同步后自动更新为最新 HEAD）`
+        : '尚未记录基线 ref：首次同步将基于 working tree 范围，之后自动收敛到「上次同步后」区间。',
+    });
+  }
+
+  /** 实验室子功能 ⑩：局域网 P2P 同步（#5.10，仅桌面） */
+  private renderLabLan(container: HTMLElement): void {
+    const s = this.plugin.settings;
+    const on = !!s.labLanEnabled;
+    const desktop = Platform.isDesktop;
+    const sec = createSection(container, {
+      title: '⑩ 局域网 P2P 同步（仅桌面）',
+      icon: 'hard-drive',
+      collapsible: true,
+      defaultOpen: on,
+    });
+    this.renderLabStatusBadge(sec.header, on);
+
+    const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
+    tip.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text: '不依赖百度网盘，直接在「同局域网两台设备」之间同步 Vault。一端开启「作为对端监听」，另一端的「局域网同步」命令即可连接并双向同步。数据不出局域网，信道用配对口令 AES-256-GCM 加密，文件内容另可叠加端到端加密。仅桌面端可用。',
+    });
+
+    new Setting(sec.body)
+      .setName('启用局域网 P2P 同步')
+      .setDesc(
+        desktop
+          ? '开启后可在命令面板使用「BDNSync：启动局域网对端」「BDNSync：局域网同步」。'
+          : '当前为移动端，局域网 P2P 不可用。',
+      )
+      .addToggle((t) =>
+        t
+          .setValue(on)
+          .setDisabled(!desktop)
+          .onChange(async (v) => {
+            s.labLanEnabled = v;
+            await this.plugin.saveSettings();
+            this.refreshLabStatusBadge(sec.header, v);
+          }),
+      );
+
+    new Setting(sec.body)
+      .setName('信道配对口令')
+      .setDesc('两端须一致才能互通；留空为明文信道（仅本机联调建议）。文件内容端到端加密由「加密」设置另行控制。')
+      .addText((t) =>
+        t
+          .setValue(s.lanPassphrase)
+          .setPlaceholder('两端一致的配对码')
+          .onChange(async (v) => {
+            s.lanPassphrase = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(sec.body)
+      .setName('本机监听端口')
+      .setDesc('本机作为「被同步对端」时监听的 TCP 端口（另一台设备连这个端口）。')
+      .addText((t) =>
+        t
+          .setValue(String(s.lanListenPort))
+          .onChange(async (v) => {
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0 && n <= 65535) {
+              s.lanListenPort = Math.floor(n);
+              await this.plugin.saveSettings();
+            }
+          }),
+      );
+
+    new Setting(sec.body)
+      .setName('手动指定对端主机')
+      .setDesc('当前版本为手动直连：请填写另一台设备的 IP。自动局域网发现仍在规划中，本机「启动局域网对端」时已会向同网段广播自身存在。')
+      .addText((t) =>
+        t
+          .setValue(s.lanTargetHost)
+          .setPlaceholder('如 192.168.1.20')
+          .onChange(async (v) => {
+            s.lanTargetHost = v.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(sec.body)
+      .setName('手动指定对端端口')
+      .setDesc('留空则随发现结果或回退到默认监听端口。')
+      .addText((t) =>
+        t
+          .setValue(s.lanTargetPort ? String(s.lanTargetPort) : '')
+          .setPlaceholder('默认 51820')
+          .onChange(async (v) => {
+            const n = Number(v);
+            s.lanTargetPort = Number.isFinite(n) ? Math.floor(n) : 0;
             await this.plugin.saveSettings();
           }),
       );

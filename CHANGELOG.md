@@ -2,11 +2,47 @@
 
 本文件记录 BDNSync 的所有版本变更。版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-> 📌 最新版本：**1.0.4**（2026-08-26）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+> 📌 最新版本：**1.0.5**（2026-08-26）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
 
 ---
 
 ## [Unreleased]
+
+## [1.0.5] - 2026-08-26
+
+### 新增：实验室功能模块（规划 §5.9 / §5.10 落地）
+
+- **⑩ 局域网 P2P 同步（#5.10）**：不依赖百度网盘，在「同局域网两台设备」之间直接同步 Vault。
+  - 抽象 `SyncEngine` 与远端存储的耦合：新增 `SyncBackend` 接口，`BaiduAdapter` 与新增 `LanBackend` 均实现该接口，引擎逻辑零改动即可切换后端。
+  - `LanBackend`：作为「对端」的远端存储客户端，经 TCP 分帧（4 字节长度前缀）链路逐请求往返；`LanPeer`：对端本机上的纯文件仓储服务（监听 TCP，处理 file_get/put/delete/rename/list_tree）。
+  - 零依赖：仅用 Node `net`/`fs`/`path`/`crypto`/`dgram`，全部懒加载，移动端不执行（上层 `Platform.isDesktop` 守卫）。
+  - 双重加密：信道用基于配对口令的 AES-256-GCM（`LanCipher`，PBKDF2 派生）；文件内容另可叠加既有的端到端加密（`Encryptor`）。口令留空退化为明文信道（仅本机联调建议）。
+  - 发现：UDP 广播信标（`LanDiscovery`）让同网段设备自动发现对端 TCP 端口。
+  - 命令面板：`BDNSync：启动局域网对端` / `停止局域网对端` / `局域网同步`；设置 → 实验室新增「⑩ 局域网 P2P 同步」子区（口令 / 监听端口 / 对端主机 / 对端端口）。
+  - 与云端索引互不干扰：局域网同步使用独立 `LocalStore` 命名空间（`.obsidian/plugins/bdnsync-lan`）。
+
+- **⑤ Git 差异增量同步（#5.9，仅桌面）**：对开启 Git 的 Vault，用 `git diff`/`git status` 差异作为增量同步变更源，跳过全量文件系统扫描，大库显著提速。
+  - `GitChangeSource`：采集「上次同步基线 ref → HEAD」区间 + working tree 变更，合并去重；非桌面 / 非 git 仓库按设置回退常规扫描。
+  - 命令面板：`BDNSync：Git 增量同步`；每次成功同步后基线 ref 自动推进为最新 HEAD，逐步收敛到「上次同步后」区间。
+  - 设置 → 实验室新增「⑤ Git 差异增量同步」子区（开关 / 回退开关 / 基线 ref 状态展示）。
+
+### 验证
+- 类型检查 `tsc -noEmit`、ESLint、生产构建 `esbuild production` 全绿。
+- 局域网 loopback 集成测试（双真实 `SyncEngine` 经 127.0.0.1 往返）：推送落盘、空库拉回逐字节一致、删除传播、双重加密非明文、信标编解码、路径穿越拒绝、口令不一致快速失败——共 7 项全过。
+
+### 加固（深度审查后修复）
+
+- **R1 请求超时**：`TcpLink.request()` 新增按请求整体超时（默认 30s，可配），对端无响应 / 口令不一致导致解密丢帧时不再无限挂起，而是抛出清晰错误。
+- **R2 持久连接**：`LanBackend` 由「每操作新建连接」改为复用单条持久 TCP 链路（抖动自动重连），全量同步的连接数从 ~2N 降到 1，消除握手开销与临时端口耗尽风险。
+- **R6 路径穿越防护**：`LanPeer.diskPath` 改为 fail-closed，遇到 `.`/`..` 段或逃出数据目录直接拒绝，防恶意/异常客户端 `../../` 越界写入。
+- **R4 加密健壮性**：`LanCipher` 构造时一次性解析并缓存 `crypto`，口令已设但模块缺失时抛出明确错误。
+- **R5 死代码清理**：移除 `git-change-source.ts` 中无用的 `pathMod`；`isGitRepo` 接入 `syncViaGit` 作为快速预检，非仓库场景提前走回退。
+- **R7/R8 资源回收**：`discovery.scan()` 的 socket 纳入 `stop()` 统一管理；`runLanSync` 结束后显式 `backend.close()` 释放半开连接。
+- **官方合规**：`getVaultDiskPath` 改为先 `instanceof FileSystemAdapter` 再 `getBasePath()`，符合 Obsidian 官方插件自查清单（移动端不取 `basePath`）。
+
+> ⚠️ 已知限制（非缺陷，留待后续）：Git 同步用 `child_process.spawnSync` 在主线程同步执行，最坏阻塞 20s（手动命令可接受）；后续可改为异步 `spawn` 以消除 UI 冻结。
+- 单元测试：Git 变更采集 9 项、局域网 P2P loopback 集成（推送 / 拉回 / 删除 / 加密落盘 / 信标编解码）全绿；全量 `vitest` 263 项通过。
+- 局域网联调验证口径：本机内启动 `LanPeer` 服务 + 两个真实 `SyncEngine`（各自独立 `LocalStore`）经 127.0.0.1 TCP 来回同步，覆盖推送落盘、空库拉回、删除传播、加密信道落盘非明文。
 
 ## [1.0.4] - 2026-08-26
 

@@ -188,9 +188,20 @@ export function errnoToCode(errno: number): string {
   return 'UNKNOWN';
 }
 
+/** 正则特殊字符转义（field 进入 RegExp 前必须转义，防止注入/ReDoS） */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function parseCookieField(cookieStr: string, field: string): string {
-  const m = new RegExp(`(?:^|;\\s*)${field}=([^;]*)`).exec(cookieStr || '');
-  return m ? decodeURIComponent(m[1]).trim() : '';
+  const m = new RegExp(`(?:^|;\\s*)${escapeRegExp(field)}=([^;]*)`).exec(cookieStr || '');
+  if (!m) return '';
+  try {
+    // 百度 Cookie 值可能是 URL 编码的；畸形 % 序列会让 decodeURIComponent 抛异常，须容错
+    return decodeURIComponent(m[1]).trim();
+  } catch {
+    return m[1].trim();
+  }
 }
 
 /**

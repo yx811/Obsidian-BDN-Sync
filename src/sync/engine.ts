@@ -6,9 +6,9 @@ import { Encryptor } from '../crypto/encryption';
 import {
   INDEX_VERSION,
   TOMBSTONE_TTL,
-  type BaiduAdapter,
   type ResolvedRemoteIndex,
 } from '../baidu/adapter';
+import type { SyncBackend } from './backend';
 import type { LocalStore } from '../storage/local-store';
 import type {
   BackupEntry,
@@ -246,7 +246,7 @@ export class SyncEngine {
   constructor(
     private app: App,
     private getSettings: () => BDNSyncSettings,
-    private adapter: BaiduAdapter,
+    private backend: SyncBackend,
     private store: LocalStore,
     private statusBar: StatusBar,
     private askFirstSync: FirstSyncAsker,
@@ -330,7 +330,7 @@ export class SyncEngine {
     const saltB64 = s.encryptionSalt;
     if (!saltB64) throw new Error('加密盐尚未初始化，请先完成一次加密同步以生成盐');
     const enc = new Encryptor(newPassword, saltB64);
-    this.adapter.setEncryptor(enc);
+    this.backend.setEncryptor(enc);
     const localIndex = await this.store.loadLocalIndex();
     let reuploadCount = 0;
     for (const p of Object.keys(localIndex.files)) {
@@ -714,8 +714,8 @@ export class SyncEngine {
     const settings = this.s();
     const filter = new PathFilter(settings);
     const localIndex = await this.store.loadLocalIndex();
-    const remoteIndex = (await this.adapter.readRemoteIndex()) || this.newRemoteIndex();
-    const remoteTree = await this.adapter.listTree();
+    const remoteIndex = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
+    const remoteTree = await this.backend.listTree();
     const localScan = await this.scanLocal(filter, localIndex.files);
     const isFirst = localIndex.lastSyncAt === 0;
     const dir: SyncDirection =
@@ -781,7 +781,8 @@ export class SyncEngine {
       return null;
     }
     const settings = this.s();
-    if (!settings.bduss && !settings.cookies && !settings.accessToken) {
+    // 5.10 局域网后端不需要百度云鉴权：仅当「后端需要云鉴权 且 未配置任何凭证」才拦截。
+    if (this.backend.requiresCloudAuth && !settings.bduss && !settings.cookies && !settings.accessToken) {
       this.statusBar.setError('未配置连接');
       this.notify('BDNSync：请先在设置中配置百度网盘连接（BDUSS/Cookie 或 access_token）');
       return null;
@@ -815,9 +816,9 @@ export class SyncEngine {
       this.statusBar.setSyncing('正在对比…');
       const filter = new PathFilter(settings);
       const localIndex = await this.store.loadLocalIndex();
-      const remoteIndex = (await this.adapter.readRemoteIndex()) || this.newRemoteIndex();
+      const remoteIndex = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
       this.statusBar.setSyncing('正在扫描远程目录…');
-      const remoteTree = await this.adapter.listTree();
+      const remoteTree = await this.backend.listTree();
       this.statusBar.setSyncing('正在扫描本地文件…');
       const localDirs = new Set<string>(); // 收集本地目录，供空文件夹补建
       const localScan = await this.scanLocal(
@@ -936,7 +937,7 @@ export class SyncEngine {
             this.statusBar.setProgress(stats.downloaded, stats.uploaded);
             return;
           }
-          const bytes = await this.adapter.download(
+          const bytes = await this.backend.download(
             {
               path: a.path,
               name: a.path.split('/').pop() || a.path,
@@ -1019,11 +1020,11 @@ export class SyncEngine {
           }
           await this.throttleBandwidth(content.length);
           const hash = a.local ? a.local.hash : md5Hex(content);
-          const res = await this.adapter.upload(a.path, content, {
+          const res = await this.backend.upload(a.path, content, {
             onProgress: () => this.statusBar.setProgress(stats.downloaded, stats.uploaded),
             // F1：每分块成功后立即持久化会话，崩溃重启后可续传而非从 precreate 重来
             onPartDone: (_session) => {
-              void this.store.saveTransferState(this.adapter.exportSessions()).catch(() => {
+              void this.store.saveTransferState(this.backend.exportSessions()).catch(() => {
                 /* 落盘失败不阻断上传 */
               });
             },
@@ -1227,7 +1228,7 @@ export class SyncEngine {
       }
       if (pendingRemoteDeletes.length > 0) {
         try {
-          await this.adapter.deleteRemote(pendingRemoteDeletes);
+          await this.backend.deleteRemote(pendingRemoteDeletes);
           const now = Date.now();
           for (const p of pendingRemoteDeletes) {
             const tomb = makeTombstone(p, this.s().deviceId, '', now);
@@ -1264,9 +1265,9 @@ export class SyncEngine {
         const missing = [...localDirs].filter(isEmptyDir).sort();
         if (missing.length) this.statusBar.setSyncing(`正在补建 ${missing.length} 个空目录…`);
         for (const rel of missing) {
-          const remoteDir = remoteJoin(this.adapter.root, rel);
+          const remoteDir = remoteJoin(this.backend.root, rel);
           try {
-            await this.adapter.ensureDir(remoteDir);
+            await this.backend.ensureDir(remoteDir);
             stats.dirsCreated = (stats.dirsCreated ?? 0) + 1;
           } catch (e) {
             engineLog('warn', `空目录补建失败 ${rel}: ${errText(e)}`);
@@ -1327,7 +1328,7 @@ export class SyncEngine {
       localIndex.stats.lastSyncSummary = summarize(stats);
       localIndex.conflicts = localIndex.conflicts.filter((c) => !c.resolved);
       await this.store.saveLocalIndex(localIndex);
-      await this.store.saveTransferState(this.adapter.exportSessions());
+      await this.store.saveTransferState(this.backend.exportSessions());
       // 统一提交本次同步累积的覆盖前备份元数据（O(1) 批量写，避免逐文件全量 IO）
       if (this.backupBuffer.length > 0) {
         await this.store.commitBackups(this.backupBuffer);
@@ -1390,7 +1391,7 @@ export class SyncEngine {
       const msg = errText(e);
       this.statusBar.setError(cooldownHint(e));
       this.notify(`BDNSync 同步失败：${msg}`, 8000);
-      await this.store.saveTransferState(this.adapter.exportSessions()).catch(() => {
+      await this.store.saveTransferState(this.backend.exportSessions()).catch(() => {
         /* ignore */
       });
       return {
@@ -1450,7 +1451,7 @@ export class SyncEngine {
    */
   async takeSnapshot(note: string): Promise<number> {
     const localIndex = await this.store.loadLocalIndex();
-    const remoteIndex = (await this.adapter.readRemoteIndex()) || this.newRemoteIndex();
+    const remoteIndex = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
     const files: VaultSnapshot['files'] = {};
     let totalBytes = 0;
     const seen = new Set<string>();
@@ -1555,9 +1556,9 @@ export class SyncEngine {
     const rel = `.bdnsync-base/${hash}`;
     try {
       // 远端已存在（同 hash 历史上传过）→ 零字节跳过
-      const existing = await this.adapter.downloadByPath(rel).catch(() => null);
+      const existing = await this.backend.downloadByPath(rel).catch(() => null);
       if (existing) return;
-      await this.adapter.upload(rel, content);
+      await this.backend.upload(rel, content);
     } catch {
       /* 上云失败不影响冲突处理；下次冲突时重试 */
     }
@@ -1620,7 +1621,7 @@ export class SyncEngine {
       await this.store.putBase(hash, bytes);
       // 上传（失败不阻断）；成功则乐观并发写索引（applyRemoteFileState 内部自写并回读校验）
       try {
-        const res = await this.adapter.upload(path, bytes);
+        const res = await this.backend.upload(path, bytes);
         await this.applyRemoteFileState(hash, st, res);
       } catch (e) {
         engineLog('warn', `合并结果上传失败（本地已保存，下次同步补齐）：${path} ${errText(e)}`);
@@ -1660,7 +1661,7 @@ export class SyncEngine {
   ): Promise<ResolvedRemoteIndex> {
     const MAX_ATTEMPTS = 6;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const fresh = (await this.adapter.readRemoteIndex()) || this.newRemoteIndex();
+      const fresh = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
       const existing = fresh.files[st.path];
       const entry: FileState = {
         ...st,
@@ -1674,12 +1675,12 @@ export class SyncEngine {
       fresh.updatedAt = Date.now();
       this.pruneTombstones(fresh);
       const ourVersion = fresh.syncVersion;
-      await this.adapter.writeRemoteIndex(fresh);
-      const verify = await this.adapter.readRemoteIndex();
+      await this.backend.writeRemoteIndex(fresh);
+      const verify = await this.backend.readRemoteIndex();
       if (verify && verify.syncVersion === ourVersion) return fresh;
     }
     // 重试耗尽：以最后一次写入为准（已尽力合并）
-    return (await this.adapter.readRemoteIndex()) || this.newRemoteIndex();
+    return (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
   }
 
   /**
@@ -1751,7 +1752,7 @@ export class SyncEngine {
     if (c.remoteState) {
       const entry = ctx.remoteTree.get(c.path);
       if (entry) {
-        remoteBytes = await this.adapter
+        remoteBytes = await this.backend
           .download(
             {
               path: c.path,
@@ -1928,7 +1929,7 @@ export class SyncEngine {
     if (remoteChanges.size === 0 && remoteDeletes.size === 0) {
       // 无变更：仅清理墓碑（若有）
       const pruned = this.pruneTombstones(remoteIndex);
-      if (pruned > 0) await this.adapter.writeRemoteIndex(remoteIndex);
+      if (pruned > 0) await this.backend.writeRemoteIndex(remoteIndex);
       return;
     }
 
@@ -1938,7 +1939,7 @@ export class SyncEngine {
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       // 1) 拉取最新索引（每次都重新读，捕获他端并发写入）
-      const fresh = await this.adapter.readRemoteIndex();
+      const fresh = await this.backend.readRemoteIndex();
       const base = fresh || this.newRemoteIndex();
 
       // 2) 竞态检测：本轮上传的文件，若在他端索引中 hash 不同 → 被覆盖，自动分叉保留双方
@@ -1950,7 +1951,7 @@ export class SyncEngine {
           const entry = ctx.remoteTree.get(path);
           if (entry && localBytes) {
             try {
-              const remoteBytes = await this.adapter.download(
+              const remoteBytes = await this.backend.download(
                 {
                   path,
                   name: path.split('/').pop() || path,
@@ -1964,7 +1965,7 @@ export class SyncEngine {
               const copyPath = conflictName(path, 'LOCAL');
               await this.writeLocalFile(copyPath, localBytes, this.s().autoBackup);
               await this.writeLocalFile(path, remoteBytes, true);
-              const copyRes = await this.adapter.upload(copyPath, localBytes);
+              const copyRes = await this.backend.upload(copyPath, localBytes);
               const copyHash = md5Hex(localBytes);
               const copyState = await this.stateAfterLocalWrite(copyPath, localBytes, copyHash);
               base.files[copyPath] = {
@@ -2020,10 +2021,10 @@ export class SyncEngine {
       base.version = INDEX_VERSION;
       this.pruneTombstones(base);
       const ourVersion = base.syncVersion;
-      await this.adapter.writeRemoteIndex(base);
+      await this.backend.writeRemoteIndex(base);
 
       // 5) 回读校验：若云端版本号仍等于我们写入的版本，说明这一轮间隙无人抢写 → 成功
-      const verify = await this.adapter.readRemoteIndex();
+      const verify = await this.backend.readRemoteIndex();
       if (verify && verify.syncVersion === ourVersion) {
         if (raceHandled > 0)
           this.notify(
@@ -2037,7 +2038,7 @@ export class SyncEngine {
     }
 
     // 重试耗尽：以最后写入的版本为准（已尽力合并），提示用户
-    const last = await this.adapter.readRemoteIndex();
+    const last = await this.backend.readRemoteIndex();
     ctx.localIndex.lastRemoteSyncVersion =
       last?.syncVersion ?? ctx.localIndex.lastRemoteSyncVersion;
     if (raceHandled > 0)
@@ -2065,7 +2066,9 @@ export class SyncEngine {
   async quickSync(paths: string[]): Promise<SyncResult> {
     if (this.syncing) return NOTHING; // 正在完整同步时忽略（完整同步会覆盖增量）
     const settings = this.s();
-    if (!settings.bduss && !settings.cookies && !settings.accessToken) return NOTHING;
+    // 5.10 局域网后端不需要百度云鉴权：仅当「后端需要云鉴权 且 未配置任何凭证」才短路返回。
+    if (this.backend.requiresCloudAuth && !settings.bduss && !settings.cookies && !settings.accessToken)
+      return NOTHING;
 
     this.syncing = true;
     this.cancelled = false;
@@ -2077,7 +2080,7 @@ export class SyncEngine {
       // 旧 run 的失败数被复用到新 run，误触发「重置本地索引」引导提示。
       this.downloadVerifyFails = 0;
       const localIndex = await this.store.loadLocalIndex();
-      const remoteIndex = (await this.adapter.readRemoteIndex()) || null;
+      const remoteIndex = (await this.backend.readRemoteIndex()) || null;
       if (!remoteIndex) {
         // 从未建立索引 → 退化为完整同步（保持 busy 锁，用 reentrant 委托，避免重入被 busy 检查吞掉）
         await this.fullSync('manual', 'bidirectional', true);
@@ -2124,7 +2127,7 @@ export class SyncEngine {
             this.statusBar.setSyncing(
               `正在重命名 ${oldP.split('/').pop()} → ${newP.split('/').pop()}…`,
             );
-            await this.adapter.renameRemote(oldP, newP);
+            await this.backend.renameRemote(oldP, newP);
             // 更新索引：new 继承 old 的 remote 态（fsId/hash），old 置墓碑
             const lst = await this.vadapter()
               .stat(newP)
@@ -2198,7 +2201,7 @@ export class SyncEngine {
             continue;
           }
           this.statusBar.setSyncing(`正在上传 ${path.split('/').pop()}…`);
-          const res = await this.adapter.upload(path, bytes);
+          const res = await this.backend.upload(path, bytes);
           const lst = await this.vadapter()
             .stat(path)
             .catch(() => null);
@@ -2289,7 +2292,7 @@ export class SyncEngine {
       }
 
       if (pendingDeletes.length > 0) {
-        await this.adapter.deleteRemote(pendingDeletes);
+        await this.backend.deleteRemote(pendingDeletes);
       }
 
       // 提交索引（带合并与竞态检测）
@@ -2321,7 +2324,7 @@ export class SyncEngine {
       localIndex.stats.syncCount += 1;
       localIndex.stats.lastSyncSummary = summarize(stats);
       await this.store.saveLocalIndex(localIndex);
-      await this.store.saveTransferState(this.adapter.exportSessions());
+      await this.store.saveTransferState(this.backend.exportSessions());
       this.statusBar.setDone(
         `↑${uploaded}${renamed ? ` ⇄${renamed}` : ''}${deleted ? ` 🗑${deleted}` : ''}`,
       );
@@ -2393,9 +2396,9 @@ export class SyncEngine {
         skipped++;
         continue;
       }
-      const remoteDir = remoteJoin(this.adapter.root, rel);
+      const remoteDir = remoteJoin(this.backend.root, rel);
       try {
-        await this.adapter.ensureDir(remoteDir);
+        await this.backend.ensureDir(remoteDir);
         created++;
         engineLog('info', `空目录已补建到云端：${rel}`);
       } catch (e) {
@@ -2412,7 +2415,7 @@ export class SyncEngine {
    */
   async verifyFsIdOwnership(fsId: string, path: string): Promise<boolean> {
     try {
-      const remoteIndex = await this.adapter.readRemoteIndex();
+      const remoteIndex = await this.backend.readRemoteIndex();
       if (!remoteIndex || !remoteIndex.files) return false;
       const entry = remoteIndex.files[path];
       if (!entry || entry.deleted) return false;
@@ -2432,14 +2435,14 @@ export class SyncEngine {
     const localIndex = await this.store.loadLocalIndex();
     const record = localIndex.conflicts.find((c) => c.path === path && !c.resolved);
     if (!record) return false;
-    const remoteIndex = (await this.adapter.readRemoteIndex()) || null;
+    const remoteIndex = (await this.backend.readRemoteIndex()) || null;
     const S = localIndex.files[path];
 
     const localBytes = await this.readLocalFile(path);
     let remoteBytes: Uint8Array | null = null;
     const rEntry = remoteIndex?.files[path];
     if (rEntry && !rEntry.deleted) {
-      remoteBytes = await this.adapter
+      remoteBytes = await this.backend
         .downloadByPath(path, rEntry.hash || undefined)
         .catch(() => null);
     }
@@ -2468,7 +2471,7 @@ export class SyncEngine {
       const st = await this.stateAfterLocalWrite(path, outcome.localBytes, hash);
       finalStates.set(path, st);
       if (outcome.uploadOriginal) {
-        const res = await this.adapter.upload(path, outcome.localBytes);
+        const res = await this.backend.upload(path, outcome.localBytes);
         remoteChanges.set(path, { ...st, remoteSize: res.remoteSize, fsId: res.fsId });
         await this.store.putBase(hash, outcome.localBytes);
       } else if (!rEntry || rEntry.deleted || rEntry.hash !== hash) {
@@ -2483,7 +2486,7 @@ export class SyncEngine {
         });
       }
     } else if (outcome.action === 'upload-local' && localBytes) {
-      const res = await this.adapter.upload(path, localBytes);
+      const res = await this.backend.upload(path, localBytes);
       const st: FileState = {
         path,
         mtime:
@@ -2500,7 +2503,7 @@ export class SyncEngine {
       remoteChanges.set(path, { ...st, remoteSize: res.remoteSize, fsId: res.fsId });
       await this.store.putBase(st.hash, localBytes);
     } else if (outcome.action === 'delete-remote') {
-      await this.adapter.deleteRemote([path]);
+      await this.backend.deleteRemote([path]);
       remoteChanges.set(path, makeTombstone(path, this.s().deviceId));
     } else if (outcome.action === 'delete-local') {
       await this.vadapter()
@@ -2516,7 +2519,7 @@ export class SyncEngine {
 
     for (const copy of outcome.conflictCopies) {
       await this.writeLocalFile(copy.path, copy.bytes, this.s().autoBackup);
-      const res = await this.adapter.upload(copy.path, copy.bytes);
+      const res = await this.backend.upload(copy.path, copy.bytes);
       const st = await this.stateAfterLocalWrite(copy.path, copy.bytes, md5Hex(copy.bytes));
       finalStates.set(copy.path, st);
       remoteChanges.set(copy.path, { ...st, remoteSize: res.remoteSize, fsId: res.fsId });
@@ -2585,7 +2588,7 @@ export class SyncEngine {
       this.statusBar.setSyncing('正在整库回滚…');
       emit('info', `开始整库回滚到快照 ${snap.id}（${snap.totalFiles} 个文件）`);
       const localIndex = await this.store.loadLocalIndex();
-      const remoteTree = await this.adapter.listTree();
+      const remoteTree = await this.backend.listTree();
       const filter = new PathFilter(this.s());
       let restored = 0,
         removed = 0;
@@ -2598,7 +2601,7 @@ export class SyncEngine {
         try {
           const entry = remoteTree.get(path);
           if (entry) {
-            const bytes = await this.adapter.download({ ...entry, path }, info.hash);
+            const bytes = await this.backend.download({ ...entry, path }, info.hash);
             await this.writeLocalFile(path, bytes, this.s().autoBackup);
           } else {
             const cached = await this.store.getBase(info.hash);

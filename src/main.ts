@@ -1,6 +1,6 @@
 // BDNSync 插件入口：生命周期、命令、事件、调度器、新 UI 集成
 
-import { Modal, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { FileSystemAdapter, Modal, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
 import {
   BaiduApi,
   parseCookieField,
@@ -83,10 +83,17 @@ import { StreamServer } from './stream-server';
 import { rewriteBdnRefs, recoverBdnRefs, buildBdnRef } from './lab/media-bridge';
 import { rebuildBacklinkIndex } from './lab/backlinks';
 import { evaluateSyncHealth } from './lab/health-score';
+import { GitChangeSource, isGitRepo } from './lab/git-change-source';
+import { LanBackend, LanPeer } from './lab/lan/lan-backend';
+import { LanDiscovery } from './lab/lan/discovery';
 // 引入插件样式：esbuild 会将其打包并通过 onload 注入，缺失会导致全部 UI 弹窗无样式
 import '../styles.css';
 
 const PLUGIN_DIR = '.obsidian/plugins/bdnsync';
+/** 局域网 P2P 同步专用本地索引目录（与云端索引隔离，避免 index namespace 冲突） */
+const LAN_PLUGIN_DIR = '.obsidian/plugins/bdnsync-lan';
+/** 本机作为「被同步对端」时，远端镜像落盘目录（置于 .obsidian 下，天然被云端同步排除） */
+const LAN_PEER_DIR = '.obsidian/plugins/bdnsync/lan-peer';
 
 export default class BDNSyncPlugin extends Plugin {
   settings!: BDNSyncSettings;
@@ -105,7 +112,13 @@ export default class BDNSyncPlugin extends Plugin {
   private vipRerenderToken = 0;
 
   private api!: BaiduApi;
-  private adapter!: BaiduAdapter;
+  private cloudAdapter!: BaiduAdapter;
+  /** 局域网 P2P：本机作为「被同步对端」时的服务实例（另一台设备连它拉/推） */
+  private lanPeer: LanPeer | null = null;
+  /** 局域网 P2P：UDP 信标广播（让同网段其他设备发现本机） */
+  private lanDiscovery: LanDiscovery | null = null;
+  /** 局域网 P2P：防止并发发起多次 LAN 同步（与云端同步互斥） */
+  private lanSyncing = false;
   /** 本地持久化存储（LocalStore）：实验功能读写索引/报告等使用 */
   store!: LocalStore;
   private nextAutoSyncAt = 0;
@@ -333,6 +346,28 @@ export default class BDNSyncPlugin extends Plugin {
       name: '跨设备同步状态看板',
       callback: () => void this.openCrossDeviceDashboard(),
     });
+    // 实验室 #5.9：基于 Git 差异的增量同步（仅桌面）
+    this.addCommand({
+      id: 'bdnsync-git-sync',
+      name: 'Git 增量同步（实验室）',
+      callback: () => void this.syncViaGit(),
+    });
+    // 实验室 #5.10：局域网 P2P 同步（仅桌面）
+    this.addCommand({
+      id: 'bdnsync-lan-peer-start',
+      name: '启动局域网对端（实验室）',
+      callback: () => void this.startLanPeer(),
+    });
+    this.addCommand({
+      id: 'bdnsync-lan-peer-stop',
+      name: '停止局域网对端（实验室）',
+      callback: () => this.stopLanPeer(),
+    });
+    this.addCommand({
+      id: 'bdnsync-lan-sync',
+      name: '局域网同步（实验室）',
+      callback: () => void this.runLanSync(),
+    });
 
     // 实验功能：插入 bdn:// 网盘媒体引用（相对 remoteRoot）
     this.addCommand({
@@ -427,7 +462,7 @@ export default class BDNSyncPlugin extends Plugin {
     // 标记卸载：之后不再接受新的同步触发（周期调度 / 保存增量 / pending 兜底），
     // 避免 dispose 清空 watcher 定时器后仍有上传在 api 层裸跑丢失最后几个文件。
     this.disposing = true;
-    void this.store?.saveTransferState(this.adapter?.exportSessions() ?? []).catch(() => {
+    void this.store?.saveTransferState(this.cloudAdapter?.exportSessions() ?? []).catch(() => {
       /* ignore */
     });
     document.body?.classList.remove('bdnsync-theme-hc');
@@ -439,6 +474,8 @@ export default class BDNSyncPlugin extends Plugin {
     // 停止本地流式代理，释放端口
     this.streamServer?.stop();
     this.streamServer = null;
+    // 停止局域网对端服务与信标广播，释放端口
+    this.stopLanPeer();
     // 清理反向引用重建防抖定时器，避免在已卸载实例上执行
     if (this.backlinkRebuildTimer !== null) {
       window.clearTimeout(this.backlinkRebuildTimer);
@@ -633,7 +670,7 @@ export default class BDNSyncPlugin extends Plugin {
 
   private rebuildBackend(): void {
     this.api = this.makeApi();
-    this.adapter = new BaiduAdapter(this.api, () => this.settings, this.makeEncryptor());
+    this.cloudAdapter = new BaiduAdapter(this.api, () => this.settings, this.makeEncryptor());
     this.store = new LocalStore(this.app.vault.adapter, PLUGIN_DIR, {
       onCorruptIndex: () =>
         new Notice('BDNSync：本地索引校验失败，已自动重建（下次同步将全量对账）', 6000),
@@ -641,7 +678,7 @@ export default class BDNSyncPlugin extends Plugin {
     this.engine = new SyncEngine(
       this.app,
       () => this.settings,
-      this.adapter,
+      this.cloudAdapter,
       this.store,
       this.statusBar,
       async (localCount, remoteCount) => {
@@ -678,7 +715,7 @@ export default class BDNSyncPlugin extends Plugin {
   private refreshBackend(): void {
     this.api?.updateAuth(this.buildAuth());
     this.api?.updateInterval(this.settings.requestIntervalMs);
-    this.adapter?.setEncryptor(this.makeEncryptor());
+    this.cloudAdapter?.setEncryptor(this.makeEncryptor());
   }
 
   /** 供设置页调用的连接测试 */
@@ -998,6 +1035,225 @@ export default class BDNSyncPlugin extends Plugin {
     await this.syncNow('manual', direction);
   }
 
+  /** 取 Vault 在磁盘上的绝对路径（仅桌面端有效；移动端 / 非文件系统 adapter 返回 null） */
+  private getVaultDiskPath(): string | null {
+    if (!Platform.isDesktop) return null;
+    // 官方要求：访问 adapter 文件系统属性前先 instanceof 校验，避免移动端 CapacitorAdapter 上取 basePath 崩溃
+    const adapter = this.app.vault.adapter;
+    return adapter instanceof FileSystemAdapter ? adapter.getBasePath() : null;
+  }
+
+  /**
+   * 实验室 #5.9：基于 Git 差异的增量同步。
+   * 采集 git 变更路径 → 喂给引擎 syncSubset（与 watcher 增量同一通道）。
+   * 同步成功后把基线 ref 更新为最新 HEAD，下次自动收敛到「上次同步后」区间。
+   * 非桌面 / 未开启 / 非 Git 仓库按设置回退常规同步或直接提示。
+   */
+  async syncViaGit(): Promise<SyncResult | null> {
+    if (!Platform.isDesktop) {
+      new Notice('Git 增量同步仅支持桌面端（依赖 git 二进制）');
+      return null;
+    }
+    if (!this.settings.labEnabled || !this.settings.labGitEnabled) {
+      new Notice('请先在「设置 → 实验室」中启用「Git 差异增量同步」');
+      return null;
+    }
+    if (!this.engine) {
+      new Notice('同步引擎尚未就绪');
+      return null;
+    }
+    const disk = this.getVaultDiskPath();
+    if (!disk) {
+      new Notice('无法获取 Vault 磁盘路径');
+      return null;
+    }
+
+    // 快速预检：非 Git 仓库直接走回退路径，避免盲目起 4 次 git 子进程后才发现
+    if (!(await isGitRepo(disk))) {
+      if (this.settings.labGitFallbackToScan) {
+        new Notice('当前 Vault 不是 Git 仓库，已回退常规同步');
+        return await this.syncNow('manual');
+      }
+      new Notice('当前 Vault 不是 Git 仓库，且未开启回退（设置 → 实验室）');
+      return null;
+    }
+
+    const src = new GitChangeSource(disk, this.settings.lastGitSyncRef || undefined);
+    let cs;
+    try {
+      cs = await src.collect();
+    } catch (e) {
+      new Notice(`Git 采集失败：${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+
+    if (!cs) {
+      if (this.settings.labGitFallbackToScan) {
+        new Notice('当前 Vault 不是 Git 仓库，已回退常规同步');
+        return await this.syncNow('manual');
+      }
+      new Notice('当前 Vault 不是 Git 仓库，且未开启回退（设置 → 实验室）');
+      return null;
+    }
+    // 空值窄化后快照：闭包内引用 const，无需非空断言，也避免后续对 cs 的误用
+    const changeSet = cs;
+
+    // 同步成功或跳过时，都把基线 ref 推进到最新 HEAD，收敛区间
+    const advanceRef = async () => {
+      if (changeSet.head && changeSet.head !== this.settings.lastGitSyncRef) {
+        this.settings.lastGitSyncRef = changeSet.head;
+        await this.saveSettings();
+      }
+    };
+
+    if (changeSet.paths.length === 0) {
+      new Notice('Git 未检测到变更（working tree 干净）');
+      await advanceRef();
+      return null;
+    }
+
+    new Notice(`Git 检测到 ${changeSet.paths.length} 个变更文件，开始增量同步…`);
+    const result = await this.engine.syncSubset(changeSet.paths);
+    await advanceRef();
+    new Notice(
+      `Git 增量同步完成：${changeSet.paths.length} 个文件，成功 ${result.successPaths?.length ?? 0}`,
+    );
+    return result;
+  }
+
+  /** 局域网 P2P：本机作为「被同步对端」时的镜像落盘目录（置于 .obsidian 下，天然被云端同步排除） */
+  private lanPeerDir(): string | null {
+    const base = this.getVaultDiskPath();
+    if (!base) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const path = (globalThis as any).require?.('path');
+    if (!path) return null;
+    return path.join(base, LAN_PEER_DIR);
+  }
+
+  /**
+   * 实验室 #5.10：启动局域网对端服务。
+   * 本机开始监听 TCP，等同「成为可被另一台设备同步的远端」；同时广播 UDP 信标便于被发现。
+   */
+  async startLanPeer(): Promise<void> {
+    if (!Platform.isDesktop) {
+      new Notice('局域网对端仅支持桌面端');
+      return;
+    }
+    if (!this.settings.labEnabled || !this.settings.labLanEnabled) {
+      new Notice('请先在「设置 → 实验室」中启用「局域网 P2P 同步」');
+      return;
+    }
+    if (this.lanPeer) {
+      new Notice(`局域网对端已在运行（端口 ${this.lanPeer.port}）`);
+      return;
+    }
+    const dir = this.lanPeerDir();
+    if (!dir) {
+      new Notice('无法获取 Vault 磁盘路径');
+      return;
+    }
+    const peer = new LanPeer({
+      peerDataDir: dir,
+      port: this.settings.lanListenPort,
+      passphrase: this.settings.lanPassphrase,
+    });
+    // 无口令时监听外部接口等同局域网内明文可读写，明确警告，指导用户设配对码
+    if (!this.settings.lanPassphrase) {
+      new Notice('重要：未设置信道配对口令，局域网内任意设备均可连接本机对端，建议配置「设置→实验室→信道配对口令」');
+    }
+    try {
+      await peer.listen();
+    } catch (e) {
+      new Notice(`启动局域网对端失败：${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    this.lanPeer = peer;
+    new Notice(`局域网对端已启动，监听端口 ${peer.port}`);
+    try {
+      this.lanDiscovery = new LanDiscovery(
+        this.settings.deviceId || 'bdnsync',
+        this.settings.deviceName || 'BDNSync 设备',
+      );
+      this.lanDiscovery.startAdvertise(peer.port);
+    } catch {
+      /* 发现广播失败不影响同步，仅影响自动发现 */
+    }
+  }
+
+  /** 停止局域网对端服务并停止信标广播 */
+  stopLanPeer(): void {
+    this.lanDiscovery?.stop();
+    this.lanDiscovery = null;
+    this.lanPeer?.close();
+    this.lanPeer = null;
+    new Notice('已停止局域网对端');
+  }
+
+  /**
+   * 实验室 #5.10：与对端执行一次双向 fullSync。
+   * 复用同一 Vault 与本地磁盘，但使用独立的 LocalStore 命名空间（bdnsync-lan）+ LanBackend，
+   * 因此与云端同步的索引互不干扰。目标 host/port 优先取设置，缺省回退到本机监听端口。
+   */
+  async runLanSync(): Promise<void> {
+    if (!Platform.isDesktop) {
+      new Notice('局域网同步仅支持桌面端');
+      return;
+    }
+    if (!this.settings.labEnabled || !this.settings.labLanEnabled) {
+      new Notice('请先在「设置 → 实验室」中启用「局域网 P2P 同步」');
+      return;
+    }
+    if (this.engine?.isBusy() || this.lanSyncing) {
+      new Notice('已有同步进行中，请稍候');
+      return;
+    }
+    const host = this.settings.lanTargetHost?.trim() || '127.0.0.1';
+    const port = this.settings.lanTargetPort || this.settings.lanListenPort;
+    if (!this.settings.lanTargetHost?.trim()) {
+      // 未指定对端主机：回退到本机回环，仅用于同机多实例联调验证；
+      // 跨设备直连必须在「设置→实验室→手动指定对端主机」填写另一台设备的 IP。
+      new Notice('未指定对端主机，将尝试本机回环直连（联调用）；跨设备请填写对端 IP');
+    }
+    this.lanSyncing = true;
+    new Notice(`局域网同步开始，连接 ${host}:${port} …`);
+    const backend = new LanBackend({
+      host,
+      port,
+      passphrase: this.settings.lanPassphrase,
+      encryptor: this.makeEncryptor(),
+    });
+    const store = new LocalStore(this.app.vault.adapter, LAN_PLUGIN_DIR, {
+      onCorruptIndex: () =>
+        new Notice('局域网同步：本地索引校验失败，已自动重建（下次同步将全量对账）', 6000),
+    });
+    const engine = new SyncEngine(
+      this.app,
+      () => this.settings,
+      backend,
+      store,
+      this.statusBar,
+      async () => 'merge',
+      (n: number) => this.statusBar.setConflicts(n),
+      async () => 'proceed',
+    );
+    try {
+      const res = await engine.fullSync('manual');
+      if (res) {
+        new Notice(
+          `局域网同步完成：上传 ${res.uploaded}、下载 ${res.downloaded}、删除远端 ${res.deletedRemote}`,
+        );
+      } else {
+        new Notice('局域网同步未执行（无变更或未完成）');
+      }
+    } catch (e) {
+      new Notice(`局域网同步失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      backend.close(); // 释放持久 TCP 连接，避免半开 socket 残留
+      this.lanSyncing = false;
+    }
+  }
+
   private async runQuickSync(paths: string[]): Promise<void> {
     if (this.disposing) return; // 卸载中：不发起新同步
     if (!this.engine || !this.settings.syncOnSave || this.settings.syncMode === 'manual') return;
@@ -1156,7 +1412,7 @@ export default class BDNSyncPlugin extends Plugin {
   private async onLayoutReady(): Promise<void> {
     try {
       const ts = await this.store.loadTransferState();
-      this.adapter.restoreSessions(ts.uploads);
+      this.cloudAdapter.restoreSessions(ts.uploads);
       const idx = await this.store.loadLocalIndex();
       this.statusBar.setConflicts(idx.conflicts.filter((c) => !c.resolved).length);
     } catch {
@@ -1876,7 +2132,7 @@ export default class BDNSyncPlugin extends Plugin {
    * 不论哪种入口都走 OrphanCleanupModal，行为差异通过 opts.autoMode 区分。
    */
   async openOrphanCleanupModal(opts: { autoMode?: boolean; preScanned?: DeepScanResult } = {}): Promise<void> {
-    if (!this.adapter) {
+    if (!this.cloudAdapter) {
       new Notice('BDNSync：尚未配置，无法扫描');
       return;
     }
@@ -2161,7 +2417,7 @@ export default class BDNSyncPlugin extends Plugin {
    * 「文件或目录名不合法」（API 在用户家目录找 basename 找不到）。
    */
   private makeOrphanLister(): RemoteLister {
-    if (!this.adapter) throw new Error('BDNSync：adapter 未初始化');
+    if (!this.cloudAdapter) throw new Error('BDNSync：adapter 未初始化');
     const api = this.getApi();
     return {
       async listDir(absPath: string): Promise<RemoteDirRow[]> {

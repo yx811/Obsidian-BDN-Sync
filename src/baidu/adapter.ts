@@ -5,6 +5,7 @@ import { looksEncrypted, type Encryptor } from '../crypto/encryption';
 import { md5Hex, md5HexOf } from '../util/md5';
 import { normalizeRemote, remoteJoin, remoteParent, sleep } from '../util/misc';
 import type { BDNSyncSettings, FileState, RemoteEntry, RemoteIndex, UploadSession } from '../types';
+import type { SyncBackend } from '../sync/backend';
 
 /**
  * 已解析（解分片）的远程索引：files 一定是非空 Record（分片已合并），
@@ -34,7 +35,12 @@ export interface UploadResult {
   remoteSize: number; // 落盘字节数（加密时为密文长度），用于远程索引新鲜度校验
 }
 
-export class BaiduAdapter {
+export class BaiduAdapter implements SyncBackend {
+  /** 云端后端：必须百度鉴权才可用 */
+  get requiresCloudAuth(): boolean {
+    return true;
+  }
+
   private dirCache = new Set<string>();
   private uploadSessions = new Map<string, UploadSession>();
   public lastError: BaiduApiError | null = null;

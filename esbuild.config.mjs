@@ -15,7 +15,23 @@ const context = await esbuild.context({
   treeShaking: true,
   // Obsidian 运行在 electron 中，Node 内置模块（http/https/url）在运行时可用，
   // 设为 external 即可（参考澜库 LyncVault 同样依赖本地 http 流式代理）。
-  external: ['obsidian', 'http', 'https', 'url', 'stream', 'net'],
+  // 实验室模块（Git 增量 / 局域网 P2P）按需 lazy-require 的 builtin 也一并 external，
+  // 避免被打包（这些仅桌面端运行时使用，移动端由 Platform.isDesktop 守卫）。
+  external: [
+    'obsidian',
+    'http',
+    'https',
+    'url',
+    'stream',
+    'net',
+    'crypto',
+    'dns',
+    'child_process',
+    'fs',
+    'path',
+    'os',
+    'util',
+  ],
 });
 
 if (prod) {

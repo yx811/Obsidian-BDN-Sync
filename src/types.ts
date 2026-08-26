@@ -472,6 +472,26 @@ export interface BDNSyncSettings {
   /** 健康分低于该值（0-100）时发 Notice 预警 */
   labHealthWarnThreshold: number;
 
+  // —— 实验功能 5：基于 Git 差异的增量同步（#5.9，仅桌面） ——
+  /** 仅当 labEnabled 时生效；用 git 差异作为增量同步变更源，跳过全量文件系统扫描 */
+  labGitEnabled: boolean;
+  /** 上次 Git 同步对应的 HEAD ref（commit sha），用于界定「上次同步后」的变更区间 */
+  lastGitSyncRef: string;
+  /** Git 不可用 / 非 git 仓库时，回退到常规扫描增量同步（而非报错） */
+  labGitFallbackToScan: boolean;
+
+  // —— 实验功能 10：局域网 P2P 同步（#5.10，仅桌面） ——
+  /** 仅当 labEnabled 时生效；开启后可在「不依赖百度网盘」的前提下与同局域网设备直连同步 */
+  labLanEnabled: boolean;
+  /** 局域网信道配对口令（AES-256-GCM 派生密钥）；留空则不加密信道（仅建议本机联调） */
+  lanPassphrase: string;
+  /** 本机作为「被同步对端」时监听的 TCP 端口（另一台设备连这个端口拉/推） */
+  lanListenPort: number;
+  /** 手动指定的对端主机（留空则通过局域网发现自动填充） */
+  lanTargetHost: string;
+  /** 手动指定的对端 TCP 端口（留空则随发现结果） */
+  lanTargetPort: number;
+
   // —— 网盘孤儿备份目录清理 ——
   /** 检测网盘远程根父目录下的「vault 名 + 时间戳段」型疑似孤儿目录；
    *  命中时写 SyncLog（不删、不弹窗），由用户决定是否手动清理 */
@@ -595,6 +615,16 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   labOfflinePinMaxMB: 200,
   labHealthEnabled: true,
   labHealthWarnThreshold: 80,
+  labGitEnabled: false,
+  lastGitSyncRef: '',
+  labGitFallbackToScan: true,
+
+  // 实验功能 10：局域网 P2P 同步
+  labLanEnabled: false,
+  lanPassphrase: '',
+  lanListenPort: 51820,
+  lanTargetHost: '',
+  lanTargetPort: 0,
 
   // 孤儿目录清理（默认保守：只检测、不自动删；保留天数 90；上次扫描 0 = 从未扫过）
   detectOrphanBackupDirs: true,
