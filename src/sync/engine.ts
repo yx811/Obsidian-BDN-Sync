@@ -1,7 +1,8 @@
 // 同步引擎：三方对比（本地 / 云端 / 上次同步）、决策矩阵、墓碑、乐观锁竞态检测、断点续传
 
-import { type App } from 'obsidian';
+import { type App, Notice } from 'obsidian';
 import { BaiduApiError } from '../baidu/api';
+import { Encryptor } from '../crypto/encryption';
 import {
   INDEX_VERSION,
   TOMBSTONE_TTL,
@@ -204,6 +205,13 @@ export class SyncEngine {
   /** 网盘容量不足标志：下载阶段命中 31326 后置位，剩余下载短路 */
   private quotaExhausted = false;
   /**
+   * #3.6 动态并发：自适应降级层数（0 = 不降级，直接用设置值）。
+   * 当开启 adaptiveConcurrency 且上一次运行出现瞬态错误（限流/网络）时 +1，
+   * 干净完成后回落，形成「错误升高→降并发→恢复」的负反馈，避免在高延迟/限流
+   * 网络下反复重试放大失败。
+   */
+  private adaptiveLevel = 0;
+  /**
    * 覆盖前备份元数据缓冲：一次完整同步可能覆盖/删除大量文件，若每个都即时全量
    * 读写 backups.json 会产生 O(N) 次整文件 IO。这里先在内存累积，待同步结束统一
    * 提交（commitBackups），将 IO 降到 O(1)。物理内容仍由 putBase 负责（hash 去重）。
@@ -247,9 +255,10 @@ export class SyncEngine {
     /** UI 通知回调（解耦引擎与 Obsidian Notice：默认回退到 new Notice，便于测试注入） */
     private onNotice: (msg: string, timeout?: number) => void = (msg, timeout) => {
       // 延迟到运行时引用，避免模块顶层直接依赖 obsidian 的 Notice
-      const NoticeCtor =
-        // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-explicit-any
-        (globalThis as any).require?.('obsidian')?.Notice ?? (globalThis as any).Notice;
+      const NoticeCtor: typeof Notice | undefined =
+        (globalThis as { require?: (m: string) => { Notice?: typeof Notice } | undefined })
+          .require?.('obsidian')?.Notice ??
+        (globalThis as { Notice?: typeof Notice }).Notice;
       if (NoticeCtor) new NoticeCtor(msg, timeout);
     },
   ) {}
@@ -262,6 +271,81 @@ export class SyncEngine {
   cancel(): void {
     this.cancelled = true;
   }
+
+  /**
+   * #3.6 运行时动态并发：供 UI / 调度器在同步间隙调整上传并发度（立即生效，下一轮同步采用）。
+   * 0 表示恢复「跟随设置」。
+   */
+  setConcurrency(upload: number, download = 0): void {
+    if (upload > 0) this._overrideUpload = Math.max(1, Math.floor(upload));
+    else this._overrideUpload = 0;
+    if (download > 0) this._overrideDownload = Math.max(1, Math.floor(download));
+    else this._overrideDownload = 0;
+  }
+  private _overrideUpload = 0;
+  private _overrideDownload = 0;
+
+  /** 当前生效的上传并发度（考虑运行时覆盖 + 自适应降级） */
+  private effUploadConcurrency(): number {
+    const base = this._overrideUpload || this.s().uploadConcurrency || 3;
+    if (this.s().adaptiveConcurrency && this.adaptiveLevel > 0) {
+      return Math.max(1, base - this.adaptiveLevel);
+    }
+    return Math.max(1, base);
+  }
+  /** 当前生效的下载并发度 */
+  private effDownloadConcurrency(): number {
+    const base = this._overrideDownload || this.s().downloadConcurrency || 3;
+    if (this.s().adaptiveConcurrency && this.adaptiveLevel > 0) {
+      return Math.max(1, base - this.adaptiveLevel);
+    }
+    return Math.max(1, base);
+  }
+
+  /**
+   * #3.6 增量同步入口（按 paths 子集对账）：直接委托 quickSync，语义一致但命名更贴近
+   * 「变更源（watcher / Git / 扫描）三源合一」的抽象。供 Git 增量（#5.9）等场景显式调用。
+   */
+  async syncSubset(paths: string[]): Promise<SyncResult> {
+    return this.quickSync(paths);
+  }
+
+  /**
+   * #3.5 改密重加密：更换端到端加密密码。
+   *
+   * 设计要点（数据安全优先、零依赖、可回退）：
+   *  - 本地 base 池存的是**明文**内容（hash 去重），故无需重加密本地缓存；
+   *  - 网盘上的密文是用「旧密钥」加密的，新密钥无法解密，因此必须重新上传；
+   *  - 本地 vault 文件是明文真相源，直接以新密钥重新上传即可（无需先下载旧密文）。
+   *  做法：①用新密码构建 Encryptor 并热替换 adapter 加密器；②清空本地索引里所有
+   *  非删除条目的 fsId/remoteSize，使下次 fullSync 以新密钥重新上传（保留 hash 不变，
+   *  仅刷新远端密文）。返回需要重新上传的文件数。可能耗时（取决于文件数），调用方应
+   *  在「用户确认 + 显示进度」的场景下调用。
+   */
+  async reEncryptWith(newPassword: string): Promise<{ reuploadCount: number }> {
+    const s = this.s();
+    if (!s.encryptionEnabled) throw new Error('加密未启用，无法更换密钥');
+    // 加密盐在首次开启加密时即已持久化到 settings.encryptionSalt；改密复用同一 salt，
+    // 仅替换密码派生的密钥（每文件随机 IV 不变，语义安全不受影响）。
+    const saltB64 = s.encryptionSalt;
+    if (!saltB64) throw new Error('加密盐尚未初始化，请先完成一次加密同步以生成盐');
+    const enc = new Encryptor(newPassword, saltB64);
+    this.adapter.setEncryptor(enc);
+    const localIndex = await this.store.loadLocalIndex();
+    let reuploadCount = 0;
+    for (const p of Object.keys(localIndex.files)) {
+      const st = localIndex.files[p];
+      if (st.deleted) continue;
+      // 清空远端锚点：下次同步将用新密钥重新上传（本地明文为真相源）
+      st.fsId = undefined;
+      st.remoteSize = undefined;
+      reuploadCount++;
+    }
+    await this.store.saveLocalIndex(localIndex);
+    engineLog('info', `加密密钥已更换，标记 ${reuploadCount} 个文件将在下次同步以新密钥重新上传`);
+    return { reuploadCount };
+  }
+
 
   /** 统一的 UI 通知出口（经 onNotice 回调解耦 Obsidian Notice，便于测试 mock） */
   private notify(msg: string, timeout?: number): void {
@@ -336,6 +420,13 @@ export class SyncEngine {
   }
 
   private async writeLocalFile(relPath: string, bytes: Uint8Array, backup: boolean): Promise<void> {
+    // 🔒 纵深防御：拒绝任何含父目录段（..）的路径。Obsidian adapter 虽以 vault 为根，
+    // 但远端索引若被伪造/篡改（极端场景：攻击者控账号 + 构造 `..` 路径）仍可能触发路径穿越、
+    // 越界写出 vault。此处显式拦截，且以抛错而非静默跳过 —— 让同步将该文件计为错误而非“已写入”，
+    // 避免本地与远端状态静默不一致。
+    if (relPath.split('/').includes('..')) {
+      throw new Error(`BDNSync：拒绝写入非法路径（含父目录段）：${relPath}`);
+    }
     const exists = await this.vadapter().exists(relPath);
     if (exists && backup) {
       const old = new Uint8Array(await this.vadapter().readBinary(relPath));
@@ -893,11 +984,18 @@ export class SyncEngine {
         }
       };
 
-      const doUpload = async (a: Extract<Action, { type: 'upload' }>, bytes?: Uint8Array) => {
+      const doUpload = async (
+        a: Extract<Action, { type: 'upload' }>,
+        bytes?: Uint8Array,
+        large = false,
+      ) => {
         if (this.cancelled) return; // 用户取消：停止发起新上传（🟡#2）
         try {
           const content = bytes ?? (await this.readLocalFile(a.path));
           if (!content) throw new BaiduApiError(0, `本地文件读取失败：${a.path}`);
+          // #4.7 大文件独立通道：超过阈值标记为 large，便于统计与后续独立后端分流
+          const isLarge =
+            large || (this.s().largeFileThresholdMB > 0 && content.length >= this.s().largeFileThresholdMB * 1024 * 1024);
           // 百度物理上无法存储 0 字节文件：扫描后文件被清空（TOCTOU）时跳过上传，
           // 记入索引（空文件策略与 planEntry 一致），避免 upload 接口报错空转
           if (content.length === 0) {
@@ -939,17 +1037,26 @@ export class SyncEngine {
             size: content.length,
             hash,
             byDevice: this.s().deviceId,
+            // #4.7 大文件标记
+            large: isLarge || undefined,
             // 版本向量：本地锚点 vv 基础上 bump 本设备（本地编辑计数 +1）
             vv: bumpVV(a.local?.vv, this.s().deviceId),
           };
           finalStates.set(a.path, st);
           remoteChanges.set(a.path, { ...st, remoteSize: res.remoteSize, fsId: res.fsId });
+          if (isLarge) {
+            engineLog('info', `大文件独立通道上传：${a.path}（${Math.round(content.length / 1024 / 1024)}MB）`);
+          }
           uploadedThisRun.set(a.path, hash);
           await this.store.putBase(hash, content);
           stats.uploaded++;
           stats.bytesUp += res.bytesUp;
           this.statusBar.setProgress(stats.downloaded, stats.uploaded);
         } catch (e) {
+          // 网盘容量不足（errno=31326）：与下载侧一致，标记整轮短路，避免后续上传逐个报错刷屏
+          if (e instanceof BaiduApiError && e.errno === 31326) {
+            this.quotaExhausted = true;
+          }
           stats.errors++;
           stats.errorMessages.push(`上传失败 ${a.path}: ${errText(e)}`);
         }
@@ -963,7 +1070,7 @@ export class SyncEngine {
       if (downloads.length) this.statusBar.setSyncing(`正在下载 ${downloads.length} 个文件…`);
       await runWithConcurrency(
         downloads.map((a) => () => doDownload(a)),
-        Math.max(1, this.s().downloadConcurrency),
+        this.effDownloadConcurrency(),
       );
 
       // 1.5) 下载后短路判定（沉浸无感 + 数据安全：不浪费配额、不掩盖根因）
@@ -995,10 +1102,26 @@ export class SyncEngine {
         { type: 'upload' }
       >[];
       if (uploads.length) this.statusBar.setSyncing(`正在上传 ${uploads.length} 个文件…`);
+      // #4.7 大文件独立通道：超过阈值的大文件拆出独立并发池（默认更低并发，避免占用全部带宽/连接）
+      const largeThreshold = this.s().largeFileThresholdMB * 1024 * 1024;
+      const largeUploads = largeThreshold > 0
+        ? uploads.filter((a) => (a.local?.size ?? 0) >= largeThreshold)
+        : [];
+      const normalUploads = largeThreshold > 0
+        ? uploads.filter((a) => (a.local?.size ?? 0) < largeThreshold)
+        : uploads;
+      const largeConc = this.s().largeFileConcurrency > 0 ? this.s().largeFileConcurrency : 1;
       await runWithConcurrency(
-        uploads.map((a) => () => doUpload(a)),
-        Math.max(1, this.s().uploadConcurrency),
+        normalUploads.map((a) => () => doUpload(a)),
+        this.effUploadConcurrency(),
       );
+      if (largeUploads.length) {
+        this.statusBar.setSyncing(`正在上传大文件（${largeUploads.length} 个，独立通道）…`);
+        await runWithConcurrency(
+          largeUploads.map((a) => () => doUpload(a, undefined, true)),
+          largeConc,
+        );
+      }
 
       // 3) 跳过（两端内容一致）
       // 仅当远程索引条目缺失/过期时才补写，否则「无变更同步」也会重写并上传整份索引。
@@ -1253,7 +1376,16 @@ export class SyncEngine {
           this.notify(`BDNSync ${dirLabel}：${summarize(stats)}`);
         }
       }
-      return { ok: stats.errors === 0, ...stats };
+      // #3.6 动态并发负反馈：根据本次运行错误情况调整自适应降级层数
+      if (this.s().adaptiveConcurrency) {
+        if (stats.errors > 0) {
+          this.adaptiveLevel = Math.min(this.adaptiveLevel + 1, 2); // 最多降 2 档
+          engineLog('info', `动态并发自适应：错误 ${stats.errors} 个，降级至 ${this.effUploadConcurrency()} 并发`);
+        } else if (this.adaptiveLevel > 0) {
+          this.adaptiveLevel = Math.max(0, this.adaptiveLevel - 1);
+        }
+      }
+      return { ok: stats.errors === 0, durationMs: Date.now() - syncStartAt, ...stats };
     } catch (e) {
       const msg = errText(e);
       this.statusBar.setError(cooldownHint(e));
@@ -1264,6 +1396,7 @@ export class SyncEngine {
       return {
         ok: false,
         ...stats,
+        durationMs: Date.now() - syncStartAt,
         errors: stats.errors + 1,
         errorMessages: [...stats.errorMessages, msg],
       };
@@ -1309,6 +1442,48 @@ export class SyncEngine {
       totalFiles: Object.keys(files).length,
       totalBytes,
     };
+  }
+
+  /**
+   * #4.5 定时/手动快照：基于当前本地索引 + 远端索引构建轻量元数据快照点（不重新扫描文件）。
+   * 用于「定时自动快照」与「用户手动快照（可附备注）」共用入口。返回快照包含的文件数。
+   */
+  async takeSnapshot(note: string): Promise<number> {
+    const localIndex = await this.store.loadLocalIndex();
+    const remoteIndex = (await this.adapter.readRemoteIndex()) || this.newRemoteIndex();
+    const files: VaultSnapshot['files'] = {};
+    let totalBytes = 0;
+    const seen = new Set<string>();
+    const skip = (p: string) =>
+      p.startsWith('.obsidian/') || p.startsWith('.trash/') || p.startsWith('.bdnsync/');
+    for (const [p, st] of Object.entries(localIndex.files)) {
+      if (st.deleted || skip(p)) continue;
+      const size = st.size ?? 0;
+      files[p] = { hash: st.hash || '', mtime: st.mtime ?? Date.now(), size };
+      totalBytes += size;
+      seen.add(p);
+    }
+    for (const [p, st] of Object.entries(remoteIndex.files)) {
+      if (seen.has(p) || st.deleted || skip(p)) continue;
+      const size = st.size ?? 0;
+      files[p] = { hash: st.hash || '', mtime: st.mtime ?? Date.now(), size };
+      totalBytes += size;
+    }
+    const snap: VaultSnapshot = {
+      id: `snap-${Date.now()}-${randomId(4)}`,
+      createdAt: Date.now(),
+      deviceId: this.s().deviceId,
+      deviceName: this.s().deviceName || '本机',
+      reason: note || '定时/手动快照',
+      note,
+      files,
+      totalFiles: Object.keys(files).length,
+      totalBytes,
+    };
+    this.store.pushSnapshot(localIndex, snap, this.s().maxSnapshots);
+    await this.store.saveLocalIndex(localIndex);
+    engineLog('info', `已生成快照点（${snap.totalFiles} 个文件，备注：${note || '无'}）`);
+    return snap.totalFiles;
   }
 
   /**
@@ -1894,6 +2069,7 @@ export class SyncEngine {
 
     this.syncing = true;
     this.cancelled = false;
+    const qStartAt = Date.now();
     // 声明提前到 try 之外，使 catch（顶层异常）仍能拿到「本次已成功落盘的文件」集合
     const finalStates = new Map<string, FileState>();
     try {
@@ -1916,6 +2092,7 @@ export class SyncEngine {
         deleted = 0,
         renamed = 0;
       let needsFullSync = false;
+      let uploadedBytes = 0; // #5.12 累计上行字节，供统计趋势图
 
       // ---- 重命名感知（F2）----
       // Obsidian vault.on('rename') 会为 oldPath（删除）和 newPath（新增）各触发一次事件，
@@ -2015,6 +2192,8 @@ export class SyncEngine {
             finalStates.set(path, st);
             this.cacheHash(path, { mtime: st.mtime, size: 0, hash });
             await this.store.putBase(hash, bytes);
+            // #3.8 空目录/0KB 边缘：明确标注跳过物理上传，便于审计与用户理解
+            engineLog('info', `0KB 空文件已跳过物理上传（仅记录索引）：${path}`);
             uploaded++;
             continue;
           }
@@ -2029,6 +2208,10 @@ export class SyncEngine {
             size: bytes.length,
             hash,
             byDevice: settings.deviceId,
+            large:
+              this.s().largeFileThresholdMB > 0 && bytes.length >= this.s().largeFileThresholdMB * 1024 * 1024
+                ? true
+                : undefined,
             // 版本向量：本地锚点 vv 基础上 bump 本设备
             vv: bumpVV(S?.vv ?? R?.vv, settings.deviceId),
           };
@@ -2037,6 +2220,7 @@ export class SyncEngine {
           uploadedThisRun.set(path, hash);
           this.cacheHash(path, { mtime: st.mtime, size: st.size, hash });
           await this.store.putBase(hash, bytes);
+          uploadedBytes += res.bytesUp ?? 0;
           uploaded++;
         } else if (S && !S.deleted) {
           // 本地删除 → 删云端。但若云端在此期间被其他设备改过（hash 与 lastSync 不同），
@@ -2117,7 +2301,7 @@ export class SyncEngine {
         conflicts: 0,
         skipped: 0,
         errors: 0,
-        bytesUp: 0,
+        bytesUp: uploadedBytes,
         bytesDown: 0,
         dirsCreated: 0,
         errorMessages: [],
@@ -2151,9 +2335,10 @@ export class SyncEngine {
         conflicts: 0,
         skipped: 0,
         errors: 0,
-        bytesUp: 0,
+        bytesUp: uploadedBytes,
         bytesDown: 0,
         dirsCreated: 0,
+        durationMs: Date.now() - qStartAt,
         errorMessages: [],
         // 成功路径：整批均已评估处理（变更已落盘 / 未变更已确认一致 / 排除项无需动作），
         // 因此 successPaths 取完整输入 paths，让上层一次性清空脏集合（🔴#3）。
@@ -2176,6 +2361,7 @@ export class SyncEngine {
         bytesUp: 0,
         bytesDown: 0,
         dirsCreated: 0,
+        durationMs: Date.now() - qStartAt,
         errorMessages: [msg],
         // 顶层异常前循环中已成功落盘的文件仍视为成功，避免它们被无意义重传
         successPaths: Array.from(finalStates.keys()),

@@ -1,6 +1,6 @@
 // BDNSync 插件入口：生命周期、命令、事件、调度器、新 UI 集成
 
-import { Modal, Notice, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { Modal, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
 import {
   BaiduApi,
   parseCookieField,
@@ -29,6 +29,8 @@ import {
 } from './ui/modals';
 import { MergePanelModal } from './ui/merge-panel';
 import { RemoteUsageModal } from './ui/remote-usage';
+import { CrossDeviceDashboardView, VIEW_TYPE_BDNSYNC_DASHBOARD } from './ui/views/cross-device-dashboard-view';
+import { ReEncryptModal } from './ui/re-encrypt-modal';
 import { NetdiskBrowserView, VIEW_TYPE_BDNSYNC_BROWSER } from './ui/views/netdisk-browser-view';
 import { SyncLogView, VIEW_TYPE_BDNSYNC_LOG } from './ui/views/sync-log-view';
 import { PreviewView, VIEW_TYPE_BDNSYNC_PREVIEW } from './ui/views/preview-view';
@@ -53,8 +55,11 @@ import {
   shouldShowNotice,
   remoteParent,
   remoteJoin,
+  applyMobileDefaults,
 } from './util/misc';
-import { Logger } from './util/logger';
+import { diagnoseByMessage } from './util/error-dict';
+import { type DiagnosticContext, Logger } from './util/logger';
+import { probeHealth, probeDegradationAdvice } from './lab/api-probe';
 import { md5Hex } from './util/md5';
 import { LogStore } from './util/log-store';
 import {
@@ -71,6 +76,7 @@ import {
   type ClassifyOptions,
 } from './util/orphan-scan';
 import { sealSecretsInPlace, unsealSecretsInPlace } from './security/secrets';
+import { keyFileTemplate, DEFAULT_KEY_FILE } from './util/keyfile';
 import { RetryQueue } from './sync/retry-queue';
 import { DirtySet } from './sync/dirty-set';
 import { StreamServer } from './stream-server';
@@ -104,6 +110,8 @@ export default class BDNSyncPlugin extends Plugin {
   store!: LocalStore;
   private nextAutoSyncAt = 0;
   private autoFailCount = 0;
+  /** #4.5 上次自动快照时间（ms），用于定时快照间隔判定 */
+  private lastSnapshotAt = 0;
   /** 订阅式日志器：持久化 + 墓碑清理 + 整合筛选/导出 */
   logger!: Logger;
   /** 日志磁盘存储层（按日期分文件 + 大小轮转 + retentionDays 清理） */
@@ -123,6 +131,8 @@ export default class BDNSyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    // #2.2 移动端：按平台下调并发/分片/风暴阈值（桌面端原样返回；已自定义值不覆盖）
+    applyMobileDefaults(this.settings);
 
     // 日志器：按日期分文件持久化 + 大小轮转 + retentionDays 自动清理 + 墓碑宽限期
     const LOGS_DIR = `${PLUGIN_DIR}/logs`;
@@ -147,7 +157,8 @@ export default class BDNSyncPlugin extends Plugin {
 
     // 注册工作区视图（文件浏览器 / 同步日志）—— 作为 Obsidian 标签页打开，避免 Modal 截断
     this.registerView(VIEW_TYPE_BDNSYNC_BROWSER, (leaf) => new NetdiskBrowserView(leaf, this));
-    this.registerView(VIEW_TYPE_BDNSYNC_LOG, (leaf) => new SyncLogView(leaf, this.logger));
+    this.registerView(VIEW_TYPE_BDNSYNC_LOG, (leaf) => new SyncLogView(leaf, this.logger, () => this.buildDiagnosticContext()));
+    this.registerView(VIEW_TYPE_BDNSYNC_DASHBOARD, (leaf) => new CrossDeviceDashboardView(leaf, this));
     this.registerView(
       VIEW_TYPE_BDNSYNC_PREVIEW,
       // view 实例在 setState 时再创建（拿到 target）
@@ -316,6 +327,12 @@ export default class BDNSyncPlugin extends Plugin {
       name: '撤销最近一次冲突合并',
       callback: () => void this.undoLastMerge(),
     });
+    // P2-4.6 跨设备同步看板（轮询式）
+    this.addCommand({
+      id: 'bdnsync-cross-device-dashboard',
+      name: '跨设备同步状态看板',
+      callback: () => void this.openCrossDeviceDashboard(),
+    });
 
     // 实验功能：插入 bdn:// 网盘媒体引用（相对 remoteRoot）
     this.addCommand({
@@ -364,28 +381,32 @@ export default class BDNSyncPlugin extends Plugin {
     this.restartScheduler();
     this.registerInterval(window.setInterval(() => this.tickScheduler(), 30_000));
 
-    // 本地流式代理：布局就绪后启动（已授权才需要），供预览 Modal 免落盘在线打开/播放
-    this.app.workspace.onLayoutReady(() => {
-      if (this.hasAuth()) {
-        this.streamServer = new StreamServer(this);
-        this.streamServer.start().catch((e) => {
-          console.warn(
-            `[BDNSync] 本地流式代理启动失败（预览将回退为下载模式）：${(e as Error)?.message || String(e)}`,
-          );
-          this.streamServer = null;
-        });
-      }
-    });
+    // #2.1 API 稳定性与容灾：轻量探查（list/upload/quota）调度，按设置周期运行；
+    // 探测到 OpenAPI 不可用且 Cookie 可用时给出降级引导（best-effort，失败不影响主流程）。
+    if (this.settings.apiProbeEnabled) {
+      this.registerInterval(
+        window.setInterval(
+          () => void this.runApiProbe().catch(() => {}),
+          Math.max(1, this.settings.apiProbeIntervalHours) * 3600_000,
+        ),
+      );
+      // 启动后稍延迟跑一次（避免在 onload 高峰期抢占网络）。
+      // 用 registerInterval 托管该一次性定时器：onunload 时会自动 clearInterval，
+      // 避免在插件已卸载（实例正在释放）后回调仍调用 this.runApiProbe 触碰已释放资源。
+      this.registerInterval(
+        window.setTimeout(() => void this.runApiProbe().catch(() => {}), 15_000),
+      );
+    }
+
   }
 
   onunload(): void {
-    // 标记卸载：之后不再接受新的同步触发（周期调度 / 保存增量 / pending 兜底），
-    // 避免 dispose 清空 watcher 定时器后仍有上传在 api 层裸跑丢失最后几个文件。
-    this.disposing = true;
+    // 停止后台重试轮询定时器（schedulePoll 用的是裸 window.setInterval，不会随插件卸载自动清除，
+    // 否则卸载后每 15s 仍会在已释放的插件实例上触发 flush → 泄漏），须在 onunload 显式停止。
+    this.retryQueue?.stopPoll();
     // 卸载前尽量把「保存后尚未同步」的待提交变更 flush 出去，避免移动端/关闭时丢改。
-    // flush() 现在会 await 实际的 runQuickSync 完成；由于 onunload 是同步上下文、Obsidian
-    // 不保证等待其异步结束，这里以「尽力同步 + startup 全量兜底」双保险：先 fire-and-forget
-    // 发起 flush，待其完成（或失败）后再 dispose，确保 flush 触发的同步不被 dispose 打断。
+    // 注意：disposing 守卫会阻止 runQuickSync 执行，因此这里先不置 disposing，
+    // 待 flush 真正发起（fire-and-forget）后再标记卸载，确保 flush 有机会实际同步。
     // 即便卸载窗口未能等网络完成，下次启动的 startup 全量扫描也会重新覆盖 vault 内全部文件。
     if (
       this.watcher &&
@@ -403,17 +424,28 @@ export default class BDNSyncPlugin extends Plugin {
     } else {
       this.watcher?.dispose();
     }
+    // 标记卸载：之后不再接受新的同步触发（周期调度 / 保存增量 / pending 兜底），
+    // 避免 dispose 清空 watcher 定时器后仍有上传在 api 层裸跑丢失最后几个文件。
+    this.disposing = true;
     void this.store?.saveTransferState(this.adapter?.exportSessions() ?? []).catch(() => {
       /* ignore */
     });
     document.body?.classList.remove('bdnsync-theme-hc');
-    // 关闭所有已打开的工作区视图（文件浏览器 / 同步日志 / 文件预览）
+    // 关闭所有已打开的工作区视图（文件浏览器 / 同步日志 / 跨设备看板 / 文件预览）
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_BDNSYNC_BROWSER);
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_BDNSYNC_LOG);
+    this.app.workspace.detachLeavesOfType(VIEW_TYPE_BDNSYNC_DASHBOARD);
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_BDNSYNC_PREVIEW);
     // 停止本地流式代理，释放端口
     this.streamServer?.stop();
     this.streamServer = null;
+    // 清理反向引用重建防抖定时器，避免在已卸载实例上执行
+    if (this.backlinkRebuildTimer !== null) {
+      window.clearTimeout(this.backlinkRebuildTimer);
+      this.backlinkRebuildTimer = null;
+    }
+    // 清理状态栏（含内部 revert 定时器）
+    this.statusBar?.unmount();
     //  ㅤ卸载前把「今天」日志缓冲落盘，避免当天日志丢失
     void this.logStore?.flush().catch(() => {
       /* ignore */
@@ -1211,13 +1243,19 @@ export default class BDNSyncPlugin extends Plugin {
    */
   private authNoticeShownAt = 0;
   private maybeSurfaceAuthFailure(msg: string): void {
-    if (!/AUTH_FAILED|access_token|errno=-6|errno=111|errno=50305|授权|令牌|token/i.test(msg))
+    if (!/AUTH_FAILED|access_token|errno=-6|errno=111|errno=50305|授权|令牌|token|errno=6|errno=111/i.test(msg))
       return;
     const now = Date.now();
     // 限频：同一鉴权问题 10 分钟内只提示一次，避免反复刷屏（沉浸无感）
     if (now - this.authNoticeShownAt < 10 * 60_000) return;
     this.authNoticeShownAt = now;
-    const notice = new Notice('BDNSync：网盘授权已失效或过期，点击「重新授权」恢复同步。', 12000);
+    // #3.7 错误诊断：复用中文知识库给出可读提示
+    const diag = diagnoseByMessage(msg);
+    const detail = diag ? `（${diag.zh}${diag.hint ? '；' + diag.hint : ''}）` : '';
+    const notice = new Notice(
+      `BDNSync：网盘授权已失效或过期，点击「重新授权」恢复同步。${detail}`,
+      12000,
+    );
     notice.noticeEl.addEventListener('click', () => {
       this.openSettingsTab();
     });
@@ -1303,6 +1341,22 @@ export default class BDNSyncPlugin extends Plugin {
     this.nextAutoSyncAt = Date.now() + backoffMs;
 
     void this.syncNow('auto').then((r) => {
+      // #4.5 定时自动快照：同步成功后，若达到间隔则顺带生成一个快照点（备注含触发来源）
+      if (
+        r &&
+        r.ok &&
+        this.settings.autoSnapshot &&
+        this.settings.snapshotIntervalMinutes > 0 &&
+        Date.now() - this.lastSnapshotAt >= this.settings.snapshotIntervalMinutes * 60_000
+      ) {
+        this.lastSnapshotAt = Date.now();
+        void this.engine
+          ?.takeSnapshot(`定时自动快照（${new Date().toLocaleString()}）`)
+          .then((n) =>
+            this.logM('engine', 'info', 'info', `定时快照完成：${n} 个文件`),
+          )
+          .catch(() => {});
+      }
       if (r && !r.ok && !r.cancelled) {
         this.autoFailCount++;
         // 服务端故障/限流：进入长退避时给出低频友好提示（沉浸无感——
@@ -1319,6 +1373,33 @@ export default class BDNSyncPlugin extends Plugin {
     });
   }
 
+  /**
+   * #2.1 API 稳定性与容灾：轻量探查 list/upload/quota，落日志并评估是否需要降级。
+   * best-effort：任何异常都被吞掉，绝不阻断主同步。
+   */
+  private async runApiProbe(): Promise<void> {
+    if (this.disposing || !this.hasAuth()) return;
+    const api = this.makeApi();
+    const root = this.settings.remoteRoot;
+    const result = await probeHealth(api, root);
+    const summary = `API 探查：${result.ok ? '正常' : '异常'}（list=${result.listOk ? '✓' : '✗'}${result.quota ? ' quota=✓' : ' quota=✗'}${result.diagnose ? ` ${result.diagnose.zh}` : ''}）`;
+    this.logM('engine', 'info', result.ok ? 'info' : 'warn', summary);
+    if (!result.ok) {
+      const currentMode: 'cookies' | 'openapi' = this.settings.cookies || this.settings.bduss
+        ? 'cookies'
+        : 'openapi';
+      const { degrade, advice } = probeDegradationAdvice(result, currentMode);
+      if (advice) this.logM('engine', 'info', 'warn', `容灾建议：${advice}`);
+      // 仅在 OpenAPI 故障且存在 Cookie 凭证时，主动提示可切换（不自动切，避免误伤上传能力）
+      if (degrade && currentMode === 'openapi' && (this.settings.cookies || this.settings.bduss)) {
+        new Notice(
+          `BDNSync：OpenAPI 探测异常，建议临时切换至 Cookie 模式继续同步。详情见设置 → 连接。`,
+          8000,
+        );
+      }
+    }
+  }
+
   // ---------------- 面板 ----------------
 
   /**
@@ -1329,8 +1410,7 @@ export default class BDNSyncPlugin extends Plugin {
    */
   private closeSettingsIfOpen(): void {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const setting = (this.app as any).setting;
+      const setting = (this.app as unknown as { setting?: { close(): void } }).setting;
       if (setting && typeof setting.close === 'function') setting.close();
     } catch {
       /* 关闭设置页失败不影响同步 */
@@ -1382,8 +1462,9 @@ export default class BDNSyncPlugin extends Plugin {
 
   private openSettingsTab(): void {
     // Obsidian 内部 API：app.setting 未在公开类型中暴露，但运行时稳定存在
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const setting = (this.app as any).setting;
+    const setting = (this.app as unknown as {
+      setting?: { open(): void; openTabById(id: string): void };
+    }).setting;
     if (!setting) return;
     setting.open();
     if (typeof setting.openTabById === 'function') {
@@ -1663,6 +1744,7 @@ export default class BDNSyncPlugin extends Plugin {
         this.settings.deviceId,
         quota,
         this.settings.deleteStrategy,
+        this.logger,
       ),
     )?.open();
   }
@@ -1716,6 +1798,71 @@ export default class BDNSyncPlugin extends Plugin {
         });
       }),
     )?.open();
+  }
+
+  /** 构造脱敏诊断上下文（#3.7 一键复制诊断），供同步日志视图调用 */
+  buildDiagnosticContext(): DiagnosticContext {
+    return {
+      version: this.manifest.version,
+      platform: Platform.isMobile ? 'mobile' : 'desktop',
+      settings: this.settings,
+    };
+  }
+
+  async openCrossDeviceDashboard(): Promise<void> {
+    if (!this.settings.crossDeviceDashboardEnabled) {
+      new Notice('BDNSync：跨设备看板已在设置中关闭');
+      return;
+    }
+    if (!this.hasAuth()) {
+      new Notice('BDNSync：请先配置百度网盘连接');
+      return;
+    }
+    this.activateView(VIEW_TYPE_BDNSYNC_DASHBOARD);
+  }
+
+  /** P1-3.5 生成密钥文件模板（首行留空待填写密码），并设为密钥文件路径 */
+  async createKeyFileTemplate(): Promise<void> {
+    const path = this.settings.keyFilePath?.trim() || DEFAULT_KEY_FILE;
+    const content = keyFileTemplate('');
+    if (await this.app.vault.adapter.exists(path)) {
+      new Notice(`BDNSync：密钥文件已存在（${path}），未覆盖`);
+      return;
+    }
+    await this.app.vault.adapter.write(path, content);
+    this.settings.keyFilePath = path;
+    await this.saveSettings();
+    new Notice(`BDNSync：已生成密钥文件模板 ${path}，请编辑首行填入密码`);
+  }
+
+  /** P2-3.5 更改加密密码（重新加密）：弹出双密码输入，确认后委托引擎重加密 */
+  async openReEncrypt(): Promise<void> {
+    if (!this.settings.encryptionEnabled) {
+      new Notice('BDNSync：请先启用端到端加密');
+      return;
+    }
+    if (!this.settings.encryptionSalt) {
+      new Notice('BDNSync：加密盐尚未初始化，请先完成一次加密同步');
+      return;
+    }
+    new ReEncryptModal(this.app, async (newPassword) => {
+      const engine = this.engine;
+      if (!engine) {
+        new Notice('BDNSync：同步引擎尚未初始化');
+        return;
+      }
+      try {
+        const { reuploadCount } = await engine.reEncryptWith(newPassword);
+        this.settings.encryptionPassword = newPassword;
+        await this.saveSettings();
+        new Notice(
+          `BDNSync：密钥已更换，${reuploadCount} 个文件将在下次同步以新密码重新上传`,
+          8000,
+        );
+      } catch (e) {
+        new Notice(`BDNSync：改密失败：${(e as Error).message}`);
+      }
+    }).open();
   }
 
   async openConflictReport(): Promise<void> {

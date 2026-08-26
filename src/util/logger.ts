@@ -7,9 +7,10 @@
 //  - 整合筛选：时间范围 / 级别 / 模块 / 业务类型 / 关键字（支持正则）/ 含墓碑 / 排序
 //  - 导出：筛选结果 → 纯文本 或 JSON；支持单条导出与复制
 
-import type { LogFilter, LogLevel, LogModule, SyncLogEntry } from '../types';
+import type { BDNSyncSettings, LogFilter, LogLevel, LogModule, SyncLogEntry } from '../types';
 import { LogStore } from './log-store';
 import { redactSecrets } from '../baidu/api';
+import { diagnoseError } from './error-dict';
 
 /** 级别严重程度权重（越大越重要） */
 const LEVEL_WEIGHT: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -316,10 +317,126 @@ export class Logger {
     return JSON.stringify(e, null, 2);
   }
 
+  /** 导出为 CSV（#4.3 审计日志导出）：含表头，字段按 RFC 4180 转义 */
+  exportCsv(filter?: LogFilter): string {
+    const rows = this.query(filter ?? {});
+    const header = [
+      'time',
+      'level',
+      'module',
+      'type',
+      'path',
+      'message',
+      'bytesUp',
+      'bytesDown',
+      'durationMs',
+    ];
+    const lines = [header.join(',')];
+    for (const e of rows) {
+      lines.push(
+        [
+          new Date(e.time).toISOString(),
+          e.level,
+          e.module,
+          e.type,
+          e.path ?? '',
+          e.message,
+          e.bytesUp ?? '',
+          e.bytesDown ?? '',
+          e.durationMs ?? '',
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    }
+    return lines.join('\n') || 'time,level,module,type,path,message,bytesUp,bytesDown,durationMs';
+  }
+
+  /** 导出为 Markdown 表格（#4.3 审计日志导出），适合直接贴入笔记/Issue */
+  exportMarkdown(filter?: LogFilter): string {
+    const rows = this.query(filter ?? {});
+    if (!rows.length) return '_（无匹配日志）_';
+    const lines: string[] = [];
+    lines.push('# BDNSync 同步审计日志');
+    lines.push('');
+    lines.push(`> 导出时间：${new Date().toLocaleString()} 共 ${rows.length} 条`);
+    lines.push('');
+    lines.push('| 时间 | 级别 | 模块 | 类型 | 路径 | 说明 |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
+    for (const e of rows) {
+      const t = new Date(e.time).toLocaleString();
+      lines.push(
+        `| ${t} | ${LEVEL_LABEL[e.level]} | ${MODULE_LABEL[e.module]} | ${e.type} | ${mdCell(e.path ?? '')} | ${mdCell(e.message)} |`,
+      );
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * 生成「一键复制诊断信息」（#3.7 错误诊断与用户引导）。
+   * 收集：版本/平台/设置子集（敏感字段已脱敏）+ 最近错误分布 + 最近 N 条日志 + 可选样本错误诊断。
+   * 返回纯文本，可直接写入剪贴板。
+   */
+  exportDiagnostic(ctx: DiagnosticContext): string {
+    const lines: string[] = [];
+    lines.push('=== BDNSync 诊断信息 ===');
+    lines.push(`版本: ${ctx.version}`);
+    lines.push(`平台: ${ctx.platform}`);
+    lines.push(`时间: ${new Date().toLocaleString()}`);
+    lines.push('');
+    lines.push('--- 设置（已脱敏）---');
+    const s = ctx.settings;
+    lines.push(`authMode: ${s.authMode}`);
+    lines.push(`remoteRoot: ${s.remoteRoot || '(未设置)'}`);
+    lines.push(`syncMode: ${s.syncMode}`);
+    lines.push(`conflictStrategy: ${s.conflictStrategy}`);
+    lines.push(`encryptionEnabled: ${s.encryptionEnabled}`);
+    lines.push(`uploadConcurrency: ${s.uploadConcurrency} (adaptive=${s.adaptiveConcurrency})`);
+    lines.push(`deviceId: ${s.deviceId || '(未设置)'}`);
+    lines.push(`apiProbeEnabled: ${s.apiProbeEnabled}`);
+    lines.push('');
+    lines.push('--- 最近错误分布 ---');
+    const errs = this.query({ types: ['error'], minLevel: 'error' }).slice(0, 20);
+    if (!errs.length) lines.push('（无 error 级日志）');
+    else for (const e of errs) lines.push(`[${new Date(e.time).toLocaleString()}] ${e.message}${e.path ? ` (${e.path})` : ''}`);
+    if (ctx.sampleError != null) {
+      lines.push('');
+      lines.push('--- 样本错误诊断 ---');
+      const d = diagnoseError(ctx.sampleError as unknown);
+      lines.push(`分类: ${d.code} (${d.category})`);
+      lines.push(`说明: ${d.zh}`);
+      lines.push(`建议: ${d.hint}`);
+      lines.push(`可恢复: ${d.recoverable ? '是' : '否'}`);
+    }
+    lines.push('');
+    lines.push('--- 最近 30 条日志 ---');
+    const recent = this.query({ sort: 'desc' }).slice(0, 30).reverse();
+    for (const e of recent) lines.push(`[${new Date(e.time).toLocaleString()}] [${e.level}] ${e.type}: ${e.message}${e.path ? ` (${e.path})` : ''}`);
+    return lines.join('\n');
+  }
+
   /** 当前全部条目（供持久化 / 快照） */
   snapshot(): SyncLogEntry[] {
     return Array.from(this.index.values());
   }
+}
+
+/** 一键复制诊断所需的上下文（由调用方（main/settings）注入脱敏后的设置与版本信息） */
+export interface DiagnosticContext {
+  version: string;
+  platform: string;
+  settings: BDNSyncSettings;
+  sampleError?: unknown;
+}
+
+function csvCell(v: string | number): string {
+  const s = String(v ?? '');
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function mdCell(v: string): string {
+  return v.replace(/\|/g, '\\|').replace(/\n/g, ' ').slice(0, 300);
 }
 
 /** 解析日志 message 文本，拆分为「一句话结论 / 关键上下文 / 技术堆栈」三段。

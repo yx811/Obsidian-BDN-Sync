@@ -27,6 +27,7 @@ import {
   type RemoteDeleter,
 } from '../util/orphan-cleanup';
 import type { QuotaInfo } from '../baidu/api';
+import type { Logger } from '../util/logger';
 import {
   createBadge,
   createCard,
@@ -595,6 +596,129 @@ export class ConflictModal extends Modal {
 }
 
 /** 统计面板 */
+// ---------- P1-5.12 统计可视化（零依赖自绘 SVG） ----------
+const VIZ_COLORS = ['#4f8cff', '#36c08a', '#f5a623', '#e0699a', '#9b7bff', '#56c2e6'];
+
+function lastNDays(n: number): string[] {
+  const out: string[] = [];
+  const now = new Date();
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(now.getDate() - i);
+    out.push(`${d.getMonth() + 1}/${d.getDate()}`);
+  }
+  return out;
+}
+
+function svgLine(title: string, labels: string[], series: { color: string; vals: number[] }[]): string {
+  const W = 340,
+    H = 150,
+    P = 26;
+  const maxV = Math.max(1, ...series.flatMap((s) => s.vals));
+  const n = labels.length;
+  const x = (i: number) => P + (i * (W - 2 * P)) / Math.max(1, n - 1);
+  const y = (v: number) => H - P - (v / maxV) * (H - 2 * P);
+  const paths = series
+    .map((s) => {
+      const pts = s.vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+      return `<polyline fill="none" stroke="${s.color}" stroke-width="2" points="${pts}"/>`;
+    })
+    .join('');
+  const grid = [0.25, 0.5, 0.75, 1]
+    .map((g) => {
+      const gy = H - P - g * (H - 2 * P);
+      return `<line class="bdnsync-viz-axis" x1="${P}" y1="${gy}" x2="${W - P}" y2="${gy}"/>`;
+    })
+    .join('');
+  const xlabels = labels
+    .map((l, i) =>
+      i % 2 === 0
+        ? `<text class="bdnsync-viz-axis-label" x="${x(i).toFixed(1)}" y="${H - 8}" text-anchor="middle">${l}</text>`
+        : '',
+    )
+    .join('');
+  return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${title}</div><svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">${grid}${paths}${xlabels}</svg></div>`;
+}
+
+function svgPie(title: string, segs: { label: string; value: number; color: string }[]): string {
+  if (segs.length === 0)
+    return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${title}</div><div class="bdnsync-viz-empty">暂无数据</div></div>`;
+  const total = segs.reduce((a, s) => a + s.value, 0) || 1;
+  const R = 50,
+    cx = 60,
+    cy = 60;
+  let acc = 0;
+  const arcs = segs
+    .map((s) => {
+      const a0 = (acc / total) * Math.PI * 2 - Math.PI / 2;
+      acc += s.value;
+      const a1 = (acc / total) * Math.PI * 2 - Math.PI / 2;
+      const x0 = cx + R * Math.cos(a0),
+        y0 = cy + R * Math.sin(a0);
+      const x1 = cx + R * Math.cos(a1),
+        y1 = cy + R * Math.sin(a1);
+      const large = a1 - a0 > Math.PI ? 1 : 0;
+      return `<path d="M${cx},${cy} L${x0.toFixed(1)},${y0.toFixed(1)} A${R},${R} 0 ${large} 1 ${x1.toFixed(1)},${y1.toFixed(1)} Z" fill="${s.color}"/>`;
+    })
+    .join('');
+  const legend = segs
+    .map(
+      (s) =>
+        `<div class="bdnsync-viz-legend"><span style="background:${s.color}"></span>${s.label} ${formatBytes(s.value)}</div>`,
+    )
+    .join('');
+  return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${title}</div><svg viewBox="0 0 120 120" width="120" height="120">${arcs}</svg><div class="bdnsync-viz-legends">${legend}</div></div>`;
+}
+
+/** 聚合日志条目，生成「每日流量折线 / 耗时趋势 / 类型占比饼图」三张自绘 SVG */
+export function buildStatsSvgs(logger: Logger): string {
+  const entries = logger.snapshot();
+  const labels = lastNDays(14);
+  const today = new Date();
+  const midnight = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const dayIndex = (t: number) => {
+    const diff = Math.floor((midnight(today) - midnight(new Date(t))) / 86_400_000);
+    return 13 - diff; // 13=今天, 0=13天前
+  };
+  const up = new Array(14).fill(0);
+  const down = new Array(14).fill(0);
+  const durSum = new Array(14).fill(0);
+  const durCnt = new Array(14).fill(0);
+  const byExt = new Map<string, number>();
+  for (const e of entries) {
+    const i = dayIndex(e.time);
+    if (i < 0 || i > 13) continue;
+    if (e.type === 'upload' && e.bytesUp) up[i] += e.bytesUp;
+    if (e.type === 'download' && e.bytesDown) down[i] += e.bytesDown;
+    if (e.durationMs && e.durationMs > 0) {
+      durSum[i] += e.durationMs;
+      durCnt[i]++;
+    }
+    if (e.type === 'upload' && e.bytesUp && e.path) {
+      const m = /\.([a-z0-9]+)$/i.exec(e.path);
+      const ext = m ? m[1].toLowerCase() : '无扩展名';
+      byExt.set(ext, (byExt.get(ext) ?? 0) + e.bytesUp);
+    }
+  }
+  const durAvg = durSum.map((s, i) => (durCnt[i] ? Math.round(s / durCnt[i] / 1000) : 0));
+  const topExt = [...byExt.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const pieSegs = topExt.map(([ext, v], i) => ({
+    label: '.' + ext,
+    value: v,
+    color: VIZ_COLORS[i % VIZ_COLORS.length],
+  }));
+
+  const line1 = svgLine('每日上传 / 下载流量（近 14 天）', labels, [
+    { color: VIZ_COLORS[0], vals: up },
+    { color: VIZ_COLORS[1], vals: down },
+  ]);
+  const line2 = svgLine('同步耗时趋势（秒/天，近 14 天）', labels, [
+    { color: VIZ_COLORS[2], vals: durAvg },
+  ]);
+  const pie = svgPie('上传文件类型占比', pieSegs);
+  return `<div class="bdnsync-viz-grid">${line1}${line2}${pie}</div>`;
+}
+
 export class StatsModal extends Modal {
   constructor(
     app: App,
@@ -605,6 +729,7 @@ export class StatsModal extends Modal {
     private deviceId: string,
     private quota: QuotaInfo | null,
     private deleteStrategy: DeleteStrategy,
+    private logger?: Logger,
   ) {
     super(app);
     this.modalEl.addClass('bdnsync-modal', 'bdnsync-stats-modal');
@@ -654,6 +779,12 @@ export class StatsModal extends Modal {
         ratio,
         `${formatBytes(this.quota.used)} / ${formatBytes(this.quota.total)}（剩余 ${formatBytes(this.quota.free)}）`,
       );
+    }
+
+    // P1-5.12 统计可视化（零依赖自绘 SVG）：每日上传/下载流量折线、耗时趋势、按类型占比饼图
+    if (this.logger) {
+      const viz = body.createDiv({ cls: 'bdnsync-stats-viz' });
+      viz.innerHTML = buildStatsSvgs(this.logger);
     }
 
     const foot = shell.createDiv({ cls: 'bdnsync-modal-foot' });
@@ -1414,8 +1545,9 @@ export class OrphanCleanupModal extends Modal {
       if (this.opts.autoMode) {
         const text = `orphan 巡检：未发现需清理的孤儿备份（${statsText}），不弹窗`;
         // 与 engine.ts:248 同样的延迟 require 兜底——避免模块顶层依赖 obsidian
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const NoticeCtor = (globalThis as any).require?.('obsidian')?.Notice;
+        const NoticeCtor: typeof Notice | undefined = (globalThis as {
+          require?: (m: string) => { Notice?: typeof Notice } | undefined;
+        }).require?.('obsidian')?.Notice;
         if (NoticeCtor) new NoticeCtor(text, 4000);
         this.phase = 'done';
         this.close();

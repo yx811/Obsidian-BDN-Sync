@@ -2,9 +2,64 @@
 
 本文件记录 BDNSync 的所有版本变更。版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-> 📌 最新版本：**1.0.3**（2026-08-26）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+> 📌 最新版本：**1.0.4**（2026-08-26）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
 
 ---
+
+## [Unreleased]
+
+## [1.0.4] - 2026-08-26
+
+### 新增：跨设备同步看板（独立标签页）
+- 将原本的 `CrossDeviceDashboardModal`（轮询式聚合表格）升级为独立 Obsidian 工作区标签页 `CrossDeviceDashboardView`（ItemView），可与笔记并列/拖拽、常驻查看，避免弹窗裁切。
+- 命令面板新增「跨设备同步状态看板」，点击后在工作区打开看板标签页。
+- 看板一次性展示三类信息：
+  - **云端状态**：连接/未连接徽标、百度网盘账号名、配额占用 SVG 环形图（已用/总量/剩余，>95% 警告）、上次同步时间。
+  - **本机在线状态**：工具栏实时显示本机 `navigator.onLine` 在线/离线，并监听 `online`/`offline` 事件即时更新。
+  - **所有设备**：从本地索引按 `byDevice` 聚合，卡片展示设备名（本机高亮）、文件数、占用、最近活跃；远端设备据最近同步时间推测活跃度（活跃/近期未同步/长时间未同步）并明确标注「推测」。
+- 底部汇总栏：总文件数 / 总占用 / 在线设备三枚统计卡片，与设备区形成完整信息闭环。
+- 自动轻量轮询（每 15s 重算本地索引聚合，无网络往返）；「刷新」按钮触发云端状态网络查询；`onClose` 清理定时器与事件监听。
+
+### 视觉：画布式拓扑 + 中式审美 + 主题自适应
+- 看板采用**画布式拓扑布局**：云端作为中心枢纽，设备以视觉卡片网格分布，增强一眼辨识同步拓扑的能力。
+- **中式审美配色**：低饱和传统色系（霁蓝/竹青/朱砂/琥珀），卡片留白充裕、阴影轻淡。
+- **全彩视觉元素**：云端圆环徽标（渐变描边 + 光晕 + 涟漪脉冲）、SVG 环形配额图、设备平台图标、状态色左侧边条、本机高亮边框。
+- **主题自适应**：云端/成功/警告/错误等关键色优先跟随 Obsidian 主题变量（`--interactive-accent`、`--text-success`、`--text-warning`、`--text-error`），通过 `color-mix` 生成柔和背景 tint；toolbar/卡片/内嵌面板统一使用 `--background-secondary` / `--background-primary` 分层，避免深色主题下黑白相间；阴影保持可见但不突兀。
+- **响应式适配**：桌面端自动多列网格，移动端 ≤720px 单列，≤420px 隐藏标题文字并纵向堆叠指标。
+- **无障碍**：保留文本状态标签（不依赖颜色）、支持 `prefers-reduced-motion` 关闭脉冲与过渡动画。
+
+### 安全与健壮性加固
+- **S1 安全**：`SyncEngine.writeLocalFile` 新增路径穿越守卫——拒绝任何含 `..` 段（父目录）的 `relPath` 并以抛错阻断（而非静默跳过），防止伪造/被篡改的远端索引越界写出 vault。
+- **S2 安全**：`redactSecrets` 词表增补 `encryptionPassword`，与 `secrets.ts` 的 `SECRET_KEYS` 保持一致，日志脱敏覆盖更完整。
+- **Q1 代码质量**：收紧 `main.ts` / `sync/engine.ts` / `ui/modals.ts` / `util/md5.ts` 中的 `as any` 类型逃逸——改为精确接口与 `unknown` 中转，移除冗余 eslint-disable。
+- **R1 健壮性**：启动后一次性 `setTimeout(runApiProbe, 15s)` 改用 `registerInterval` 托管，确保 `onunload` 时自动清理。
+
+### 生命周期清理修复（发布前审查）
+- `main.ts`：移除 `onload` 中重复的 `StreamServer` 启动块，避免布局就绪时创建两个流式代理实例、卸载时只关停一个导致端口泄漏。
+- `main.ts`：`onunload` 增加 `detachLeavesOfType(VIEW_TYPE_BDNSYNC_DASHBOARD)`，确保跨设备看板标签页在插件卸载时一并关闭。
+- `main.ts`：`onunload` 清理 `backlinkRebuildTimer` 防抖定时器，避免在已卸载实例上执行反向引用重建。
+- `main.ts`：`onunload` 调用 `statusBar.unmount()`，移除状态栏 DOM 与内部超时。
+- `main.ts`：调整 `disposing` 置位时机，先发起 `watcher.flush()` 再标记卸载，使卸载前尽力同步真正有机会执行（仍受 startup 全量兜底保护）。
+
+### 代码审查与视觉打磨
+
+交付前对全模块（51 个源文件）做系统性审查，识别并修复缺陷、冗余与性能问题，并对新增前端界面做视觉统一：
+
+- **缺陷修复（高优先级）**
+  - `util/log-store.ts`：修复 `loadRecent` / `purge` 对 `adapter.list()` 返回结构误用 `Object.keys(listed)` 遍历 `{files,folders}` 键名（而非真实路径）的致命 bug——日志永久无法从磁盘重载、保留期清理与墓碑物理清除长期失效；改为遍历 `listed.files` / `listed.folders`
+  - `main.ts`：`onunload` 显式调用 `retryQueue.stopPoll()`，修复后台重试定时器（`window.setInterval`，非 Obsidian `registerInterval`）在插件卸载后持续触发同步的泄漏
+  - `sync/engine.ts`：`doUpload` 的 `catch` 新增 `errno=31326` 容量不足短路，与下载侧一致，避免仅上传场景下逐个报错刷屏
+- **缺陷修复（中/低）**
+  - `ui/media-player.ts`：`destroy()` 显式移除 `mousemove` / `mouseup` 的 window 级监听，修复反复打开/关闭媒体播放器累积全局监听的泄漏
+  - `ui/cross-device-dashboard.ts`：移除表头创建后立即 `empty()` 重建的无效占位 DOM
+  - `util/misc.ts`：`conflictName` 化简相互抵消的冗余切片算式
+- **冗余清理与功能完善**
+  - `sync/conflict-resolver.ts`：将长期处于「已导出但未接线」的 `mergeFrontmatter` 接入 `.md` 冲突的 smart-merge，真正实现 #4.8 Markdown frontmatter 字段级合并（正文保持不变），消除死代码
+- **视觉打磨（新增前端界面）**
+  - 补齐 `.bdnsync-table`（跨设备看板表格）、`.bdnsync-error-text`（改密错误）、`.bdnsync-muted`（静默文本）等缺失样式
+  - 统计可视化：`.bdnsync-viz-grid` 改为 `repeat(auto-fit, minmax(260px,1fr))` 响应式布局，卡片增加表面/边框/阴影/悬停过渡；SVG 坐标轴与标签改用主题变量统一配色
+  - 统计/预览卡片增加 `hover` 过渡；新增 `@media (max-width:640px)` 窄屏适配（栅格降列、表格横向滚动、分栏堆叠）
+- **验证**：`tsc -noEmit` 0 错误 · `esbuild production` 通过 · `vitest` 全绿（249/249）
 
 ## [1.0.3] - 2026-08-26
 

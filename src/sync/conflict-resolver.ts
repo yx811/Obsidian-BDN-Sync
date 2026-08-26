@@ -3,7 +3,7 @@
 import type { ConflictKind, ConflictStrategy } from '../types';
 import { conflictName, isTextPath } from '../util/misc';
 import { threeWayMerge, unionMerge } from '../util/diff3';
-import { classifyConfigPath, mergeConfigTexts } from '../util/config-merge';
+import { classifyConfigPath, mergeConfigTexts, classifyCanvasPath, mergeCanvasTexts, mergeFrontmatter } from '../util/config-merge';
 
 export interface ConflictInput {
   path: string;
@@ -128,7 +128,63 @@ export class ConflictResolver {
               );
             }
           }
+          // —— #4.8 Canvas / Excalidraw 节点级三方合并（结构化，非整文件 diff3）——
+          const canvasKind = classifyCanvasPath(path);
+          if (canvasKind) {
+            const totalBytesCv = localBytes.length + remoteBytes.length + (baseBytes?.length ?? 0);
+            if (totalBytesCv > MERGE_MAX_BYTES) {
+              return forkRemoteCopy(
+                remoteBytes,
+                `Canvas 体量超过 ${Math.round(MERGE_MAX_BYTES / 1024)} KB 未做自动合并：分叉保留双方`,
+              );
+            }
+            const localText = decodeStrict(localBytes);
+            const remoteText = decodeStrict(remoteBytes);
+            const baseText = baseBytes ? decodeStrict(baseBytes) : null;
+            const localNewer = (input.localMtime ?? 0) >= (input.remoteMtime ?? 0);
+            if (localText !== null && remoteText !== null && baseText !== null) {
+              const cv = mergeCanvasTexts(canvasKind, localText, remoteText, baseText, localNewer);
+              if (cv.merged !== null) {
+                return {
+                  action: 'write-and-upload',
+                  localBytes: new TextEncoder().encode(restoreLineEndings(cv.merged, localText)),
+                  uploadOriginal: true,
+                  conflictCopies: [],
+                  hasMarkers: cv.hasConflict,
+                  note: cv.hasConflict
+                    ? `Canvas 节点级合并：元素 ${cv.conflictIds.join('、')} 两端不同，已按最后写入取用（可在冲突副本回滚）`
+                    : '已按节点级三方合并 Canvas',
+                };
+              }
+            }
+            return forkRemoteCopy(remoteBytes, 'Canvas 解析失败或缺少 base，已按分叉保留双方版本');
+          }
+          // —— #4.8 Markdown frontmatter 字段级合并 ——
+          // 两端都有 YAML frontmatter 时，用字段级合并（而非整文件 diff3），避免「字段互相独立
+          // 却被当成整体冲突」；正文保持不变。仅一端有 frontmatter 或解析失败时回落到下方 diff3。
+          // 体量超过上限时直接跳过本分支（下方会按超大文本分叉），避免主线程卡顿。
           const totalBytes = localBytes.length + remoteBytes.length + (baseBytes?.length ?? 0);
+          const lowerPath = path.toLowerCase();
+          if (lowerPath.endsWith('.md') && totalBytes <= MERGE_MAX_BYTES) {
+            const lt = decodeStrict(localBytes);
+            const rt = decodeStrict(remoteBytes);
+            if (lt !== null && rt !== null) {
+              const localNewer = (input.localMtime ?? 0) >= (input.remoteMtime ?? 0);
+              const fm = mergeFrontmatter(lt, rt, localNewer);
+              if (fm.merged !== null) {
+                return {
+                  action: 'write-and-upload',
+                  localBytes: new TextEncoder().encode(restoreLineEndings(fm.merged, lt)),
+                  uploadOriginal: true,
+                  conflictCopies: [],
+                  hasMarkers: fm.hasConflict,
+                  note: fm.hasConflict
+                    ? `frontmatter 字段 ${fm.conflictKeys.join('、')} 两端不同，已按最后写入取用`
+                    : '已按字段级合并 Markdown frontmatter（正文保持不变）',
+                };
+              }
+            }
+          }
           if (isTextPath(path) && totalBytes <= MERGE_MAX_BYTES) {
             const localText = decodeStrict(localBytes);
             const remoteText = decodeStrict(remoteBytes);

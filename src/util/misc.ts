@@ -1,5 +1,6 @@
 // 通用工具：路径、glob 过滤、格式化、重试退避等
 
+import { Platform } from 'obsidian';
 import type { BDNSyncSettings } from '../types';
 
 export function sleep(ms: number): Promise<void> {
@@ -68,7 +69,7 @@ export function conflictName(path: string, origin: 'LOCAL' | 'REMOTE'): string {
   const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/') + 1) : '';
   const base =
     idx > dir.length
-      ? path.slice(dir.length, idx - dir.length + dir.length)
+      ? path.slice(dir.length, idx)
       : path.slice(dir.length);
   const ext = idx > dir.length ? path.slice(idx) : '';
   return `${dir}${base}.conflict-${ts}-${origin}${ext}`;
@@ -153,14 +154,27 @@ const ALWAYS_EXCLUDE = [
   // 是插件内部数据，绝不参与同步比对、删除传播或 orphan 识别。
   /^\.bdnsync-base\/.*/,
   /^\.bdnsync-merge-draft\/.*/,
+  // 空目录占位符（#3.8）：仅存在于远端索引/偶发落盘，绝不参与正常比对，避免删除传播循环。
+  /^\.bdnsync-empty-.*/,
+  // 密钥文件（#3.5）：含密码源，严禁被同步上云泄露。
+  /^\.bdnsync-key(\.|$)/,
 ];
+
+/** 空目录占位符文件名前缀（#3.8）：位于某目录下时，表示该目录在远端应保留为空目录 */
+export const EMPTY_DIR_MARKER_PREFIX = '.bdnsync-empty-';
+/** 密钥文件名（#3.5）：vault 内约定文件作为密码源 */
+export const KEY_FILE_NAME = '.bdnsync-key';
 
 export class PathFilter {
   private regexes: RegExp[] = [];
+  private includeRegexes: RegExp[] = [];
 
   constructor(private settings: BDNSyncSettings) {
     for (const p of settings.excludePatterns || []) {
       if (p.trim()) this.regexes.push(globToRegExp(p));
+    }
+    for (const p of settings.includePatterns || []) {
+      if (p.trim()) this.includeRegexes.push(globToRegExp(p));
     }
   }
 
@@ -168,6 +182,10 @@ export class PathFilter {
   isExcluded(path: string): boolean {
     const p = path.replace(/\\/g, '/');
     if (ALWAYS_EXCLUDE.some((re) => re.test(p))) return true;
+    // 选择性同步白名单（#4.2）：include 非空时仅放行命中项
+    if (this.includeRegexes.length > 0) {
+      return !this.includeRegexes.some((re) => re.test(p));
+    }
     if (!this.settings.syncConfigDir && (p === '.obsidian' || p.startsWith('.obsidian/')))
       return true;
     if (this.settings.syncConfigDir) {
@@ -181,10 +199,45 @@ export class PathFilter {
     return this.regexes.some((re) => re.test(p));
   }
 
+  /** 选择性同步：该路径是否被白名单命中（用于 UI 提示） */
+  isIncluded(path: string): boolean {
+    const p = path.replace(/\\/g, '/');
+    if (this.includeRegexes.length === 0) return true;
+    return this.includeRegexes.some((re) => re.test(p));
+  }
+
   isOversized(sizeBytes: number): boolean {
     const max = this.settings.maxFileSizeMB * 1024 * 1024;
     return sizeBytes > max;
   }
+
+  /** 是否超过「大文件独立通道」阈值（#4.7）。0 = 不启用 */
+  isLargeFile(sizeBytes: number): boolean {
+    if (!this.settings.largeFileThresholdMB) return false;
+    return sizeBytes > this.settings.largeFileThresholdMB * 1024 * 1024;
+  }
+}
+
+/**
+ * 移动端平台默认参数（#2.2 移动端适配与性能）。
+ * 移动端内存/算力受限，按平台下调并发与分片，避免卡顿与 OOM。
+ * 桌面端原样返回。调用方应在 loadData 合并 DEFAULT_SETTINGS 之后调用，
+ * 直接改写传入对象（不改动 DEFAULT_SETTINGS 常量）。
+ */
+export function applyMobileDefaults(s: BDNSyncSettings): BDNSyncSettings {
+  if (Platform.isMobile) {
+    s.uploadConcurrency = Math.min(s.uploadConcurrency || 3, 2);
+    s.downloadConcurrency = Math.min(s.downloadConcurrency || 3, 2);
+    s.chunkSizeMB = Math.min(s.chunkSizeMB || 8, 4);
+    s.stormThreshold = Math.min(s.stormThreshold || 200, 100);
+    // 移动端后台会被系统挂起，探查/快照调度 best-effort：保留开关但缩短间隔意义不大，维持默认
+  }
+  return s;
+}
+
+/** 是否处于移动端（供 UI 展示「移动端支持矩阵」状态） */
+export function isMobilePlatform(): boolean {
+  return Platform.isMobile;
 }
 
 /** 简单文本文件扩展名集合（用于智能合并判定） */

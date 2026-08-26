@@ -942,12 +942,15 @@ export function mountMediaPlayer(
     ev.preventDefault();
     startDrag(ev.clientX);
   });
-  window.addEventListener('mousemove', (ev) => {
+  // 命名引用：destroy 时需显式移除 window 级监听，否则每次打开/关闭播放器都会累积全局监听（泄漏）
+  const onWinMove = (ev: MouseEvent) => {
     if (dragging) moveDrag(ev.clientX);
-  });
-  window.addEventListener('mouseup', (ev) => {
+  };
+  const onWinUp = (ev: MouseEvent) => {
     if (dragging) endDrag(ev.clientX);
-  });
+  };
+  window.addEventListener('mousemove', onWinMove);
+  window.addEventListener('mouseup', onWinUp);
   seek.addEventListener('mousemove', (ev) => showHoverTip(ev.clientX));
   seek.addEventListener('mouseleave', () => {
     hideHoverTip();
@@ -1153,6 +1156,8 @@ export function mountMediaPlayer(
   return {
     destroy(): void {
       document.removeEventListener('fullscreenchange', onFsChange);
+      window.removeEventListener('mousemove', onWinMove);
+      window.removeEventListener('mouseup', onWinUp);
       if (hideUiTimer) clearTimeout(hideUiTimer);
       if (clickTimer) clearTimeout(clickTimer);
       saveTime(el.currentTime);

@@ -224,16 +224,6 @@ export async function downloadToVault(
   }
 }
 
-/**
- * 统一的预览入口（已废弃）：曾经的 Modal 弹窗版本，现在统一改用
- * preview-view.ts 的 openFilePreviewInLeaf，在主内容区 ItemView 中打开。
- *
- * 保留仅作历史导出，调用方会得到一个 console.warn。
- */
-export function openFilePreview(_app: App, _plugin: BDNSyncPlugin, _t: PreviewTarget): void {
-  console.warn('[BDNSync] openFilePreview 已废弃，请改用 openFilePreviewInLeaf（preview-view.ts）');
-}
-
 // ---- 通用下载动作行 ----
 
 function buildActionBar(host: HTMLElement, plugin: BDNSyncPlugin, t: PreviewTarget): void {

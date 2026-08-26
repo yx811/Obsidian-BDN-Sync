@@ -1,24 +1,35 @@
 // MD5 实现：桌面端优先使用 Node crypto，否则回退纯 JS 实现（RFC 1321）
 
+// 仅在运行时通过 CJS require 获取 Node crypto（避免模块顶层硬依赖 obsidian/node）。
+// 以下具体接口用于收紧此前 `as any` 的类型逃逸，并规避可选方法导致的类型塌缩为 unknown。
+interface NodeHash {
+  update(chunk: Buffer): NodeHash;
+  digest(encoding: string): string;
+}
+interface NodeCryptoModule {
+  createHash(algorithm: string): NodeHash;
+}
+type CjsRequire = (id: string) => NodeCryptoModule | undefined;
+
+/** 在运行时按环境取 CJS require（桌面端 globalThis/window 上的 Obsidian 注入），无则 undefined。 */
+function getCjsRequire(): CjsRequire | undefined {
+  const g = globalThis as { require?: CjsRequire };
+  if (typeof g.require === 'function') return g.require;
+  if (typeof window !== 'undefined') {
+    const w = window as unknown as { require?: CjsRequire };
+    if (typeof w.require === 'function') return w.require;
+  }
+  return undefined;
+}
+
 function md5ViaNodeCrypto(data: Uint8Array): string | null {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const w = globalThis as any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const req =
-      typeof w.require === 'function'
-        ? w.require
-        : typeof window !== 'undefined'
-          ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (window as any).require
-          : undefined;
-    if (typeof req === 'function') {
-      const nodeCrypto = req('crypto');
-      if (nodeCrypto && nodeCrypto.createHash) {
-        const buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-        return nodeCrypto.createHash('md5').update(buf).digest('hex');
-      }
-    }
+    const req = getCjsRequire();
+    if (typeof req !== 'function') return null;
+    const nodeCrypto: NodeCryptoModule | undefined = req('crypto');
+    if (!nodeCrypto || typeof nodeCrypto.createHash !== 'function') return null;
+    const buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    return nodeCrypto.createHash('md5').update(buf).digest('hex');
   } catch (_e) {
     // ignore → 纯 JS 回退
   }
@@ -121,24 +132,13 @@ export function md5HexOf(chunks: Uint8Array[]): string {
 
 function md5ViaNodeCryptoOfChunks(chunks: Uint8Array[]): string | null {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const w = globalThis as any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const req =
-      typeof w.require === 'function'
-        ? w.require
-        : typeof window !== 'undefined'
-          ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (window as any).require
-          : undefined;
-    if (typeof req === 'function') {
-      const nodeCrypto = req('crypto');
-      if (nodeCrypto && nodeCrypto.createHash) {
-        const h = nodeCrypto.createHash('md5');
-        for (const c of chunks) h.update(Buffer.from(c.buffer, c.byteOffset, c.byteLength));
-        return h.digest('hex');
-      }
-    }
+    const req = getCjsRequire();
+    if (typeof req !== 'function') return null;
+    const nodeCrypto: NodeCryptoModule | undefined = req('crypto');
+    if (!nodeCrypto || typeof nodeCrypto.createHash !== 'function') return null;
+    const h = nodeCrypto.createHash('md5');
+    for (const c of chunks) h.update(Buffer.from(c.buffer, c.byteOffset, c.byteLength));
+    return h.digest('hex');
   } catch (_e) {
     /* ignore */
   }
@@ -157,8 +157,9 @@ export async function md5HexAsync(data: Uint8Array): Promise<string> {
   // 优先同步快路径（桌面端 Node crypto / 小数据）
   const fast = md5ViaNodeCrypto(data);
   if (fast) return fast;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const subtle = (globalThis as any).crypto?.subtle as SubtleCrypto | undefined;
+  const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle as
+    | SubtleCrypto
+    | undefined;
   if (subtle?.digest) {
     try {
       const buf = await subtle.digest('MD5', data);

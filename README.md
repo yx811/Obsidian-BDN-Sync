@@ -6,6 +6,8 @@
 
 > ⚠️ 使用前请阅读 **[免责协议](免责协议.md)**。同步软件涉及数据覆盖与删除操作，请确认你已理解并自担风险。
 
+> 🆕 **v1.0.4 已发布**：新增「跨设备同步状态看板」独立标签页（画布式拓扑 + 中式审美 + 深色/浅色主题自适应），并补充路径穿越防御、日志脱敏增强、`onunload` 生命周期清理等加固。详见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/RELEASE-v1.0.4.md](docs/RELEASE-v1.0.4.md)。
+
 ---
 
 ## 目录
@@ -140,6 +142,9 @@
 |              | 墓碑清理  | 后台自动清理过期日志条目                               |
 | **网盘孤儿备份清理** | 智能识别  | 识别网盘「vault 名_时间戳段」型疑似孤儿备份（非当前插件写入）         |
 |              | 安全清理  | 严格 1 层扫描、零信任、用户逐项确认；支持全选/清除、失败重试与 errno 诊断 |
+| **跨设备同步状态看板** | 画布式拓扑 | 独立标签页展示云端枢纽 + 设备卡片网格，一眼辨识同步拓扑           |
+|              | 主题自适应 | 关键色跟随 Obsidian 主题变量与 `color-mix` tint，深/浅色均协调、不黑白相间 |
+|              | 实时状态  | 工具栏显示本机在线/离线并监听事件；底部汇总总文件/占用/在线设备        |
 
 ### 实验功能（Lab 特性）
 
@@ -230,7 +235,8 @@ bdnsync/
 │   │   └── views/
 │   │       ├── netdisk-browser-view.ts   # 网盘浏览器视图（标签页）
 │   │       ├── sync-log-view.ts          # 同步日志视图（标签页）
-│   │       └── preview-view.ts           # 文件预览视图（标签页）
+│   │       ├── preview-view.ts           # 文件预览视图（标签页）
+│   │       └── cross-device-dashboard-view.ts # 跨设备同步状态看板视图（标签页）
 │   ├── lab/                        # 实验功能
 │   │   ├── media-bridge.ts         # bdn:// 媒体直嵌
 │   │   ├── backlinks.ts            # 反向引用索引
@@ -901,6 +907,7 @@ BDNSync 对「没有内容的文件/目录」采取与平台限制一致的处�
 | `bdnsync-snapshots`       | 整库快照与回滚   | 管理快照点，执行回滚      |
 | `bdnsync-conflict-report` | 查看冲突处理报告  | 最近同步的冲突处理明细     |
 | `bdnsync-orphan-cleanup`  | 扫描并清理网盘备份 | 识别并安全清理疑似孤儿备份目录 |
+| `bdnsync-cross-device-dashboard` | 跨设备同步状态看板 | 打开独立标签页查看云端/本机/各设备同步状态 |
 | `bdnsync-insert-bdn-ref`  | 插入网盘媒体引用  | 生成 `bdn://` 引用  |
 
 此外还有：
@@ -1216,6 +1223,24 @@ BDNSync 支持 Obsidian 1.13.7 及以上版本。插件本身可安装于桌面�
 - 📝 [更新日志](CHANGELOG.md)
 - 🐛 [提交 Bug 或功能请求](https://github.com/yx811/Obsidian-BDN-Sync/issues/new)
 - 💬 [讨论区](https://github.com/yx811/Obsidian-BDN-Sync/discussions)
+
+---
+
+## 移动端支持矩阵（#2.2）
+
+> 本插件 `manifest.json` 声明 `isDesktopOnly: false`，**移动端（Android / iOS）核心同步可用**；下表列出各能力在移动端的支持状态与注意事项。
+
+| 能力 | 移动端支持 | 说明 |
+| --- | --- | --- |
+| 双向同步（上传/下载/删除） | ✅ | 核心链路走 `requestUrl`，桌面/移动端通用 |
+| OpenAPI 设备码授权 | ✅（需扫码） | 授权页为 Web，移动端浏览器可完成设备码扫码 |
+| Cookie 模式 | ⚠️ | 需手动粘贴 Cookie，移动端无桌面浏览器便利 |
+| 媒体直嵌（`bdn://`） | ✅（降级） | 桌面走流式代理；移动端走内存 Blob，大文件降级为「点击下载后查看」 |
+| 端到端加密 / 断点续传 | ✅ | 复用 Web Crypto / 分片续传 |
+| 自动探查 / 定时快照 | ⚠️ best-effort | 移动端后台会被系统挂起，调度仅在前台有效 |
+| 性能参数 | 自动下调 | 安装时按平台默认下调并发/分片（见 `applyMobileDefaults`），可在设置中手动调整 |
+
+**已验证建议**：在真机（Android / iOS）各跑通一次完整上传/下载 + `bdn://` 预览后再投入日常使用。
 
 ---
 

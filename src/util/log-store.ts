@@ -73,7 +73,7 @@ export class LogStore {
 
     // 筛选出 retentionDays 范围内的日期目录
     const dateDirs = new Set<string>();
-    for (const path of Object.keys(listed)) {
+    for (const path of [...(listed.files ?? []), ...(listed.folders ?? [])]) {
       // path 形如 logsDir/2026-03-20/2026-03-20.json
       const rel = path.slice(this.logsDir.length + 1); // 去掉前缀 + 斜杠
       const seg = rel.split('/');
@@ -222,7 +222,7 @@ export class LogStore {
         listed = {};
       }
       const dateDirs: Record<string, string> = {}; // date -> dirPath
-      for (const path of Object.keys(listed)) {
+      for (const path of [...(listed.files ?? []), ...(listed.folders ?? [])]) {
         const rel = path.slice(this.logsDir.length + 1);
         const seg = rel.split('/');
         if (seg.length >= 2 && /^\d{4}-\d{2}-\d{2}$/.test(seg[0])) {
@@ -236,7 +236,7 @@ export class LogStore {
           const dirPath = dateDirs[date];
           try {
             const dirList = await this.adapter.list(dirPath);
-            for (const f of Object.keys(dirList)) {
+            for (const f of dirList.files ?? []) {
               await this.adapter.remove(f).catch(() => {});
             }
             removedDays += 1;
@@ -256,7 +256,7 @@ export class LogStore {
         listed = {};
       }
       const dateDirs = new Set<string>();
-      for (const path of Object.keys(listed)) {
+      for (const path of [...(listed.files ?? []), ...(listed.folders ?? [])]) {
         const rel = path.slice(this.logsDir.length + 1);
         const seg = rel.split('/');
         if (seg.length >= 2 && /^\d{4}-\d{2}-\d{2}$/.test(seg[0])) dateDirs.add(seg[0]);

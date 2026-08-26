@@ -4,7 +4,7 @@
 
 import { ItemView, WorkspaceLeaf, Notice } from 'obsidian';
 import type { LogLevel, LogFilter, LogModule, SyncLogEntry } from '../../types';
-import { LEVEL_LABEL, MODULE_LABEL, Logger, parseLogMessage } from '../../util/logger';
+import { LEVEL_LABEL, MODULE_LABEL, Logger, parseLogMessage, type DiagnosticContext } from '../../util/logger';
 import { createIconButton, createModalHeader, showConfirmModal, setIcon, type IconName } from '../components';
 
 export const VIEW_TYPE_BDNSYNC_LOG = 'bdnsync-log';
@@ -45,6 +45,7 @@ export class SyncLogView extends ItemView {
   constructor(
     leaf: WorkspaceLeaf,
     private logger: Logger,
+    private diagCtx: () => DiagnosticContext,
   ) {
     super(leaf);
   }
@@ -219,6 +220,15 @@ export class SyncLogView extends ItemView {
       },
     });
     createIconButton(footer, {
+      icon: 'info',
+      label: '复制诊断',
+      title: '一键复制脱敏诊断信息（版本/平台/设置摘要/最近错误），便于反馈问题',
+      onClick: async () => {
+        await navigator.clipboard.writeText(this.logger.exportDiagnostic(this.diagCtx()));
+        new Notice('BDNSync：诊断信息已复制到剪贴板');
+      },
+    });
+    createIconButton(footer, {
       icon: 'file-json',
       label: '导出 JSON',
       onClick: async () => {
@@ -234,6 +244,25 @@ export class SyncLogView extends ItemView {
         const txt = this.logger.exportText(this.buildFilter());
         await this.downloadFile('bdnsync-logs.txt', txt, 'text/plain');
         new Notice('BDNSync：已导出文本日志');
+      },
+    });
+    // #4.3 审计日志导出：CSV（Excel 友好）与 Markdown（可读性）
+    createIconButton(footer, {
+      icon: 'file-spreadsheet',
+      label: '导出 CSV',
+      onClick: async () => {
+        const csv = this.logger.exportCsv(this.buildFilter());
+        await this.downloadFile('bdnsync-logs.csv', csv, 'text/csv;charset=utf-8');
+        new Notice('BDNSync：已导出 CSV 审计日志');
+      },
+    });
+    createIconButton(footer, {
+      icon: 'file-text',
+      label: '导出 MD',
+      onClick: async () => {
+        const md = this.logger.exportMarkdown(this.buildFilter());
+        await this.downloadFile('bdnsync-logs.md', md, 'text/markdown');
+        new Notice('BDNSync：已导出 Markdown 审计日志');
       },
     });
 

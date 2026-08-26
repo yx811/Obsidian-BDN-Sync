@@ -226,3 +226,246 @@ export function mergeConfigTexts(
     strategy: 'field-merge',
   };
 }
+
+// ---------------- Markdown Frontmatter 结构化合并（#4.8 插件生态集成） ----------------
+//
+// 仅做「顶层 key 级」合并，绝不递归深度合并嵌套对象（YAML 嵌套语义复杂，深度合并
+// 极易破坏用户手写 frontmatter）。非标量/列表块统一按整块 LWW。合并失败（解析异常）
+// 返回 null，交由调用方走「保留双方 / 回滚」。
+
+export interface FrontmatterMergeResult {
+  /** 合并后的完整文档（含 body）。null = 无法合并 */
+  merged: string | null;
+  hasConflict: boolean;
+  conflictKeys: string[];
+}
+
+/** 解析 YAML frontmatter：返回 { fm: 行数组（已去缩进块归属）, body }；无 frontmatter 返回 null */
+function parseFrontmatter(text: string): { lines: string[]; body: string } | null {
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!m) return null;
+  const fmBlock = m[1];
+  const body = text.slice(m[0].length);
+  // 按顶层 key（行首非空白 `key:` 或 `key: value`）拆分块；缩进行归属上一个顶层 key
+  const lines = fmBlock.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  return { lines, body };
+}
+
+/** 把 frontmatter 行数组解析成 顶层key → 整块文本（含其下缩进子行） 的映射，保留顺序 */
+function fmToBlocks(lines: string[]): { order: string[]; blocks: Map<string, string> } {
+  const order: string[] = [];
+  const blocks = new Map<string, string>();
+  let curKey: string | null = null;
+  let curLines: string[] = [];
+  const flush = () => {
+    if (curKey !== null) {
+      if (!blocks.has(curKey)) order.push(curKey);
+      blocks.set(curKey, curLines.join('\n'));
+    }
+  };
+  for (const line of lines) {
+    const topMatch = line.match(/^([A-Za-z0-9_][\w-]*):(?:\s+(.*))?$/);
+    if (topMatch && !/^\s/.test(line)) {
+      flush();
+      curKey = topMatch[1];
+      curLines = [line];
+    } else if (curKey !== null) {
+      curLines.push(line);
+    }
+  }
+  flush();
+  return { order, blocks };
+}
+
+/**
+ * 合并两版 Markdown 的 frontmatter（字段级）。
+ * @param localText 本地版完整文档
+ * @param remoteText 远程版完整文档
+ * @param localNewer 是否以本地为「较新」基底（用于 LWW 取值）
+ */
+export function mergeFrontmatter(
+  localText: string,
+  remoteText: string,
+  localNewer: boolean,
+): FrontmatterMergeResult {
+  const lp = parseFrontmatter(localText);
+  const rp = parseFrontmatter(remoteText);
+  // 仅一端（或两端都）无 frontmatter：无法做字段级合并，返回 null 交由 conflict-resolver
+  // 回落整文件 diff3/联合合并（与「仅一端有 frontmatter 或解析失败时回落到下方 diff3」一致）。
+  if (!lp || !rp) {
+    return { merged: null, hasConflict: false, conflictKeys: [] };
+  }
+  const local = fmToBlocks(lp.lines);
+  const remote = fmToBlocks(rp.lines);
+  const conflictKeys: string[] = [];
+  const outOrder: string[] = [];
+  const outBlocks = new Map<string, string>();
+  const allKeys = Array.from(new Set([...local.order, ...remote.order]));
+  for (const key of allKeys) {
+    const l = local.blocks.get(key);
+    const r = remote.blocks.get(key);
+    if (l && !r) {
+      outOrder.push(key);
+      outBlocks.set(key, l);
+    } else if (!l && r) {
+      outOrder.push(key);
+      outBlocks.set(key, r);
+    } else if (l && r) {
+      if (l === r) {
+        outOrder.push(key);
+        outBlocks.set(key, l);
+      } else {
+        // 同 key 不同值：标冲突，LWW 取值（localNewer 取本地，否则取远程）
+        conflictKeys.push(key);
+        outOrder.push(key);
+        outBlocks.set(key, localNewer ? l : r);
+      }
+    }
+  }
+  const fmText = outOrder.map((k) => outBlocks.get(k)).join('\n');
+  const body = (localNewer ? lp : rp).body;
+  const merged = `---\n${fmText}\n---\n${body}`;
+  return { merged, hasConflict: conflictKeys.length > 0, conflictKeys };
+}
+
+// ---------------- Canvas / Excalidraw 节点级三方合并（#4.8） ----------------
+//
+// .canvas 是 { nodes:[{id,...}], edges:[{id,...}] } 的 JSON；.excalidraw 是
+// { type, version, elements:[{id,...}], files:{}, appState:{} }。两者语义都是
+// 「带 id 的元素集合」，适合做按 id 的结构化三方合并（而非整文件文本 diff3）。
+// 合并策略：
+//   - 每个参与合并的数组字段（canvas: nodes/edges；excalidraw: elements）按 id 对齐；
+//   - 某 id 仅一端改 → 取该端；两端都改且相同 → 取任一；两端都改不同 → 按 LWW 取较新端并标冲突；
+//   - 某端删除、另一端保留 → 保留；两端都删 → 丢弃；
+//   - 顶层非数组字段（version/appState/files 等）整字段 LWW（取较新端），不标冲突。
+// 任一端非合法 JSON → merged:null，交由 conflict-resolver 走分叉兜底。
+
+export type CanvasKind = 'canvas' | 'excalidraw';
+
+/** 判断路径是否为可节点级合并的画布文件 */
+export function classifyCanvasPath(path: string): CanvasKind | null {
+  const lower = path.toLowerCase();
+  if (lower.endsWith('.canvas')) return 'canvas';
+  if (lower.endsWith('.excalidraw')) return 'excalidraw';
+  return null;
+}
+
+/** 数组字段（按 id 参与三方合并） */
+const CANVAS_ARRAY_FIELDS: Record<CanvasKind, string[]> = {
+  canvas: ['nodes', 'edges'],
+  excalidraw: ['elements'],
+};
+
+/** 递归排序对象键，产生稳定字符串用于「内容是否相同」比较（规避 JSON key 顺序差异） */
+function stableStringify(v: unknown): string {
+  if (v === undefined) return 'undefined';
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+}
+
+export interface CanvasMergeResult {
+  /** null = 无法合并（解析失败），调用方应走保留双方/回滚 */
+  merged: string | null;
+  hasConflict: boolean;
+  /** 发生冲突（两端同 id 不同）的元素 id 列表 */
+  conflictIds: string[];
+}
+
+/**
+ * 画布三方合并。
+ * @param localText 本地版（设备 A）
+ * @param remoteText 远程版（设备 B）
+ * @param baseText 上次同步快照（base 缺失时为 null → 调用方应走分叉兜底）
+ * @param localNewer 本地是否为「较新」基底（LWW 取值）
+ */
+export function mergeCanvasTexts(
+  kind: CanvasKind,
+  localText: string,
+  remoteText: string,
+  baseText: string | null,
+  localNewer: boolean,
+): CanvasMergeResult {
+  const local = parseJsonSafe(localText);
+  const remote = parseJsonSafe(remoteText);
+  const base = baseText ? parseJsonSafe(baseText) : null;
+  if (!isPlainObject(local) || !isPlainObject(remote) || !isPlainObject(base)) {
+    return { merged: null, hasConflict: false, conflictIds: [] };
+  }
+  const conflictIds: string[] = [];
+  const newer = (localNewer ? local : remote) as Record<string, unknown>;
+  const older = (localNewer ? remote : local) as Record<string, unknown>;
+  const baseRec = base as Record<string, unknown>;
+
+  // 顶层非数组字段：整字段 LWW（取较新端；若较新端没有而较旧端有则并入）
+  const out: Record<string, unknown> = {};
+  const allTopKeys = Array.from(new Set([...Object.keys(newer), ...Object.keys(older)]));
+  for (const k of allTopKeys) {
+    if (CANVAS_ARRAY_FIELDS[kind].includes(k)) continue; // 数组字段单独处理
+    if (k in newer) out[k] = newer[k];
+    else if (k in older) out[k] = older[k];
+  }
+
+  // 数组字段逐 id 三方合并
+  for (const field of CANVAS_ARRAY_FIELDS[kind]) {
+    const baseArr = Array.isArray(baseRec[field]) ? (baseRec[field] as unknown[]) : [];
+    const localArr = Array.isArray(local[field as keyof typeof local])
+      ? (local[field as keyof typeof local] as unknown[])
+      : [];
+    const remoteArr = Array.isArray(remote[field as keyof typeof remote])
+      ? (remote[field as keyof typeof remote] as unknown[])
+      : [];
+    const toMap = (arr: unknown[]) => {
+      const m = new Map<string, Record<string, unknown>>();
+      for (const it of arr) {
+        const rec = it as Record<string, unknown>;
+        const id = rec?.id;
+        if (typeof id === 'string' || typeof id === 'number') m.set(String(id), rec);
+      }
+      return m;
+    };
+    const baseMap = toMap(baseArr);
+    const localMap = toMap(localArr);
+    const remoteMap = toMap(remoteArr);
+    // 保持顺序：base → local 新增 → remote 新增
+    const ordered = Array.from(
+      new Set([
+        ...baseMap.keys(),
+        ...[...localMap.keys()].filter((id) => !baseMap.has(id)),
+        ...[...remoteMap.keys()].filter((id) => !baseMap.has(id) && !localMap.has(id)),
+      ]),
+    );
+    const result: Record<string, unknown>[] = [];
+    for (const id of ordered) {
+      const b = baseMap.get(id);
+      const l = localMap.get(id);
+      const r = remoteMap.get(id);
+      const eq = (a: unknown, c: unknown) => stableStringify(a) === stableStringify(c);
+      if (b && l && r) {
+        if (eq(l, r)) result.push(l);
+        else if (eq(l, b)) result.push(r); // 仅远端改
+        else if (eq(r, b)) result.push(l); // 仅本地改
+        else {
+          result.push(localNewer ? l : r);
+          conflictIds.push(id);
+        }
+      } else if (!b && l && r) {
+        if (eq(l, r)) result.push(l);
+        else {
+          result.push(localNewer ? l : r);
+          conflictIds.push(id);
+        }
+      } else if (b && l && !r) result.push(l); // 远端删、本地留
+      else if (b && !l && r) result.push(r); // 本地删、远端留
+      else if (!b && l && !r) result.push(l); // 仅本地建
+      else if (!b && !l && r) result.push(r); // 仅远端建
+      // 两端都删 → 丢弃
+    }
+    out[field] = result;
+  }
+
+  return { merged: JSON.stringify(out, null, 2), hasConflict: conflictIds.length > 0, conflictIds };
+}
+

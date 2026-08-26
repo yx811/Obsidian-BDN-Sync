@@ -1029,6 +1029,65 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     // 规则变更后刷新预览
     input.addEventListener('blur', () => void updatePreview());
 
+    // P1-4.2 include 白名单：设置了 include 后，仅匹配其一的文件参与同步；
+    // 空 include 表示「全部（再按 exclude 过滤）」。include 优先级高于 exclude。
+    const includeBlock = container.createDiv({ cls: 'bdnsync-rule-editor' });
+    const incHead = includeBlock.createDiv({ cls: 'bdnsync-rule-editor-head' });
+    incHead.createEl('span', {
+      text: '包含规则（白名单，可选）',
+      cls: 'bdnsync-rule-editor-title',
+    });
+    const incAdd = incHead.createDiv({ cls: 'bdnsync-rule-editor-add' });
+    const incInput = incAdd.createEl('input', {
+      cls: 'bdnsync-input bdnsync-rule-input',
+      attr: { type: 'text', placeholder: '例如：笔记/** 或 项目/*.md' },
+    }) as HTMLInputElement;
+    createIconButton(incAdd, {
+      icon: 'folder-plus',
+      label: '添加包含',
+      primary: true,
+      onClick: () => {
+        const v = incInput.value.trim();
+        if (!v) return;
+        s.includePatterns = [...(s.includePatterns || []), v];
+        incInput.value = '';
+        void this.plugin.saveSettings();
+        renderInc();
+      },
+    });
+    const incList = includeBlock.createDiv({ cls: 'bdnsync-rule-list' });
+    const renderInc = () => {
+      incList.empty();
+      const patterns = s.includePatterns || [];
+      if (patterns.length === 0) {
+        incList.createEl('div', {
+          text: '未设置包含规则（同步全部文件，再按排除规则过滤）',
+          cls: 'bdnsync-rule-empty',
+        });
+      }
+      patterns.forEach((p, i) => {
+        const row = incList.createDiv({ cls: 'bdnsync-rule-row' });
+        const badge = row.createSpan({ cls: 'bdnsync-rule-badge bdnsync-rule-badge-include' });
+        badge.setText('包含');
+        row.createSpan({ text: p, cls: 'bdnsync-rule-pattern' });
+        createIconButton(row, {
+          icon: 'x',
+          label: '移除',
+          danger: true,
+          onClick: () => {
+            s.includePatterns = (s.includePatterns || []).filter((_, idx) => idx !== i);
+            void this.plugin.saveSettings();
+            renderInc();
+          },
+        });
+      });
+    };
+    renderInc();
+    container.createEl('p', {
+      cls: 'bdnsync-help-text',
+      text: '提示：include 与 exclude 支持 glob（*、**、?）。include 为空时同步全部，再按 exclude 过滤；include 非空时仅同步命中其一的文件。',
+    });
+
     new Setting(container)
       .setName('单文件大小上限（MB）')
       .setDesc('超过此大小的文件不同步')
@@ -1120,6 +1179,55 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         cls: 'bdnsync-help-text',
         text: '警告：忘记密码将无法解密云端文件，请妥善保管。密码只保存在本地。算法 AES-256-GCM + PBKDF2-SHA256（100,000 轮），与 rclone crypt / 主流 E2EE 同级。',
       });
+
+      // P1-3.5 密码提示语（明文，仅作回忆线索，不替代密码）
+      const hintRow = container.createDiv({ cls: 'bdnsync-input-row' });
+      hintRow.createEl('label', { text: '密码提示语（可选）' });
+      const hintInput = hintRow.createEl('input', {
+        cls: 'bdnsync-input',
+        attr: { type: 'text', placeholder: '例如：我家门牌号 + 宠物名' },
+      }) as HTMLInputElement;
+      hintInput.value = s.passwordHint;
+      hintInput.addEventListener('change', async () => {
+        s.passwordHint = hintInput.value;
+        await this.plugin.saveSettings();
+      });
+
+      // P1-3.5 密钥文件模式：从 vault 内 .bdnsync-key 读取密码，避免每次输入
+      const keyRow = container.createDiv({ cls: 'bdnsync-input-row' });
+      keyRow.createEl('label', { text: '密钥文件路径（可选）' });
+      const keyInput = keyRow.createEl('input', {
+        cls: 'bdnsync-input',
+        attr: { type: 'text', placeholder: '.bdnsync-key （相对 vault 根）' },
+      }) as HTMLInputElement;
+      keyInput.value = s.keyFilePath;
+      keyInput.addEventListener('change', async () => {
+        s.keyFilePath = keyInput.value.trim();
+        await this.plugin.saveSettings();
+      });
+      container.createEl('p', {
+        cls: 'bdnsync-help-text',
+        text: '密钥文件模式：在 vault 根放置 .bdnsync-key（首行即密码）。启用后插件从该文件读取密码，不再弹窗输入；文件本身被自动排除同步。需要时可点右侧按钮生成模板。',
+      });
+      new Setting(container)
+        .setName('生成密钥文件模板')
+        .setDesc('在 vault 根创建 .bdnsync-key（第一行留空待你填写密码），并自动设为密钥文件路径。')
+        .addButton((b) =>
+          b.setButtonText('生成模板').onClick(() => void this.plugin.createKeyFileTemplate()),
+        );
+
+      // P2-3.5 改密重加密
+      new Setting(container)
+        .setName('更改加密密码（重新加密）')
+        .setDesc(
+          '用新密码对所有已加密的云端文件重新加密（本地明文始终为真相源，先全量解密确认再重加密，过程不丢数据）。',
+        )
+        .addButton((b) =>
+          b
+            .setButtonText('更改密码')
+            .setWarning()
+            .onClick(() => void this.plugin.openReEncrypt()),
+        );
     }
 
     // 版本历史设置（无论是否加密都可开启）
@@ -1563,6 +1671,74 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           }
         });
       });
+
+    // P1-3.6 动态并发（自适应反馈）
+    new Setting(container)
+      .setName('自适应并发（实验）')
+      .setDesc(
+        '开启后，上传/下载并发数将根据「连续成功 / 频繁限流」自动微调（1–5 之间），降低手动调参成本。关闭则严格使用上方固定并发值。',
+      )
+      .addToggle((t) =>
+        t.setValue(s.adaptiveConcurrency).onChange(async (v) => {
+          s.adaptiveConcurrency = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    // P1-4.7 大文件独立通道阈值
+    new Setting(container)
+      .setName('大文件独立通道阈值（MB）')
+      .setDesc(
+        '超过此大小的文件走「大文件专用并发通道」（独立队列，避免阻塞小文件同步）。0 = 不启用独立通道。',
+      )
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(s.largeFileThresholdMB));
+        t.onChange(async (v) => {
+          const n = Number(v);
+          if (Number.isFinite(n) && n >= 0 && n <= 4096) {
+            s.largeFileThresholdMB = Math.floor(n);
+            await this.plugin.saveSettings();
+          }
+        });
+      });
+
+    // P1-2.1 API 容灾：每日轻量探查 + 降级提示
+    new Setting(container)
+      .setName('API 健康探查')
+      .setDesc('每日轻量探测 list/upload/quota，异常时在日志给出降级建议（OpenAPI 故障时提示可切 Cookie 模式）。')
+      .addToggle((t) =>
+        t.setValue(s.apiProbeEnabled).onChange(async (v) => {
+          s.apiProbeEnabled = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(container)
+      .setName('API 探查间隔（小时）')
+      .setDesc('两次探查之间的最小间隔（避免频繁打扰）。默认 24 小时。')
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(s.apiProbeIntervalHours));
+        t.onChange(async (v) => {
+          const n = Number(v);
+          if (Number.isFinite(n) && n >= 1 && n <= 168) {
+            s.apiProbeIntervalHours = Math.floor(n);
+            await this.plugin.saveSettings();
+          }
+        });
+      });
+
+    // P2-4.6 跨设备看板开关
+    new Setting(container)
+      .setName('跨设备同步看板')
+      .setDesc('在命令面板提供「跨设备同步状态看板」，基于本地索引聚合各设备同步状态（轮询式，非实时推送）。')
+      .addToggle((t) =>
+        t.setValue(s.crossDeviceDashboardEnabled).onChange(async (v) => {
+          s.crossDeviceDashboardEnabled = v;
+          await this.plugin.saveSettings();
+        }),
+      );
   }
 
   private renderDevice(container: HTMLElement): void {
@@ -1640,6 +1816,24 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (Number.isFinite(n) && n >= 1 && n <= 20) {
             this.plugin.settings.maxSnapshots = n;
+            await this.plugin.saveSettings();
+          }
+        });
+      });
+
+    // P1-4.5 定时自动快照（常驻调度，按间隔生成带备注的整库快照）
+    new Setting(section.body)
+      .setName('定时快照间隔（分钟）')
+      .setDesc(
+        '后台按固定间隔自动生成整库快照（0 = 关闭定时快照，仍可手动生成）。仅桌面端常驻生效；移动端在每次同步后补拍。',
+      )
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(this.plugin.settings.snapshotIntervalMinutes));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          if (Number.isFinite(n) && n >= 0 && n <= 1440) {
+            this.plugin.settings.snapshotIntervalMinutes = n;
             await this.plugin.saveSettings();
           }
         });

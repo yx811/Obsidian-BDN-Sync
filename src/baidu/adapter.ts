@@ -276,6 +276,8 @@ export class BaiduAdapter {
       onProgress?: (done: number, total: number) => void;
       onPartDone?: (session: UploadSession) => void; // F1：每分块成功后回调，用于落盘断点
       overwrite?: boolean;
+      /** #3.8 边缘情况：0KB 文件跳过物理上传时回调，便于引擎记日志/统计 */
+      onSkipEmpty?: (relPath: string) => void;
     } = {},
   ): Promise<UploadResult> {
     if (this.api.snapshotAuth().mode !== 'openapi') {
@@ -309,6 +311,9 @@ export class BaiduAdapter {
     if (total === 0) {
       const emptyHash = md5sKey || md5Hex(new Uint8Array(0)); // 空内容 md5：d41d8cd9...
       void emptyHash; // 仅供调试参考；engine 会自行计算 hash
+      // #3.8 边缘情况：0KB 文件跳过物理上传（百度网盘禁止 0 字节文件），仅记索引。
+      // 显式回调通知引擎，使其能标注「已跳过物理上传」并计入统计，避免日志中看似「静默成功」。
+      opts.onSkipEmpty?.(relPath);
       return { fsId: undefined, rapid: true, bytesUp: 0, remoteSize: 0 };
     }
 

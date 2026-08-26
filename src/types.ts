@@ -30,6 +30,8 @@ export interface FileState {
    * 会让索引里的 hash 被判为过期 → 每次同步重复下载、每次本地编辑都变成假冲突。
    */
   remoteSize?: number;
+  /** #4.7 大文件独立通道标记：true 表示本文件超过 largeFileThresholdMB，走专用并发/策略 */
+  large?: boolean;
 }
 
 /**
@@ -253,6 +255,8 @@ export interface SyncStats {
   bytesDown: number;
   /** 本次同步新补建到云端的空目录数（此前同步链路只处理文件，空文件夹缺口的修复载体）。可选：部分失败占位结果不携带该计数 */
   dirsCreated?: number;
+  /** 同步总耗时（毫秒）。用于 #5.12 同步耗时趋势图性能退化探测。可选：占位结果不携带 */
+  durationMs?: number;
   errorMessages: string[];
 }
 
@@ -296,6 +300,8 @@ export interface VaultSnapshot {
   deviceId: string;
   deviceName?: string;
   reason: string; // 触发原因（如「强制全量上传前自动备份」）
+  /** 用户备注（定时快照/手动快照可填写，用于后续差异对比时识别） */
+  note?: string;
   files: Record<string, { hash: string; mtime: number; size: number }>;
   totalFiles: number;
   totalBytes: number;
@@ -369,13 +375,23 @@ export interface BDNSyncSettings {
 
   // 过滤
   excludePatterns: string[];
+  /** 选择性同步：include 白名单。非空时仅同步命中模式的文件，include 优先于 exclude（#4.2） */
+  includePatterns: string[];
   maxFileSizeMB: number;
+  /** 大文件独立管理阈值（MB）：超过则走「大文件专用通道」（#4.7）。0 = 不启用独立通道 */
+  largeFileThresholdMB: number;
+  /** 大文件专用通道并发度（#4.7）。0 = 与普通上传并发相同 */
+  largeFileConcurrency: number;
   skipHiddenFiles: boolean;
   syncConfigDir: boolean;
 
   // 加密
   encryptionEnabled: boolean;
   encryptionPassword: string;
+  /** 密码提示语（帮助用户回忆，不存储密码本身） */
+  passwordHint: string;
+  /** 密钥文件模式：vault 内约定文件（如 .bdnsync-key）作为密码源；非空时优先于 encryptionPassword（#3.5） */
+  keyFilePath: string;
   /** 本库固定的 PBKDF2 salt（base64）。首次加密时自动生成并持久化，
    *  用于避免每个文件都重跑一次 10 万轮 PBKDF2。 */
   encryptionSalt: string;
@@ -393,6 +409,8 @@ export interface BDNSyncSettings {
   renameGraceMs: number;
   /** 实时同步风暴阈值：单次批量变更超过该数量降级为完整同步；0 = 关闭 */
   stormThreshold: number;
+  /** 动态并发：根据队列长度/内存压力运行时自适应调整上传并发（#3.6）。false = 用固定 uploadConcurrency */
+  adaptiveConcurrency: boolean;
 
   // 版本历史
   /** 每个文件保留的最近版本数（0 = 关闭版本历史） */
@@ -403,10 +421,14 @@ export interface BDNSyncSettings {
   autoSnapshot: boolean;
   /** 保留的快照点数量上限 */
   maxSnapshots: number;
+  /** 定时自动快照间隔（分钟）：>0 时由调度器周期触发 pushSnapshot（#4.5）；0 = 关闭 */
+  snapshotIntervalMinutes: number;
 
   // 设备
   deviceId: string;
   deviceName: string;
+  /** 跨设备状态看板（轮询式）：读取远端各设备锚点聚合展示（#4.6）；false = 关闭 */
+  crossDeviceDashboardEnabled: boolean;
 
   // 日志与诊断
   /** 日志最低记录级别：低于该级别的日志将被丢弃（debug 最详细，error 最精简） */
@@ -486,6 +508,14 @@ export interface BDNSyncSettings {
   /** 额外的「孤儿识别忽略 glob」列表（相对路径，支持 *、**、?），叠加在已有 excludePatterns 之上
    *  —— 用于声明「即使模型判断为孤儿，也请跳过」的安全白名单（例：attachments/**、*.important） */
   orphanExtraIgnoreGlobs: string[];
+
+  // —— API 容灾 / 轻量探查（#2.1）——
+  /** 每日轻量探查开关：探测 list/upload/quota 健康度，失败时提示降级（仅桌面常驻有效，移动端 best-effort） */
+  apiProbeEnabled: boolean;
+  /** 探查间隔（小时） */
+  apiProbeIntervalHours: number;
+  /** 上次探查时间戳（ms），用于限频 */
+  lastApiProbeAt: number;
 }
 
 export const DEFAULT_SETTINGS: BDNSyncSettings = {
@@ -513,12 +543,17 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   configSnapshotRetention: 5,
 
   excludePatterns: ['.trash/**', '*.tmp', '~$*', '*.lock'],
+  includePatterns: [],
   maxFileSizeMB: 100,
+  largeFileThresholdMB: 0,
+  largeFileConcurrency: 1,
   skipHiddenFiles: true,
   syncConfigDir: false,
 
   encryptionEnabled: false,
   encryptionPassword: '',
+  passwordHint: '',
+  keyFilePath: '',
   encryptionSalt: '',
 
   uploadConcurrency: 3,
@@ -529,14 +564,17 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   syncPreviewEnabled: true,
   renameGraceMs: 1500,
   stormThreshold: 200,
+  adaptiveConcurrency: true,
 
   maxVersions: 5,
 
   autoSnapshot: true,
   maxSnapshots: 3,
+  snapshotIntervalMinutes: 0,
 
   deviceId: '',
   deviceName: '',
+  crossDeviceDashboardEnabled: false,
 
   logLevel: 'info',
   logRetentionDays: 30,
@@ -574,6 +612,11 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   orphanScanConcurrency: 3,
   orphanUseRecycleBin: true, // 默认回收站模式（可逆）；切 false 才走永久删除
   orphanExtraIgnoreGlobs: [],
+
+  // API 容灾探查
+  apiProbeEnabled: true,
+  apiProbeIntervalHours: 24,
+  lastApiProbeAt: 0,
 };
 
 /** 远程目录条目 */
@@ -615,6 +658,16 @@ export type SyncLogEntry = {
   level: LogLevel;
   message: string;
   path?: string;
+  /** 本次操作上传字节数（用于统计可视化折线图；仅 upload 类有意义） */
+  bytesUp?: number;
+  /** 本次操作下载字节数（用于统计可视化折线图；仅 download 类有意义） */
+  bytesDown?: number;
+  /** 单次同步耗时（ms），用于性能退化趋势图 */
+  durationMs?: number;
+  /** 变更前内容摘要：用于审计「变更前 → 变更后」对比（base 缓存可供给 before 内容） */
+  beforeHash?: string;
+  beforeSize?: number;
+  beforeMtime?: number;
   /** 墓碑标记：true 表示已被逻辑删除（宽限期内可恢复），物理清除后置为移除 */
   deleted?: boolean;
   /** 墓碑标记时间戳（ms）。用于宽限期判断 */

@@ -330,7 +330,15 @@ export function redactSecrets(input: string): string {
   //  1) URL / Cookie 串中的 key=value（原始实现，向后兼容）
   //  2) JSON 序列化对象中的 "key":"value"（日志中常对 auth 等对象做 JSON.stringify，
   //     原实现无法脱敏，会导致凭证明文进入日志 —— 本次修复补齐）
-  const keys = ['access_token', 'BDUSS', 'STOKEN', 'refresh_token', 'client_secret', 'secretKey'];
+  const keys = [
+    'access_token',
+    'BDUSS',
+    'STOKEN',
+    'refresh_token',
+    'client_secret',
+    'secretKey',
+    'encryptionPassword',
+  ];
   let out = input;
   for (const k of keys) {
     // key=value （值截至分隔符/空白/引号/尖括号）
