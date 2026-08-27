@@ -331,15 +331,6 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const syncSection = createSection(containerEl, { title: '同步模式', icon: 'zap' });
     this.renderSyncMode(syncSection.body);
 
-    // 实验室（实验功能，默认折叠；启用后展开子项）
-    const labSection = createSection(containerEl, {
-      title: '实验室',
-      icon: 'beaker',
-      collapsible: true,
-      defaultOpen: false,
-    });
-    this.renderLab(labSection.body);
-
     // 冲突与删除
     const conflictSection = createSection(containerEl, {
       title: '冲突与删除',
@@ -348,7 +339,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     this.renderConflict(conflictSection.body);
 
     // 同步范围
-    const filterSection = createSection(containerEl, { title: '同步范围', icon: 'folder' });
+    const filterSection = createSection(containerEl, { title: '同步范围', icon: 'filter' });
     this.renderFilter(filterSection.body);
 
     // 远程占用明细入口
@@ -380,6 +371,20 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const encSection = createSection(containerEl, { title: '端到端加密', icon: 'shield' });
     this.renderEncryption(encSection.body);
 
+    // 设备
+    const deviceSection = createSection(containerEl, { title: '本设备', icon: 'smartphone' });
+    this.renderDevice(deviceSection.body);
+    this.renderSnapshot(deviceSection.body);
+
+    // 实验室（实验功能，默认折叠；启用后展开子项）
+    const labSection = createSection(containerEl, {
+      title: '实验室',
+      icon: 'beaker',
+      collapsible: true,
+      defaultOpen: false,
+    });
+    this.renderLab(labSection.body);
+
     // 高级性能（默认折叠）
     const perfSection = createSection(containerEl, {
       title: '高级性能参数',
@@ -389,13 +394,13 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     });
     this.renderPerformance(perfSection.body);
 
-    // 设备
-    const deviceSection = createSection(containerEl, { title: '本设备', icon: 'smartphone' });
-    this.renderDevice(deviceSection.body);
-    this.renderSnapshot(deviceSection.body);
-
-    // 日志与诊断
-    const logSection = createSection(containerEl, { title: '日志与诊断', icon: 'file-text' });
+    // 日志与诊断（默认折叠）
+    const logSection = createSection(containerEl, {
+      title: '日志与诊断',
+      icon: 'file-text',
+      collapsible: true,
+      defaultOpen: false,
+    });
     this.renderLogConfig(logSection.body);
 
     // 维护（危险区）
@@ -826,7 +831,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     if (s.syncMode === 'auto') {
       new Setting(container)
         .setName('自动同步间隔（分钟）')
-        .setDesc('无变更时仅拉取索引，几乎不消耗流量；实时同步模式不启用定时轮询')
+        .setDesc('定时拉取变更并同步；实时模式下不生效。')
         .addSlider((sl) => {
           sl.setLimits(1, 60, 1)
             .setValue(s.autoSyncInterval)
@@ -849,9 +854,9 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         }),
       );
 
-    new Setting(container)
-      .setName('保存时同步')
-      .setDesc('文件修改 3 秒后自动上传；大于 10MB 延长至 10 秒')
+      new Setting(container)
+        .setName('保存时同步')
+        .setDesc('保存文件后自动上传，大文件延迟稍长。')
       .addToggle((t) =>
         t.setValue(s.syncOnSave).onChange(async (v) => {
           s.syncOnSave = v;
@@ -864,7 +869,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const s = this.plugin.settings;
     new Setting(container)
       .setName('冲突解决策略')
-      .setDesc('智能合并会自动合并文本；每次询问则打开冲突面板')
+      .setDesc('智能合并自动处理文本冲突；需裁决时打开冲突面板。')
       .addDropdown((d) => {
         d.addOption('smart-merge', '智能合并（推荐）');
         d.addOption('force-local', '强制本地优先');
@@ -881,7 +886,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName('删除同步策略')
       .setDesc(
-        '一端删除、另一端也删除时，删除会正常同步到云端（已删除的文件不会复活）。仅在「一端删除、另一端同时修改」时才需要裁决：保留修改 = 以对方的新版本为准（不丢对方改动）；到处删除 = 直接删除云端。',
+        '一端删除时是否同步删除另一端。默认「保留修改」更安全：仅当对方也改过时才删除云端副本。',
       )
       .addDropdown((d) => {
         d.addOption('keep-modified', '保留修改（更安全，推荐）');
@@ -895,7 +900,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(container)
       .setName('覆盖前自动备份')
-      .setDesc('同步覆盖本地文件前，先备份到插件目录（最近 100 份）')
+      .setDesc('覆盖本地文件前先备份（最近 100 份），可随时恢复。')
       .addToggle((t) =>
         t.setValue(s.autoBackup).onChange(async (v) => {
           s.autoBackup = v;
@@ -905,9 +910,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(container)
       .setName('批量删除确认阈值')
-      .setDesc(
-        '单次同步的删除数量达到该值时弹窗确认。0 = 关闭此确认（异常删除检测始终生效：例如云端整棵目录树为空却要删本地文件时，一定会拦下来）',
-      )
+      .setDesc('单次删除数达到该值时弹窗确认；0 关闭。异常删除（如清空本地）始终拦截。')
       .addText((t) => {
         t.inputEl.type = 'number';
         t.setValue(String(s.bulkDeleteConfirm ?? 50));
@@ -921,9 +924,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     // P0-1.3/4.2 合并草稿开关：冲突含标记时写草稿待面板确认，而非直接覆盖原文件
     new Setting(container)
       .setName('冲突合并草稿（逐段确认）')
-      .setDesc(
-        '智能合并无法完全自动解决时，将带标记的合并结果写入独立草稿（不覆盖原文件），由「冲突合并面板」逐段采纳后保存。关闭则维持旧行为（直接写回 + 生成分叉副本）。',
-      )
+      .setDesc('无法自动解决时写入草稿，由面板逐段确认，不直接覆盖原文件。')
       .addToggle((t) =>
         t.setValue(s.mergeDraftEnabled).onChange(async (v) => {
           s.mergeDraftEnabled = v;
@@ -934,7 +935,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     // P0-1.4 打开合并面板入口
     new Setting(container)
       .setName('打开冲突合并面板')
-      .setDesc('对存在「待处理合并草稿」的冲突，三栏对比 + 逐段采纳本地/远端/保留双方，保存后写回原文件。')
+      .setDesc('三栏对比、逐段采纳本地/远端/保留双方，保存后写回原文件。')
       .addButton((b) =>
         b.setButtonText('打开合并面板').onClick(() => void this.plugin.openMergePanelFirst()),
       );
@@ -942,7 +943,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     // P2-4.2 撤销最近合并入口
     new Setting(container)
       .setName('撤销最近一次合并')
-      .setDesc('把冲突文件恢复为合并前的本地版本，并清理草稿（可从「同步统计 → 版本历史」再次恢复）。')
+      .setDesc('恢复为合并前的本地版本并清理草稿。')
       .addButton((b) =>
         b.setButtonText('撤销合并').onClick(() => void this.plugin.undoLastMerge()),
       );
@@ -1103,7 +1104,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     renderInc();
     container.createEl('p', {
       cls: 'bdnsync-help-text',
-      text: '提示：include 与 exclude 支持 glob（*、**、?）。include 为空时同步全部，再按 exclude 过滤；include 非空时仅同步命中其一的文件。',
+      text: '通配符：* 单层、** 递归、? 单字符。未设 include 时同步全部，再按 exclude 排除。',
     });
 
     new Setting(container)
@@ -1166,7 +1167,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const s = this.plugin.settings;
     new Setting(container)
       .setName('启用端到端加密')
-      .setDesc('AES-256-GCM：文件在上传前于本机加密，云端仅存密文。所有设备必须使用同一密码。')
+      .setDesc('上传前在本机加密，云端只存密文；所有设备须用同一密码。')
       .addToggle((t) =>
         t.setValue(s.encryptionEnabled).onChange(async (v) => {
           s.encryptionEnabled = v;
@@ -1195,7 +1196,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       meter.className = `bdnsync-pw-meter bdnsync-pw-meter-${st0.score}`;
       container.createEl('p', {
         cls: 'bdnsync-help-text',
-        text: '警告：忘记密码将无法解密云端文件，请妥善保管。密码只保存在本地。算法 AES-256-GCM + PBKDF2-SHA256（100,000 轮），与 rclone crypt / 主流 E2EE 同级。',
+        text: '⚠ 忘记密码将无法解密，请妥善保管；密码仅存本地。算法 AES-256-GCM + PBKDF2。',
       });
 
       // P1-3.5 密码提示语（明文，仅作回忆线索，不替代密码）
@@ -1225,7 +1226,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       });
       container.createEl('p', {
         cls: 'bdnsync-help-text',
-        text: '密钥文件模式：在 vault 根放置 .bdnsync-key（首行即密码）。启用后插件从该文件读取密码，不再弹窗输入；文件本身被自动排除同步。需要时可点右侧按钮生成模板。',
+        text: '在 vault 根放置 .bdnsync-key（首行即密码），启用后免输入；该文件自动排除同步。',
       });
       new Setting(container)
         .setName('生成密钥文件模板')
@@ -1288,16 +1289,16 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const usage = container.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-info' });
     usage.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '实验室：实验功能集中入口，每个功能都独立开关。开启主开关后，按需启用下方的子功能。',
+      text: '实验室为实验功能，每项独立开关。开启总开关后，按需启用下方子功能。',
     });
     const usageList = usage.createEl('ul', { cls: 'bdnsync-callout-list' });
     usageList.createEl('li', {
       cls: 'bdnsync-callout-text',
-      text: 'bdn:// 语法：bdn://<fsId>|<相对路径> 或 bdn://<相对路径>（相对「云端同步目录」）。',
+      text: 'bdn:// 引用：bdn://<相对路径>（相对云端同步目录）。',
     });
     usageList.createEl('li', {
       cls: 'bdnsync-callout-text',
-      text: '快速插入：命令面板运行「BDNSync：插入网盘媒体引用（bdn://）」，按当前笔记路径自动生成引用。',
+      text: '插入引用：命令面板运行「BDNSync：插入网盘媒体引用」。',
     });
 
     // ---- 总开关 ----
@@ -1377,7 +1378,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
     tip.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '在笔记中用 bdn:// 引用百度网盘文件并直接内联渲染，支持图片/视频/音频；PDF/Office 等显示为文件卡片。',
+      text: '在笔记中用 bdn:// 引用网盘文件并内联渲染，支持图片/视频/音频；PDF/Office 显示文件卡片。',
     });
 
     new Setting(sec.body)
@@ -1441,7 +1442,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
     tip.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '在文件预览 / 网盘浏览器中展示「哪些笔记引用了此网盘文件」，点击可跳回对应笔记并定位行号。索引按 vault 增量重建，存储于插件缓存目录。',
+      text: '在预览/网盘浏览器中展示「哪些笔记引用了此文件」，点击可跳回对应笔记并定位行号。',
     });
 
     new Setting(sec.body)
@@ -1471,7 +1472,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
     tip.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '把 bdn:// 媒体「收藏到本地」：已收藏的文件在离线时可直接渲染（不等网络恢复）；超出容量上限按访问时间清理。',
+      text: '把 bdn:// 媒体收藏到本地，离线时可直接渲染；超出上限按访问时间清理。',
     });
 
     new Setting(sec.body)
@@ -1517,7 +1518,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
     tip.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '每次同步完成后计算一个 0-100 的健康分：综合冲突数 / 大规模删除 / 失败 / 超大传输权重计算。低于阈值时弹提醒，避免半夜同步后问题被忽略。',
+      text: '每次同步后给出 0–100 健康分，分数过低时弹提醒，避免问题被忽略。',
     });
 
     new Setting(sec.body)
@@ -1562,14 +1563,14 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
     tip.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '对开启 Git 的 Vault，用 git 差异作为增量同步变更源，跳过全量文件系统扫描，大库显著提速。仅桌面端可用（依赖 git 二进制），移动端自动回退常规扫描。BDNSync 只读 Git 状态，绝不自动 commit。',
+      text: '对启用 Git 的库，用 git 差异作为变更源，跳过全量扫描，大库提速明显。仅桌面端可用，且不自动 commit。',
     });
 
     new Setting(sec.body)
       .setName('启用 Git 差异增量')
       .setDesc(
         desktop
-          ? '开启后可用命令「BDNSync：Git 增量同步」触发基于 git 差异的增量同步。'
+          ? '开启后可用「Git 增量同步」命令，基于 git 差异跳过全量扫描。'
           : '当前为移动端，Git 增量不可用，将自动回退常规同步。',
       )
       .addToggle((t) =>
@@ -1585,7 +1586,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(sec.body)
       .setName('Git 不可用时回退常规同步')
-      .setDesc('关闭后，非 Git 仓库 / 无 git 时命令会直接报错；开启则回退到常规扫描增量。')
+      .setDesc('关闭则非 Git 仓库时报错；开启则回退常规扫描。')
       .addToggle((t) =>
         t.setValue(!!s.labGitFallbackToScan).onChange(async (v) => {
           s.labGitFallbackToScan = v;
@@ -1618,14 +1619,14 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
     tip.createEl('p', {
       cls: 'bdnsync-callout-text',
-      text: '不依赖百度网盘，直接在「同局域网两台设备」之间同步 Vault。一端开启「作为对端监听」，另一端的「局域网同步」命令即可连接并双向同步。数据不出局域网，信道用配对口令 AES-256-GCM 加密，文件内容另可叠加端到端加密。仅桌面端可用。',
+      text: '不依赖网盘，在同局域网两台设备间直接同步。数据不出局域网，信道用配对口令加密。仅桌面端可用。',
     });
 
     new Setting(sec.body)
       .setName('启用局域网 P2P 同步')
       .setDesc(
         desktop
-          ? '开启后可在命令面板使用「BDNSync：启动局域网对端」「BDNSync：局域网同步」。'
+          ? '开启后可在命令面板使用「启动局域网对端」「局域网同步」命令。'
           : '当前为移动端，局域网 P2P 不可用。',
       )
       .addToggle((t) =>
@@ -1654,22 +1655,47 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(sec.body)
       .setName('本机监听端口')
-      .setDesc('本机作为「被同步对端」时监听的 TCP 端口（另一台设备连这个端口）。')
-      .addText((t) =>
-        t
-          .setValue(String(s.lanListenPort))
-          .onChange(async (v) => {
-            const n = Number(v);
-            if (Number.isFinite(n) && n > 0 && n <= 65535) {
-              s.lanListenPort = Math.floor(n);
-              await this.plugin.saveSettings();
-            }
-          }),
-      );
+      .setDesc('本机作为「被同步对端」时监听的端口（1–65535）。')
+      .addText((t) => {
+        t.setValue(String(s.lanListenPort));
+        const input = t.inputEl;
+        const hintEl = input.parentElement?.createDiv({ cls: 'bdnsync-field-hint' });
+        const hint = hintEl ?? undefined;
+        const validate = () => {
+          const v = input.value.trim();
+          const n = Number(v);
+          if (!v) {
+            hint?.setText('请填写监听端口');
+            if (hint) hint.className = 'bdnsync-field-hint bdnsync-field-hint-error';
+            input.classList.add('bdnsync-input-invalid');
+            return false;
+          }
+          if (!Number.isInteger(n) || n < 1 || n > 65535) {
+            hint?.setText('端口需为 1–65535 之间的整数');
+            if (hint) hint.className = 'bdnsync-field-hint bdnsync-field-hint-error';
+            input.classList.add('bdnsync-input-invalid');
+            return false;
+          }
+          hint?.setText('端口有效');
+          if (hint) hint.className = 'bdnsync-field-hint bdnsync-field-hint-ok';
+          input.classList.remove('bdnsync-input-invalid');
+          return true;
+        };
+        input.addEventListener('input', validate);
+        input.addEventListener('blur', validate);
+        validate();
+        t.onChange(async (v) => {
+          const n = Number(v);
+          if (Number.isFinite(n) && n > 0 && n <= 65535) {
+            s.lanListenPort = Math.floor(n);
+            await this.plugin.saveSettings();
+          }
+        });
+      });
 
     new Setting(sec.body)
       .setName('手动指定对端主机')
-      .setDesc('当前版本为手动直连：请填写另一台设备的 IP。自动局域网发现仍在规划中，本机「启动局域网对端」时已会向同网段广播自身存在。')
+      .setDesc('手动填写另一台设备的 IP（自动发现仍在规划中）。')
       .addText((t) =>
         t
           .setValue(s.lanTargetHost)
@@ -1682,17 +1708,41 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(sec.body)
       .setName('手动指定对端端口')
-      .setDesc('留空则随发现结果或回退到默认监听端口。')
-      .addText((t) =>
-        t
-          .setValue(s.lanTargetPort ? String(s.lanTargetPort) : '')
-          .setPlaceholder('默认 51820')
-          .onChange(async (v) => {
-            const n = Number(v);
-            s.lanTargetPort = Number.isFinite(n) ? Math.floor(n) : 0;
-            await this.plugin.saveSettings();
-          }),
-      );
+      .setDesc('留空则随发现结果或回退到默认监听端口（1–65535，0 表示未指定）。')
+      .addText((t) => {
+        t.setValue(s.lanTargetPort ? String(s.lanTargetPort) : '');
+        t.setPlaceholder('默认 51820');
+        const input = t.inputEl;
+        const hintEl = input.parentElement?.createDiv({ cls: 'bdnsync-field-hint' });
+        const hint = hintEl ?? undefined;
+        const validate = () => {
+          const v = input.value.trim();
+          if (!v) {
+            hint?.setText('留空将回退默认端口');
+            if (hint) hint.className = 'bdnsync-field-hint';
+            input.classList.remove('bdnsync-input-invalid');
+            return;
+          }
+          const n = Number(v);
+          if (!Number.isInteger(n) || n < 1 || n > 65535) {
+            hint?.setText('端口需为 1–65535 之间的整数，或留空');
+            if (hint) hint.className = 'bdnsync-field-hint bdnsync-field-hint-error';
+            input.classList.add('bdnsync-input-invalid');
+            return;
+          }
+          hint?.setText('端口有效');
+          if (hint) hint.className = 'bdnsync-field-hint bdnsync-field-hint-ok';
+          input.classList.remove('bdnsync-input-invalid');
+        };
+        input.addEventListener('input', validate);
+        input.addEventListener('blur', validate);
+        validate();
+        t.onChange(async (v) => {
+          const n = Number(v);
+          s.lanTargetPort = Number.isFinite(n) ? Math.floor(n) : 0;
+          await this.plugin.saveSettings();
+        });
+      });
   }
 
   /** 在子区头右侧渲染一个状态徽标（绿/灰） */
@@ -1775,7 +1825,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName('请求间隔（毫秒）')
       .setDesc(
-        '元数据接口（列表/预创建/合并等）的 QPS 节流，避免触发网盘限流。200-300 为推荐值；分片上传与文件下载不参与此节流（已优化为全速）',
+        '元数据接口节流，避免触发网盘限流；上传/下载不节流。推荐 200–300。',
       )
       .addText((t) => {
         t.setValue(String(s.requestIntervalMs));
@@ -1818,7 +1868,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName('风暴阈值（实时同步）')
       .setDesc(
-        '单次批量变更超过该数量时，实时同步降级为一次完整同步以保证一致性。0 = 关闭（大库/批量操作建议设为 200）',
+        '单次批量变更超此数量时，实时同步降级为一次完整同步。大库建议 200，0 关闭。',
       )
       .addText((t) => {
         t.inputEl.type = 'number';
@@ -1835,7 +1885,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName('脏集合窗口（毫秒）')
       .setDesc(
-        '跨窗口 rename 配对的时间窗口：在时间窗口内的「删除+创建」会被合并为一次 move。范围 0–10000，默认 1500',
+        '把短时间内的「删除+新建」合并为一次重命名。默认 1500 毫秒。',
       )
       .addText((t) => {
         t.inputEl.type = 'number';
@@ -1853,7 +1903,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName('自适应并发（实验）')
       .setDesc(
-        '开启后，上传/下载并发数将根据「连续成功 / 频繁限流」自动微调（1–5 之间），降低手动调参成本。关闭则严格使用上方固定并发值。',
+        '按限流情况自动微调并发（1–5），减少手动调参。',
       )
       .addToggle((t) =>
         t.setValue(s.adaptiveConcurrency).onChange(async (v) => {
@@ -1866,7 +1916,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName('大文件独立通道阈值（MB）')
       .setDesc(
-        '超过此大小的文件走「大文件专用并发通道」（独立队列，避免阻塞小文件同步）。0 = 不启用独立通道。',
+        '超过此大小的文件走专用通道，避免阻塞小文件。0 不启用。',
       )
       .addText((t) => {
         t.inputEl.type = 'number';
@@ -1883,7 +1933,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     // P1-2.1 API 容灾：每日轻量探查 + 降级提示
     new Setting(container)
       .setName('API 健康探查')
-      .setDesc('每日轻量探测 list/upload/quota，异常时在日志给出降级建议（OpenAPI 故障时提示可切 Cookie 模式）。')
+      .setDesc('每日轻量探测接口健康，异常时提示降级方案（如切 Cookie 模式）。')
       .addToggle((t) =>
         t.setValue(s.apiProbeEnabled).onChange(async (v) => {
           s.apiProbeEnabled = v;
@@ -1957,7 +2007,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
     new Setting(container)
       .setName('界面主题')
-      .setDesc('高对比度模式使用纯黑/纯白与加粗描边，提升弱光或视觉敏感场景的可读性')
+      .setDesc('高对比度模式提升弱光或视觉敏感场景的可读性。')
       .addDropdown((d) =>
         d
           .addOption('auto', '跟随 Obsidian')
@@ -1976,7 +2026,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const section = createSection(container, { title: '整库快照', icon: 'layers' });
     new Setting(section.body)
       .setName('自动快照')
-      .setDesc('强制全量同步（本地/云端覆盖）执行前自动生成整库快照点，误删后可整库回滚')
+      .setDesc('强制覆盖前自动生成整库快照，误删后可整库回滚。')
       .addToggle((t) =>
         t.setValue(this.plugin.settings.autoSnapshot).onChange(async (v) => {
           this.plugin.settings.autoSnapshot = v;
@@ -1985,7 +2035,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       );
     new Setting(section.body)
       .setName('保留快照数')
-      .setDesc('最多保留的快照点数量，超出后最旧的自动淘汰')
+      .setDesc('最多保留的快照点数量，超出自动淘汰最旧的。')
       .addText((t) => {
         t.inputEl.type = 'number';
         t.setValue(String(this.plugin.settings.maxSnapshots));
@@ -2151,53 +2201,29 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     note.createEl('p', {
       cls: 'bdnsync-callout-text',
       text:
-        '· 用途：识别网盘「同步目录的父目录」下，形如 「vault 名_YYYYMMDD_HHMMSS[_YYYYMMDD_HHMMSS...]」 的疑似孤儿备份；这些目录并非当前 BDNSync 写入。',
+        '识别网盘上「vault 名_时间戳」型的疑似残留目录与无主文件。仅检测、不静默删除：清理前一律弹窗确认。',
     });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 行为：检测开启后，命中会写入日志（不删、不弹窗）；自动清理开启后，同步结束后会扫描，但「是否删除」仍由用户在弹窗里勾选确认，**绝不静默删除**。',
+
+    // 详细说明（可折叠，供需要深入了解的用户阅读）
+    const detail = createSection(section.body, {
+      title: '详细说明',
+      icon: 'info',
+      collapsible: true,
+      defaultOpen: false,
     });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 范围（v2 增强）：可选三种模式 —— ① 父目录单层（保守，旧行为）；② 父目录 + vault 顶层（scoped）；③ 深度遍历 vault 整棵树（full-vault，可识别 vault 根下的孤儿文件如「未命名.canvas」、以及嵌套在子目录里的时间戳孤儿子目录）。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 资源控制：full-vault 受「节点预算 + 字节预算」双重上限保护（默认 2w 节点 / 2GB），触达即停止并标记「已截断」，不会因为大库耗尽资源；并发数 1–8 可调（默认 3），避免触百度 QPS 限频。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 忽略规则：除既有 excludePatterns 外，可叠加 orphanExtraIgnoreGlobs（glob 列表，相对路径）作为「白名单」—— 命中即整棵子树跳过；插件自身基础设施目录（.bdnsync*/）永远硬排除，绝不参与删除。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 三类候选：① 备份目录（${vaultName}_TS[_TS...]）任意深度；② 孤儿文件（不在 sync index 的文件，可定位「未命名.canvas」型无主残留）；③ 孤儿目录（空 / 全部子项也是孤儿）。弹窗内可分组批量勾选 + 单独删除。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 删除模式（v2）：默认「先送回收站」（可逆）；关闭 orphanUseRecycleBin 后语义上为「永久删除」—— 但百度网盘 xpan API 不提供单次「跳过回收站」接口，仍会进回收站，需用户到网盘 Web 端手动清空。modal 会显式提示，避免「看似永久实际可恢复」造成的预期偏差。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 常见来源：① 旧版本 BDNSync 残留；② 你在网盘 Web 端手动重命名了 vault 根；③ 其它同步插件（Remotely Save / Self-hosted LiveSync 等）写入同路径时为防冲突改名前缀；④ 百度网盘客户端对 `/apps/bdnsync/<vault>/` 的并发写入；⑤ 多设备 BDNSync 并发同步竞争；⑥ 在 vault 根目录手动新建/上传的「未命名.xxx」测试文件未同步到本地。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 预防建议：避免在网盘 Web 端直接重命名 vault 根目录；同一时间不要让两个同步工具写入同一父目录；如果使用其它同步插件，请把它们的远端根目录指向 `/apps/bdnsync/<vault>/.other-tool/` 之类的子目录。',
-    });
-    note.createEl('p', {
-      cls: 'bdnsync-callout-text',
-      text:
-        '· 启动时巡检：插件启动时（24h 限频）也会扫一次，即使当天没做过同步也能发现外部力量造成的孤儿。如果发现短期内新增 ≥ 3 个，会弹一条常驻 Notice 提示可能存在并发写入冲突。',
-    });
+    const detailBody = detail.body;
+    const addDetail = (t: string): void => {
+      detailBody.createEl('p', { cls: 'bdnsync-callout-text', text: t });
+    };
+    addDetail('用途：识别同步目录父目录下形如「vault 名_YYYYMMDD_HHMMSS」的疑似备份；这些目录并非当前 BDNSync 写入。');
+    addDetail('行为：检测开启后仅写日志；自动清理开启后同步结束会扫描，但删除仍由弹窗勾选确认，绝不静默删除。');
+    addDetail('范围：parent-only 仅看父目录；scoped 含 vault 顶层；full-vault 深度遍历整棵树（可识别「未命名.canvas」等无主残留）。');
+    addDetail('资源控制：full-vault 受节点/字节双重预算保护（默认 2 万节点 / 2GB），触达即停止，不会耗尽资源。');
+    addDetail('忽略规则：可叠加 orphanExtraIgnoreGlobs 作为白名单；插件自身 .bdnsync*/ 目录永远硬排除。');
+    addDetail('删除模式：默认先送回收站（可逆）；百度网盘接口不提供「跳过回收站」，关闭回收站后仍需到 Web 端清空。');
+    addDetail('常见来源：旧版本残留、Web 端改 vault 名、其它同步插件改名前缀、多设备并发竞争等。');
+    addDetail('预防：勿在 Web 端直接重命名 vault 根；避免两个同步工具写同一父目录；其它插件远端根指向子目录。');
+    addDetail('启动巡检：插件启动（24h 限频）也会扫描；短期新增 ≥3 个会弹 Notice 提示并发写入风险。');
 
     // 检测开关
     new Setting(section.body)
@@ -2248,7 +2274,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(section.body)
       .setName('扫描模式')
       .setDesc(
-        '选择深度遍历范围。full-vault 能识别 vault 根下的孤儿文件与嵌套子目录里的孤儿子目录；scoped 仅识别顶层；parent-only 只看父目录直接子项。',
+        '选择深度遍历范围。full-vault 能识别 vault 根下的孤儿文件与嵌套孤儿子目录。',
       )
       .addDropdown((d) => {
         for (const k of ['parent-only', 'scoped', 'full-vault']) d.addOption(k, modeLabels[k]);
@@ -2264,7 +2290,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     new Setting(section.body)
       .setName('最大递归深度（仅 full-vault）')
       .setDesc(
-        '限制扫描层级。0 = 不限（仍受节点/字节预算保护）。一般库用 8–10 已足够；嵌套较深可调高。',
+        '限制扫描层级。0 = 不限（仍受预算保护）。',
       )
       .addText((t) => {
         t.inputEl.type = 'number';

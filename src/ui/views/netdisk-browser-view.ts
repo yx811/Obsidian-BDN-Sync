@@ -1,7 +1,7 @@
 // 百度网盘文件浏览器：改为 Obsidian 标签页（ItemView），在主区域作为新标签打开
 // 替代旧的 NetdiskBrowserModal，避免弹窗裁切/滚动问题，并支持与其它笔记标签并列
 
-import { ItemView, WorkspaceLeaf, Notice } from 'obsidian';
+import { ItemView, WorkspaceLeaf } from 'obsidian';
 import type BDNSyncPlugin from '../../main';
 import { formatBytes, formatTime, u8ToArrayBuffer } from '../../util/misc';
 import { looksEncrypted } from '../../crypto/encryption';
@@ -10,9 +10,11 @@ import {
   setIcon,
   showConfirmModal,
   showPromptModal,
+  createEmptyState,
   MiniModal,
   type IconName,
 } from '../components';
+import { Notices } from '../notices';
 import { canPreview, classifyFile } from '../file-preview';
 import { openFilePreviewInLeaf } from './preview-view';
 
@@ -273,9 +275,10 @@ export class NetdiskBrowserView extends ItemView {
       this.render();
     } catch (e) {
       this.listEl.empty();
-      this.listEl.createEl('div', {
-        cls: 'bdnsync-empty-state',
-        text: `加载失败：${e instanceof Error ? e.message : String(e)}`,
+      createEmptyState(this.listEl, {
+        icon: 'cloud-alert',
+        title: '加载失败',
+        desc: e instanceof Error ? e.message : String(e),
       });
       this.setStatus('加载失败');
     } finally {
@@ -296,9 +299,10 @@ export class NetdiskBrowserView extends ItemView {
       this.render();
     } catch (e) {
       this.listEl.empty();
-      this.listEl.createEl('div', {
-        cls: 'bdnsync-empty-state',
-        text: `搜索失败：${e instanceof Error ? e.message : String(e)}`,
+      createEmptyState(this.listEl, {
+        icon: 'cloud-alert',
+        title: '搜索失败',
+        desc: e instanceof Error ? e.message : String(e),
       });
     } finally {
       this.loading = false;
@@ -376,9 +380,9 @@ export class NetdiskBrowserView extends ItemView {
     header.createSpan({ cls: 'bdnsync-explorer-col-act' });
 
     if (this.entries.length === 0) {
-      this.listEl.createDiv({
-        cls: 'bdnsync-explorer-empty',
-        text: this.mode === 'search' ? '无匹配结果' : '此目录为空',
+      createEmptyState(this.listEl, {
+        icon: 'folder',
+        title: this.mode === 'search' ? '无匹配结果' : '此目录为空',
       });
       return;
     }
@@ -488,7 +492,7 @@ export class NetdiskBrowserView extends ItemView {
   private setSyncDir(dir: string): void {
     this.plugin.settings.remoteRoot = dir;
     void this.plugin.saveSettings();
-    new Notice(`BDNSync：同步目录已设为 ${dir}`);
+    Notices.syncDirSet(dir);
     if (onSelectDirCallback) {
       const cb = onSelectDirCallback;
       cb(dir);
@@ -554,7 +558,7 @@ export class NetdiskBrowserView extends ItemView {
   // ---- 下载 / 文件管理（与 Modal 行为一致）----
 
   private async downloadFile(e: BrowserEntry, destBase = DOWNLOAD_DIR): Promise<boolean> {
-    const notice = new Notice(`BDNSync：正在下载 ${e.name}…`, 0);
+    const notice = Notices.downloadStart(e.name);
     try {
       const api = this.pluginApi();
       const dlink = await api.getDlink(e.fsId, e.fullPath);
@@ -563,17 +567,14 @@ export class NetdiskBrowserView extends ItemView {
         const enc = this.plugin.createEncryptor();
         if (!enc) {
           notice.hide();
-          new Notice(`BDNSync：${e.name} 是加密文件，请先开启端到端加密并填写密码`, 8000);
+          Notices.encryptedNeedPass(e.name);
           return false;
         }
         try {
           bytes = await enc.decrypt(bytes);
         } catch (decErr) {
           notice.hide();
-          new Notice(
-            `BDNSync：${e.name} 解密失败（${decErr instanceof Error ? decErr.message : String(decErr)}）`,
-            8000,
-          );
+          Notices.decryptFail(e.name, decErr);
           return false;
         }
       }
@@ -584,17 +585,17 @@ export class NetdiskBrowserView extends ItemView {
       const relPath = await this.uniquePath(`${destBase}/${sanitizeName(e.name)}`);
       await adapter.writeBinary(relPath, u8ToArrayBuffer(bytes));
       notice.hide();
-      new Notice(`BDNSync：已下载到 ${relPath}（${formatBytes(bytes.length)}）`);
+      Notices.downloadDone(relPath, bytes.length);
       return true;
     } catch (err) {
       notice.hide();
-      new Notice(`BDNSync：下载失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.downloadFail(err);
       return false;
     }
   }
 
   private async downloadDir(e: BrowserEntry): Promise<void> {
-    const notice = new Notice(`BDNSync：正在下载目录 ${e.name}…`, 0);
+    const notice = Notices.dirDownloadStart(e.name);
     try {
       let count = 0;
       const walk = async (dir: string, destBase: string) => {
@@ -616,17 +617,17 @@ export class NetdiskBrowserView extends ItemView {
       };
       await walk(e.fullPath, `${DOWNLOAD_DIR}/${sanitizeName(e.name)}`);
       notice.hide();
-      new Notice(`BDNSync：目录下载完成，共 ${count} 个文件 → ${DOWNLOAD_DIR}/${e.name}`);
+      Notices.dirDownloadDone(count, e.name);
     } catch (err) {
       notice.hide();
-      new Notice(`BDNSync：目录下载失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.dirDownloadFail(err);
     }
   }
 
   private async bulkDownload(): Promise<void> {
     const paths = [...this.selected];
     if (paths.length === 0) {
-      new Notice('请先勾选要下载的文件/目录');
+      Notices.bulkDownloadEmpty();
       return;
     }
     let ok = 0;
@@ -636,7 +637,7 @@ export class NetdiskBrowserView extends ItemView {
       if (entry.isDir) await this.downloadDir(entry);
       else if (await this.downloadFile(entry)) ok++;
     }
-    new Notice(`BDNSync：批量下载完成（${ok} 个文件）`);
+    Notices.bulkDownloadDone(ok);
     this.selected.clear();
     this.lastClickedIndex = null;
     this.render();
@@ -655,18 +656,18 @@ export class NetdiskBrowserView extends ItemView {
       return;
     try {
       await this.pluginApi().deleteFiles([e.fullPath]);
-      new Notice(`BDNSync：已删除 ${e.name}`);
+      Notices.deleteDone(e.name);
       this.selected.delete(e.fullPath);
       await this.refresh();
     } catch (err) {
-      new Notice(`BDNSync：删除失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.deleteFail(err);
     }
   }
 
   private async bulkDelete(): Promise<void> {
     const paths = [...this.selected];
     if (paths.length === 0) {
-      new Notice('请先勾选要删除的文件');
+      Notices.bulkDeleteEmpty();
       return;
     }
     if (
@@ -681,12 +682,12 @@ export class NetdiskBrowserView extends ItemView {
       return;
     try {
       await this.pluginApi().deleteFiles(paths);
-      new Notice(`BDNSync：已删除 ${paths.length} 项`);
+      Notices.bulkDeleteDone(paths.length);
       this.selected.clear();
       this.lastClickedIndex = null;
       await this.refresh();
     } catch (err) {
-      new Notice(`BDNSync：批量删除失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.bulkDeleteFail(err);
     }
   }
 
@@ -700,10 +701,10 @@ export class NetdiskBrowserView extends ItemView {
     try {
       const dir = this.currentDir === '/' ? `/${name}` : `${this.currentDir}/${name}`;
       await this.pluginApi().mkdir(dir);
-      new Notice(`BDNSync：已创建 ${dir}`);
+      Notices.created(dir);
       await this.refresh();
     } catch (err) {
-      new Notice(`BDNSync：创建失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.createFail(err);
     }
   }
 
@@ -716,10 +717,10 @@ export class NetdiskBrowserView extends ItemView {
     if (!name || name === e.name) return;
     try {
       await this.pluginApi().rename(e.fullPath, name);
-      new Notice(`BDNSync：已重命名为 ${name}`);
+      Notices.renamed(name);
       await this.refresh();
     } catch (err) {
-      new Notice(`BDNSync：重命名失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.renameFail(err);
     }
   }
 
@@ -737,15 +738,15 @@ export class NetdiskBrowserView extends ItemView {
       return;
     try {
       await this.pluginApi().move(e.fullPath, root);
-      new Notice(`BDNSync：已移动到同步目录 ${dest}`);
+      Notices.moved(dest);
       await this.refresh();
     } catch (err) {
-      new Notice(`BDNSync：移动失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.moveFail(err);
     }
   }
 
   private async previewThumb(e: BrowserEntry): Promise<void> {
-    const notice = new Notice(`BDNSync：加载缩略图 ${e.name}…`, 0);
+    const notice = Notices.thumbStart(e.name);
     try {
       const api = this.pluginApi();
       const dlink = await api.getDlink(e.fsId, e.fullPath);
@@ -757,14 +758,14 @@ export class NetdiskBrowserView extends ItemView {
       m.open();
     } catch (err) {
       notice.hide();
-      new Notice(`BDNSync：缩略图加载失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.thumbFail(err);
     }
   }
 
   /** 预览文件：在主内容区（workspace leaf）打开，支持图片/文本/PDF/Office/音视频 */
   private previewFile(e: BrowserEntry): void {
     if (!canPreview(e.name)) {
-      new Notice(`BDNSync：暂不支持预览 ${e.name}，可下载到仓库后用本地应用打开`);
+      Notices.previewUnsupported(e.name);
       return;
     }
     const target = {
@@ -793,22 +794,22 @@ export class NetdiskBrowserView extends ItemView {
   }
 
   private async createShare(e: BrowserEntry): Promise<void> {
-    const notice = new Notice(`BDNSync：正在生成分享链接 ${e.name}…`, 0);
+    const notice = Notices.shareStart(e.name);
     try {
       const link = await this.pluginApi().createShareLink(e.fullPath);
       notice.hide();
       try {
         await navigator.clipboard.writeText(link);
-        new Notice(`BDNSync：分享链接已生成并复制到剪贴板：\n${link}`, 10000);
+        Notices.shareDone(link, true);
       } catch {
-        new Notice(`BDNSync：分享链接已生成：\n${link}`, 10000);
+        Notices.shareDone(link, false);
       }
       const m = new MiniModal(this.app);
       m.renderShare(e.name, link);
       m.open();
     } catch (err) {
       notice.hide();
-      new Notice(`BDNSync：生成分享链接失败 — ${err instanceof Error ? err.message : String(err)}`);
+      Notices.shareFail(err);
     }
   }
 

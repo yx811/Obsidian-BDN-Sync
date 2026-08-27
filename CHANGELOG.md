@@ -2,11 +2,57 @@
 
 本文件记录 BDNSync 的所有版本变更。版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-> 📌 最新版本：**1.0.5**（2026-08-26）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+> 📌 最新版本：**1.0.6**（2026-08-28）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
 
 ---
 
-## [Unreleased]
+## [1.0.6] - 2026-08-28
+
+### 优化：设置面板结构与文案（UI/UX 一致性）
+
+- **分区顺序重构**：设置动线调整为「连接 → 同步目录 → 同步模式 → 冲突与删除 → 同步范围 → 远程存储与分析 → 端到端加密 → 本设备 → 实验室 → 高级性能 → 日志与诊断 → 维护」。
+- **默认折叠**：「实验室」「高级性能参数」「日志与诊断」改为默认折叠，首屏更聚焦，降低浏览负荷。
+- **描述文案精简**：同步模式 / 冲突删除 / 同步范围 / 加密 / 性能 / 设备 / 实验室（Git、局域网 P2P）等全部 `setDesc` 由术语段落改写为 1–2 句通俗说明，保留原意不变。
+- **孤儿清理说明降噪**：原 10 段密集说明压缩为 1 句摘要 + 可折叠「详细说明」，关键安全提示（不静默删除、回收站可逆）保留。
+- **视觉一致性增强层**（styles.css 末尾追加，非破坏性）：设置页限宽居中、折叠分区头统一悬停/箭头过渡、说明文字行高统一、危险区左侧强调线、入口/选择卡片统一悬停动效。
+- 验证：`tsc --noEmit`、`eslint`、`esbuild production` 全绿。
+
+### 优化：命令门控与界面/代码一致性（第二轮 UI/代码治理）
+
+- **P0-1 命令面板按功能开关门控**（`src/main.ts`）：实验室 / 高级命令按 `labEnabled` / `labGitEnabled` / `labLanEnabled` / `cloudMediaEnabled` / `mergeDraftEnabled` 门控包裹，关闭开关后命令面板不再暴露对应命令；核心同步命令常驻。行为不变，仅收敛可见入口。
+- **P1-5 统一空状态 / 加载态组件**（`src/ui/components.ts` 新增 `createEmptyState` / `createSkeleton`，`src/ui/views/netdisk-browser-view.ts` 接入）：消除网盘浏览器视图内「加载失败 / 搜索失败 / 目录为空」三处内联空态的样式漂移，统一复用设计令牌空态。
+- **P2-8 集中提示文案字典**（`src/ui/notices.ts` 新建）：抽象 `Notices` 字典，统一 `BDNSync：` 前缀与口吻；经脚本将网盘浏览器视图 29 处 `new Notice(...)` 精确迁移至 `Notices.*`，**文案逐字不变、零行为变更**，为后续多语言治理铺路。
+- **P2-7 Git 增量同步异步化**（`src/lab/git-change-source.ts`）：新增 `AsyncGitRunner`（默认 `spawn` + Promise + 20s 超时 `SIGKILL`），保留同步 `GitRunner` 接口以兼容既有单测 mock；消除 `spawnSync` 在主线程最坏 20s 的 UI 冻结（呼应 1.0.5 已知限制）。
+- **P1-4 状态栏快速操作浮层优化**（`styles.css`）：`.bdnsync-quick-actions` 限高 72vh + 滚动；`.bdnsync-popover-grid` 分组分隔线、`.bdnsync-quick-group-label` 间距统一。
+- **P2-9 移动端窄屏适配**（`styles.css`）：`@media (max-width: 640px)` 下设置页 / 选择卡 / 工具栏换行、状态栏文字隐藏、浮层 88vw、冲突面板纵向。
+- **P0-2 / P0-3 / P1-6 复核结论（不改动）**：抽样核查确认三大视图（explorer/dash/preview）各有连贯子设计令牌（非零令牌）、`connection-modal.ts` 已高度对齐设计系统、术语「云端 / 网盘」属统一三方模型（网盘为产品名），故本轮不盲改核心逻辑文案，仅做表层统一。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`styles.css` 体积增至约 135 KB（一致性增强层累加）。
+
+### 加固：接口 / 数据通信全链路排查与修复（第三轮：健壮性）
+
+- **排查结论（CORS / 鉴权非真实风险面）**：Obsidian 插件语境下云端请求统一走 `requestUrl`（Electron net，**无浏览器 CORS**）；仅 `file-preview.ts` / `preview-view.ts` 用浏览器 `fetch` 到本地 `http://127.0.0.1:<port>/stream`，由 `StreamServer` 下发 `Access-Control-Allow-Origin`，CORS 已闭合；局域网 P2P（`TcpLink`）为原始 TCP + AES-256-GCM，无 HTTP / 无 CORS。真正风险在百度 API 客户端健壮性，已修复 4 处。
+- **A9（🔴 静默假空 / 数据安全）**（`src/baidu/api.ts` `openRequest`）：非 JSON 响应体（网关错误页 / 代理拦截 / 空响应）或 HTTP ≥ 400 时，旧逻辑 `safeJson` 返回 `null` 后 `Number(null?.errno ?? 0) === 0` 被误判成功，会使 `listDir` 把远端目录误判为**空目录**、引擎据此**删除本地文件**。现改为：`data === null || resp.status >= 400` 一律抛 `BaiduApiError`（5xx / status 0 标 `transient` 供重试），鉴权类 errno 先走 `refreshAccessToken` 重试。
+- **A8（POST 缺 Content-Type）**（`openRequest`）：openapi 模式 POST 原未声明 `Content-Type`，现 `if (opts.method === 'POST') headers['Content-Type'] = 'application/x-www-form-urlencoded'`（cookie 模式原本已带），避免部分端点因缺类型拒绝。
+- **分片上传鉴权刷新**（`superfileUpload`）：签名新增 `retried` 参数，捕获 `AUTH_ERRNOS`（111/-6/50305）后置 `sawAuthErrno`，最终抛错前若 `sawAuthErrno && !retried` 且 `refreshAccessToken()` 成功则自递归重试一次，消除「token 过期导致整批上传失败需人工重授权」。
+- **账号信息可观测性**（`getUserInfo`）：原 `catch { return {普通用户...} }` 静默吞错掩盖未授权，现 `catch (e)` 对 `AUTH_FAILED` / `Error` 用 `console.debug` 记录**脱敏**原因后返回默认值，便于运维定位。
+
+### 优化：前端微交互打磨（第三轮：视觉细节与反馈）
+
+- **微交互增强层（增量，非破坏性）**（`styles.css` 尾部追加）：
+  - 禁用态：`.bdnsync-btn` / `.bdnsync-icon-btn` / `.bdnsync-compact-btn` / `.bdnsync-explorer-btn` / `.bdnsync-media-ctrl-btn` 统一 `opacity:.45;cursor:not-allowed;pointer-events:none`（明确不可点反馈），`:disabled:active{transform:none}`。
+  - 进行中态：`.bdnsync-status[aria-busy="true"]` 与 `.bdnsync-btn[aria-busy="true"] .bdnsync-btn-icon` 旋转动画，操作进行中有可见指示。
+  - 输入校验三态：`.bdnsync-input-invalid` 红框 + `.bdnsync-field-hint` / `-error` / `-ok` 即时提示。
+  - 无障碍：`@media (prefers-reduced-motion: reduce)` 覆盖全部关键帧（spin/shimmer/pulse/blink/hub-pulse/vip-warn/各状态点/孤儿扫描）与过渡（modal/popover/card/btn/icon-btn/dash/viz 等），尊重系统减弱动效设置。
+- **表单校验组件**（`src/ui/components.ts` 新增 `ValidatedTextHandle` 与 `createValidatedText(container, opts)`）：渲染 `.bdnsync-input` + `.bdnsync-field-hint`，`input` / `blur` 即时 `validator(v)` 校验，非法加红框 + 错误提示、合法显示 OK，**不改变既有 `onChange` 数据写入**。
+- **LAN 端口即时校验**（`src/settings.ts`）：「本机监听端口」与「手动指定对端端口」两个 `addText` 改为内联 hint，即时校验端口为 1–65535 整数；非法显示红框 + 提示，留空对端端口提示「回退默认」。修复此前**超出范围值被静默忽略**的断层（用户误填不报错也不生效）。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` 268 项全过（18 文件）；`main.js` 已重构建（531 KB）。
+
+> ⚠️ 已知限制（非缺陷，留待后续）：① 需真实百度凭据的在线场景（授权 / 上传 / 同步 / 预览）沙箱无法跑，属环境限制；② Office 预览 `iframe`（`file-preview.ts`）依赖 WebView Cookie 罐、实际可用性脆弱，已文档化非本轮回退；③ `device-auth-modal.ts` 第三方 QR 服务 `api.qrserver.com` 仅作百度 `qrcode_url` 缺失时的回退，且已具备 `onerror` 降级到手动码，**info 级隐私关切、不改动**。
+
+### 发布元数据
+
+- 版本号：**1.0.6**（自 1.0.5 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` / `package.json` 同步更新为 1.0.6。
+- 构建产物 `main.js` / `styles.css` 由 CI 自动生成，不在版本控制中。
 
 ## [1.0.5] - 2026-08-26
 

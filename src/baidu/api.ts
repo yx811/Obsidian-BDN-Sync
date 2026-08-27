@@ -739,7 +739,9 @@ export class BaiduApi {
     const token = await this.accessToken();
     const sep = url.includes('?') ? '&' : '?';
     const fullUrl = `${url}${sep}access_token=${encodeURIComponent(token)}`;
-    const headers = { 'User-Agent': PCS_UA };
+    // A8：openapi POST 显式声明表单编码，避免部分端点因缺 Content-Type 拒绝（cookie 模式已带）
+    const headers: Record<string, string> = { 'User-Agent': PCS_UA };
+    if (opts.method === 'POST') headers['Content-Type'] = 'application/x-www-form-urlencoded';
     const resp =
       opts.method === 'POST'
         ? await this.request(
@@ -753,7 +755,32 @@ export class BaiduApi {
           )
         : await this.request(fullUrl, { method: 'GET', headers }, { skipThrottle: opts.skipThrottle });
     const data = safeJson(resp) as BaiduApiResponse;
-    const errno = Number(data?.errno);
+    const errno = Number(data?.errno ?? 0);
+    // ---- 修复 A9（静默假空 / 数据安全）----
+    // 非 JSON 响应体（网关错误页 / 空响应 / 代理拦截）或 HTTP 错误状态码，
+    // 绝不能当成「成功且为空」返回。否则 listDir 会把远端目录误判为空目录，
+    // 进而在同步中删除本地文件。此前 safeJson 返回 null 时 Number(null?.errno ?? 0)
+    // 被算作 0（成功），是高危隐性缺陷。
+    if (data === null || resp.status >= 400) {
+      const transient = resp.status === 0 || resp.status >= 500;
+      // 鉴权类失败仍走刷新重试（与下方非 null 分支同源）
+      if ((resp.status === 401 || AUTH_ERRNOS.includes(errno)) && !opts.retried) {
+        if (await this.refreshAccessToken()) {
+          return this.openRequest(url, { ...opts, retried: true });
+        }
+        throw new BaiduApiError(
+          errno || -6,
+          `AccessToken 无效或已过期（HTTP ${resp.status}），自动刷新失败，请重新完成设备码授权`,
+          { code: 'AUTH_FAILED', raw: data },
+        );
+      }
+      throw new BaiduApiError(
+        errno || 0,
+        `请求返回非预期响应（HTTP ${resp.status}${data === null ? '，响应体非 JSON（可能被网关/代理拦截）' : ''}），无法解析为有效结果`,
+        { transient, raw: data },
+      );
+    }
+    // status < 400 且 data 非 null：仅鉴权类 errno 触发刷新重试
     if ((resp.status === 401 || AUTH_ERRNOS.includes(errno)) && !opts.retried) {
       if (await this.refreshAccessToken()) {
         return this.openRequest(url, { ...opts, retried: true });
@@ -964,7 +991,13 @@ export class BaiduApi {
       };
       this.userInfoCache = { ts: Date.now(), info };
       return info;
-    } catch {
+    } catch (e) {
+      // 不静默吞没授权失效：记录真实原因（脱敏），否则会误显示「普通用户」掩盖未授权问题
+      if (e instanceof BaiduApiError && e.code === 'AUTH_FAILED') {
+        console.debug(`[BDNSync] getUserInfo 授权失效：${e.message}`);
+      } else if (e instanceof Error) {
+        console.debug(`[BDNSync] getUserInfo 获取失败：${redactSecrets(e.message)}`);
+      }
       return { name: '', vipType: 0, vipLabel: '普通用户', avatarUrl: null, uk: null };
     }
   }
@@ -1386,6 +1419,7 @@ export class BaiduApi {
     uploadid: string,
     partseq: number,
     chunk: Uint8Array,
+    retried = false,
   ): Promise<{ md5?: string }> {
     this.ensureAuth();
     const token = await this.accessToken();
@@ -1409,6 +1443,8 @@ export class BaiduApi {
 
     const attempts: { host: string; method: string; status: number; msg: string }[] = [];
     let successHostIdx = -1;
+    /** 是否命中鉴权类 errno（上传期间 token 过期），用于失败兜底时触发刷新重试 */
+    let sawAuthErrno = false;
 
     for (let round = 0; round < 3; round++) {
       const order =
@@ -1461,6 +1497,7 @@ export class BaiduApi {
             const data: BaiduApiResponse =
               safeJson<BaiduApiResponse>(resp) ?? ({} as BaiduApiResponse);
             const errno = Number(data?.error_code ?? data?.errno ?? 0);
+            if (AUTH_ERRNOS.includes(errno)) sawAuthErrno = true;
             if (resp.status < 400 && errno === 0) {
               const md5 = data?.md5 ? String(data.md5) : undefined;
               // 防「假成功」：百度返回 200/errno=0 但缺 md5 时，分片可能未真正落盘。
@@ -1502,6 +1539,13 @@ export class BaiduApi {
       .slice(0, 3)
       .map((a) => `${a.host} ${a.method} ${a.status}${a.msg ? `(${a.msg})` : ''}`)
       .join('；');
+    // 鉴权类失败（上传期间 token 过期）：刷新 access_token 后整片重试一次，
+    // 避免长文件分片上传中途因 token 失效而整体失败。
+    if (sawAuthErrno && !retried) {
+      if (await this.refreshAccessToken()) {
+        return this.superfileUpload(remotePath, uploadid, partseq, chunk, true);
+      }
+    }
     // 错误详情不暴露 access_token（已在 qs 中），脱敏后抛出
     const safeRemote = redactSecrets(remotePath);
     throw new BaiduApiError(

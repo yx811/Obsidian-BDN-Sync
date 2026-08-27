@@ -26,9 +26,14 @@ export interface GitRunResult {
   stderr: string;
 }
 
-/** 可注入的 git 执行器（便于单测 mock） */
+/** 可注入的 git 执行器（便于单测 mock，同步） */
 export interface GitRunner {
   run(args: string[], cwd: string): GitRunResult;
+}
+
+/** 异步 git 执行器（生产默认，避免阻塞 UI 线程） */
+export interface AsyncGitRunner {
+  run(args: string[], cwd: string): Promise<GitRunResult>;
 }
 
 /** 默认执行器：桌面端通过 child_process.spawnSync 调 git（懒加载，避免移动端加载崩溃） */
@@ -53,6 +58,59 @@ function defaultRunner(): GitRunner {
       } catch (e) {
         return { ok: false, stdout: '', stderr: String(e) };
       }
+    },
+  };
+}
+
+/**
+ * 异步默认执行器：桌面端通过 child_process.spawn 调 git（懒加载）。
+ * 与同步 defaultRunner 的语义一致，但用事件驱动 + Promise 包裹，
+ * 不再阻塞 Obsidian 主线程（大库 git status 可能耗时数秒）。
+ */
+function defaultAsyncRunner(): AsyncGitRunner {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cp = (globalThis as any).require?.('child_process');
+  if (!cp || typeof cp.spawn !== 'function') {
+    return {
+      run: async () => ({ ok: false, stdout: '', stderr: 'child_process unavailable' }),
+    };
+  }
+  return {
+    run(args: string[], cwd: string): Promise<GitRunResult> {
+      return new Promise<GitRunResult>((resolve) => {
+        let stdout = '';
+        let stderr = '';
+        let settled = false;
+        const finish = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ ok, stdout, stderr });
+        };
+        const child = cp.spawn('git', args, { cwd });
+        const timer = setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* ignore */
+          }
+          stderr += '\n[git 调用超时（20s）]';
+          finish(false);
+        }, 20000);
+        child.stdout?.on('data', (d: Buffer) => {
+          stdout += d.toString('utf8');
+        });
+        child.stderr?.on('data', (d: Buffer) => {
+          stderr += d.toString('utf8');
+        });
+        child.on('error', (e: Error) => {
+          stderr += String(e);
+          finish(false);
+        });
+        child.on('close', (code: number) => {
+          finish(code === 0);
+        });
+      });
     },
   };
 }
@@ -165,22 +223,32 @@ export class GitChangeSource {
     private vaultPath: string,
     private lastRef?: string,
     private runner?: GitRunner,
+    private asyncRunner?: AsyncGitRunner,
   ) {}
 
   private getRunner(): GitRunner {
     return this.runner ?? defaultRunner();
   }
 
+  private getAsyncRunner(): AsyncGitRunner {
+    return this.asyncRunner ?? defaultAsyncRunner();
+  }
+
+  /** 统一执行入口：测试注入的同步 runner 优先（保持单测兼容），否则走异步 spawn（不阻塞 UI 线程） */
+  private async runGit(args: string[]): Promise<GitRunResult> {
+    if (this.runner) return this.runner.run(args, this.vaultPath);
+    return this.getAsyncRunner().run(args, this.vaultPath);
+  }
+
   async collect(): Promise<GitChangeSet | null> {
     if (!Platform.isDesktop) return null;
-    const runner = this.getRunner();
 
-    const top = runner.run(['rev-parse', '--show-toplevel'], this.vaultPath);
+    const top = await this.runGit(['rev-parse', '--show-toplevel']);
     if (!top.ok) return null;
     const repoRoot = top.stdout.trim().replace(/\\/g, '/').replace(/\/+$/, '');
     if (!repoRoot) return null;
 
-    const headRes = runner.run(['rev-parse', 'HEAD'], this.vaultPath);
+    const headRes = await this.runGit(['rev-parse', 'HEAD']);
     const head = headRes.ok ? headRes.stdout.trim() : null;
 
     const paths = new Set<string>();
@@ -188,10 +256,7 @@ export class GitChangeSource {
     // 1) 已提交区间（上次同步 ref → 当前 HEAD）
     const usedFallback = !this.lastRef;
     if (this.lastRef) {
-      const diff = runner.run(
-        ['diff', '--name-only', this.lastRef, 'HEAD'],
-        this.vaultPath,
-      );
+      const diff = await this.runGit(['diff', '--name-only', this.lastRef, 'HEAD']);
       if (diff.ok) {
         for (const p of diff.stdout.split('\n')) {
           const t = p.trim();
@@ -201,7 +266,7 @@ export class GitChangeSource {
     }
 
     // 2) working tree 相对 HEAD 的改动（含未跟踪、重命名）
-    const status = runner.run(['status', '--porcelain', '-uall'], this.vaultPath);
+    const status = await this.runGit(['status', '--porcelain', '-uall']);
     if (!status.ok) {
       // status 失败且没有任何区间结果 → 无法界定变更
       if (paths.size === 0) return null;

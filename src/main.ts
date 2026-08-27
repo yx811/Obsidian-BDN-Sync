@@ -328,61 +328,69 @@ export default class BDNSyncPlugin extends Plugin {
       name: '扫描并清理网盘备份目录',
       callback: () => void this.openOrphanCleanupModal({ autoMode: false }),
     });
-    // P0-1.4 冲突合并面板（仅当存在 pending-merge 草稿时展示）
-    this.addCommand({
-      id: 'bdnsync-open-merge-panel',
-      name: '打开冲突合并面板（逐段裁决）',
-      callback: () => void this.openMergePanelFirst(),
-    });
-    // P2-4.2 撤销最近合并
-    this.addCommand({
-      id: 'bdnsync-undo-merge',
-      name: '撤销最近一次冲突合并',
-      callback: () => void this.undoLastMerge(),
-    });
+    // P0-1.4 冲突合并面板（仅当 mergeDraftEnabled 时展示）
+    if (this.settings.mergeDraftEnabled) {
+      this.addCommand({
+        id: 'bdnsync-open-merge-panel',
+        name: '打开冲突合并面板（逐段裁决）',
+        callback: () => void this.openMergePanelFirst(),
+      });
+      // P2-4.2 撤销最近合并
+      this.addCommand({
+        id: 'bdnsync-undo-merge',
+        name: '撤销最近一次冲突合并',
+        callback: () => void this.undoLastMerge(),
+      });
+    }
     // P2-4.6 跨设备同步看板（轮询式）
     this.addCommand({
       id: 'bdnsync-cross-device-dashboard',
       name: '跨设备同步状态看板',
       callback: () => void this.openCrossDeviceDashboard(),
     });
-    // 实验室 #5.9：基于 Git 差异的增量同步（仅桌面）
-    this.addCommand({
-      id: 'bdnsync-git-sync',
-      name: 'Git 增量同步（实验室）',
-      callback: () => void this.syncViaGit(),
-    });
-    // 实验室 #5.10：局域网 P2P 同步（仅桌面）
-    this.addCommand({
-      id: 'bdnsync-lan-peer-start',
-      name: '启动局域网对端（实验室）',
-      callback: () => void this.startLanPeer(),
-    });
-    this.addCommand({
-      id: 'bdnsync-lan-peer-stop',
-      name: '停止局域网对端（实验室）',
-      callback: () => this.stopLanPeer(),
-    });
-    this.addCommand({
-      id: 'bdnsync-lan-sync',
-      name: '局域网同步（实验室）',
-      callback: () => void this.runLanSync(),
-    });
+    // 实验室 #5.9：基于 Git 差异的增量同步（仅桌面，且需开启对应开关）
+    if (this.settings.labEnabled && this.settings.labGitEnabled && Platform.isDesktop) {
+      this.addCommand({
+        id: 'bdnsync-git-sync',
+        name: 'Git 增量同步（实验室）',
+        callback: () => void this.syncViaGit(),
+      });
+    }
+    // 实验室 #5.10：局域网 P2P 同步（仅桌面，且需开启对应开关）
+    if (this.settings.labEnabled && this.settings.labLanEnabled && Platform.isDesktop) {
+      this.addCommand({
+        id: 'bdnsync-lan-peer-start',
+        name: '启动局域网对端（实验室）',
+        callback: () => void this.startLanPeer(),
+      });
+      this.addCommand({
+        id: 'bdnsync-lan-peer-stop',
+        name: '停止局域网对端（实验室）',
+        callback: () => this.stopLanPeer(),
+      });
+      this.addCommand({
+        id: 'bdnsync-lan-sync',
+        name: '局域网同步（实验室）',
+        callback: () => void this.runLanSync(),
+      });
+    }
 
-    // 实验功能：插入 bdn:// 网盘媒体引用（相对 remoteRoot）
-    this.addCommand({
-      id: 'bdnsync-insert-bdn-ref',
-      name: '插入网盘媒体引用（bdn://）',
-      editorCallback: (editor, ctx) => {
-        const file = ctx.file;
-        if (!file) {
-          new Notice('请先打开一个笔记再插入引用');
-          return;
-        }
-        const ref = buildBdnRef(undefined, file.path);
-        editor.replaceSelection(`[${file.name}](${ref})`);
-      },
-    });
+    // 实验功能：插入 bdn:// 网盘媒体引用（相对 remoteRoot，需开启网盘媒体直嵌）
+    if (this.settings.labEnabled && this.settings.cloudMediaEnabled) {
+      this.addCommand({
+        id: 'bdnsync-insert-bdn-ref',
+        name: '插入网盘媒体引用（bdn://）',
+        editorCallback: (editor, ctx) => {
+          const file = ctx.file;
+          if (!file) {
+            new Notice('请先打开一个笔记再插入引用');
+            return;
+          }
+          const ref = buildBdnRef(undefined, file.path);
+          editor.replaceSelection(`[${file.name}](${ref})`);
+        },
+      });
+    }
 
     // 实验功能：网盘媒体直嵌 Markdown PostProcessor
     this.registerMarkdownPostProcessor((el) => rewriteBdnRefs(this, el));

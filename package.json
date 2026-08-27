@@ -1,6 +1,6 @@
 {
   "name": "bdnsync",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "BDNSync - Baidu Netdisk sync plugin for Obsidian (WPS-like cloud doc experience)",
   "main": "main.js",
   "repository": {

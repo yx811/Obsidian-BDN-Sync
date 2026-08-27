@@ -6,7 +6,7 @@
 
 > ⚠️ 使用前请阅读 **[免责协议](免责协议.md)**。同步软件涉及数据覆盖与删除操作，请确认你已理解并自担风险。
 
-
+> 🆕 **v1.0.6 已发布**：接口 / 数据通信全链路健壮性加固（修复 🔴 静默假空等 4 处，消除 `listDir` 误判空目录导致本地文件被删的风险）、前端微交互打磨（禁用 / 进行中态、输入校验、减弱动效），以及实验室「Git 差异增量同步」「局域网 P2P 同步」、跨设备同步看板等。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -1060,7 +1060,7 @@ npm run deploy       # 构建 + 部署到 vault
 
 1. 更新 `CHANGELOG.md`、`manifest.json` 与 `versions.json`（以及 `package.json`）中的版本号，保持三者一致
 2. 提交并推送代码
-3. 推送标签：`git tag v1.0.3 && git push origin v1.0.3`
+3. 推送标签：`git tag v1.0.6 && git push origin v1.0.6`
 4. CI 自动执行：
    - 类型检查（tsc）
    - Lint 检查（eslint）

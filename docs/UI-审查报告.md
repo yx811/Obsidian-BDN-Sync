@@ -1,0 +1,221 @@
+# BDNSync 代码 · 功能 · 界面审查报告
+
+> 审查对象：Obsidian 插件 BDNSync（v1.0.6）
+> 审查范围：设置面板 UI/UX、整体视觉一致性、代码与功能健全性
+> 日期：2026-08-28
+
+---
+
+## 一、总体结论
+
+代码与功能层在既往轮次已通过深度审查与加固（R1–R8、F1–F7），整体**生产可用性良好**。本轮聚焦用户明确的诉求——**设置面板的视觉一致性与文案体验**，发现的核心问题集中在「说明文案过长过专业」「结构分区偏大且未折叠」「少量视觉语言不统一」三处。已在不改动任何功能与接口的前提下完成优化，类型检查 / ESLint / 生产构建全绿。
+
+---
+
+## 二、分层审查发现
+
+### 2.1 界面 / UX（本轮重点）
+
+| 编号 | 问题 | 位置 | 严重程度 | 处置 |
+| --- | --- | --- | --- | --- |
+| U1 | 设置说明文案冗长、术语密集，新用户不易快速理解 | 多处 `setDesc` / callout | 高 | 已精简为 1–2 句通俗说明 |
+| U2 | 「维护」区将 维护 / 强制同步 / 孤儿清理 / 数据安全堆在一起，孤儿清理原含 10 段密集说明 | `renderOrphanCleanup` | 高 | 压缩为摘要 + 可折叠「详细说明」 |
+| U3 | 「日志与诊断」「高级性能」「实验室」默认展开，首屏信息过载 | `display()` | 中 | 改为默认折叠 |
+| U4 | 分区顺序未贴合用户心智（实验室夹在模式与冲突之间） | `display()` | 中 | 重排为「连接→目录→模式→冲突→范围→存储→加密→设备→实验室→性能→日志→维护」 |
+| U5 | 设置页无最大宽度，宽屏下长文可读性差 | 全局 | 中 | 追加限宽居中样式 |
+| U6 | 折叠分区头缺少统一悬停/箭头反馈；入口卡、选择卡悬停动效不统一 | 全局 | 低 | 追加一致性增强层 |
+| U7 | 术语混用（「云端」/「网盘」交替） | 多处 | 低 | 统一为「网盘」为主、「云端」为辅 |
+| U8 | 同步范围分区图标与「同步目录」重复（均为 folder） | `display()` | 低 | 改为 filter 图标 |
+
+### 2.2 功能
+
+- 设置逻辑与渲染解耦清晰：`sanitizeImportedSettings` 对导入做白名单 + 类型/范围校验（防 Mass-Assignment 与 `delete-all` 注入），本次未改动。
+- 所有开关 `onChange` 均 `saveSettings()` + 必要重绘/重调度，行为闭环完整。
+- 「实验室」子功能状态徽标（绿/灰）实时刷新，逻辑正确。
+- 未发现功能性回归风险（改动仅触及 `display()` 布局与文案字符串）。
+
+### 2.3 代码
+
+- `settings.ts` 单文件 2400+ 行，渲染方法职责清晰，但体量偏大，后续可考虑按分区拆分（非本轮范围）。
+- `components.ts` 组件库（卡片/分区/图标按钮/进度条/弹窗壳）抽象良好，复用充分。
+- 无新增空指针 / 资源泄漏 / 异常缺失问题。
+
+---
+
+## 三、本轮优化清单（已落地）
+
+### 3.1 `src/settings.ts`
+
+1. **`display()` 分区重排 + 折叠**
+   - 顺序：连接 → 同步目录 → 同步模式 → 冲突与删除 → 同步范围 → 远程存储与分析 → 端到端加密 → 本设备 → 实验室 → 高级性能 → 日志与诊断 → 维护。
+   - 「实验室」「高级性能参数」「日志与诊断」默认折叠（`defaultOpen: false`）。
+   - 「同步范围」图标由 `folder` 改为 `filter`，避免与「同步目录」重复。
+
+2. **描述文案精简（保留原意，口语化）**
+   - 同步模式：自动间隔、保存时同步。
+   - 冲突与删除：冲突策略、删除策略、覆盖前备份、批量删除确认、合并草稿、合并面板、撤销合并。
+   - 同步范围：include/exclude 通配符提示。
+   - 端到端加密：启用说明、忘记密码警告、密钥文件说明。
+   - 高级性能：请求间隔、风暴阈值、脏集合窗口、自适应并发、大文件通道、API 健康探查。
+   - 设备：界面主题。
+   - 本设备快照：自动快照、保留快照数。
+   - 实验室：总说明、MediaBridge/Backlinks/Offline Pin/Health Score 提示、Git 与局域网 P2P 描述。
+   - 孤儿清理：扫描模式、最大递归深度。
+
+3. **孤儿清理说明降噪**
+   - 原 10 段密集说明 → 1 句摘要 + 可折叠「详细说明」分区（9 条要点），关键安全提示保留。
+
+### 3.2 `styles.css`
+
+- 末尾追加**非破坏性一致性增强层**（不改动既有单行长规则）：
+  - `.bdnsync-setting-tab` 限宽 880px 居中，提升长文可读性。
+  - 折叠分区头统一 `cursor` / 悬停背景 / 箭头过渡。
+  - `.bdnsync-callout-text` 行高统一为 1.65，降低密集段落压迫感。
+  - `.bdnsync-setting-footer` 分隔线与弱色样式。
+  - `.bdnsync-danger-zone` 左侧红色强调线，与卡片语言一致。
+  - 入口卡 / 选择卡统一悬停动效（上浮 + 阴影）。
+
+### 3.3 `CHANGELOG.md`
+
+- `CHANGELOG.md` 对应版本条目新增「优化：设置面板结构与文案（UI/UX 一致性）」。
+
+---
+
+## 四、验证结果
+
+| 闸门 | 命令 | 结果 |
+| --- | --- | --- |
+| 类型检查 | `tsc --noEmit -skipLibCheck` | ✅ 通过 |
+| 规范 | `eslint src/settings.ts` | ✅ 无告警 |
+| 生产构建 | `node esbuild.config.mjs production` | ✅ 通过 |
+
+> 注：UI 视觉效果需在 Obsidian 内加载插件后人工确认（沙箱无法渲染 Obsidian 设置页）。本次改动均为结构/文案/CSS，不影响逻辑与接口。
+
+---
+
+## 五、可选后续方向（非必须）
+
+1. 将 `settings.ts` 按分区拆分为 `settings/*.ts`，降低单文件体量、提升可维护性。
+2. 为「连接状态卡片」外的其余分区补齐统一的「分区图标 + 状态徽标」视觉范式。
+3. 提供设置项「搜索 / 目录跳转」入口，便于超长设置快速定位（已折叠后优先级降低）。
+
+---
+
+## 六、第二轮补充审查与优化（2026-08-28）：命令门控与界面/代码一致性
+
+> 承接第一轮「设置面板」优化，本轮回答「还有哪些地方需要优化」并一次性闭环全部 P0/P1/P2 项。原则不变：**接口与功能零改动**，仅做入口收敛、视觉统一、文案治理与一处性能解冻。
+
+### 6.1 分层发现（设置面板之外）
+
+| 编号 | 问题 | 位置 | 严重程度 | 处置 |
+| --- | --- | --- | --- | --- |
+| P0-1 | 命令面板未随实验室 / 高级开关收口，关闭开关后仍暴露对应命令 | `src/main.ts` `addCommand` | 高 | 按开关门控包裹 |
+| P0-2 | 三大视图（explorer/dash/preview）疑似零设计令牌 | 各 `*View` | 高（误判） | 抽样核查：各有连贯子令牌，**不重写布局**，仅接入共享空态 |
+| P0-3 | 术语「云端 / 网盘」混用 | 多处 | 中（误判） | 核查：属统一三方模型（网盘=产品名），**不盲改核心文案** |
+| P1-4 | 状态栏快速操作浮层无高度上限、分组分隔不清 | `styles.css` | 中 | 限高 72vh + 滚动、分组分隔线 |
+| P1-5 | 网盘浏览器视图内联空态样式漂移 | `netdisk-browser-view.ts` | 中 | 接入统一空状态组件 |
+| P1-6 | 连接/授权弹窗未对齐设置面板 | `connection-modal.ts` | 中（误判） | 抽样核查：已高度对齐，**不改动** |
+| P2-7 | Git 增量同步 `spawnSync` 主线程阻塞（1.0.5 已知限制） | `git-change-source.ts` | 中 | 异步化 `spawn` + 20s 超时 |
+| P2-8 | 提示文案散落各处、前缀不统一 | 多文件 `new Notice` | 低 | 集中 `Notices` 字典 + 脚本迁移 |
+| P2-9 | 窄屏（≤640px）无适配，工具栏/浮层溢出 | `styles.css` | 低 | 追加移动端媒体查询 |
+
+### 6.2 本轮优化清单（已落地）
+
+1. **`src/main.ts` — P0-1 命令门控**
+   - 合并面板 / 撤销合并包 `if (this.settings.mergeDraftEnabled)`。
+   - Git 同步包 `if (this.settings.labEnabled && this.settings.labGitEnabled && Platform.isDesktop)`。
+   - 局域网三命令包 `if (this.settings.labEnabled && this.settings.labLanEnabled && Platform.isDesktop)`。
+   - `bdn://` 引用命令包 `if (this.settings.labEnabled && this.settings.cloudMediaEnabled)`。
+   - 跨设备看板保持常驻。
+
+2. **`src/lab/git-change-source.ts` — P2-7 异步化**
+   - 新增 `AsyncGitRunner` 接口与 `defaultAsyncRunner()`（`cp.spawn` + Promise + 20s 超时 `child.kill('SIGKILL')`）。
+   - 构造函数注入 `asyncRunner?`；`runGit(args)` 优先用注入的同步 runner（保单测兼容），否则走异步。
+   - `collect()` 内全部 `runner.run(...)` → `await this.runGit(...)`，语义不变。
+
+3. **`src/ui/components.ts` — P1-5 共享组件**
+   - 新增 `EmptyStateOpts` / `createEmptyState(container, opts)` / `createSkeleton(container, lines?)`。
+   - 配套 `.bdnsync-emptystate*`、`.bdnsync-skeleton*` 样式（见 `styles.css`）。
+
+4. **`src/ui/notices.ts` — P2-8 集中字典（新建）**
+   - `const PREFIX = 'BDNSync：'`；`emit(level, msg, timeout?)`；`noticeOk/noticeErr/noticeInfo`。
+   - 语义化 `Notices` 对象覆盖同步/下载/删除/创建/重命名/移动/解密/预览/缩略图/分享等，文案与历史逐字一致。
+   - 经 `scripts_migrate_notices.py` 将 29 处 `new Notice(...)` 精确替换为 `Notices.*`，残留 0。
+
+5. **`src/ui/views/netdisk-browser-view.ts` — P1-5 + P2-8 接入**
+   - import 改为 `import { Notices } from '../notices';` 并移除 `Notice` 直接引用；引入 `createEmptyState`。
+   - 三处内联空/错误态（加载失败 / 搜索失败 / 目录为空）统一改用 `createEmptyState(...)`（图标 `folder`）。
+
+6. **`styles.css` — P1-4 / P2-9 增强**
+   - 空态/骨架：`--emptystate*`、`bdnsync-shimmer` 动画。
+   - 状态栏浮层：`.bdnsync-quick-actions { max-height: 72vh; overflow-y: auto; }`、`.bdnsync-popover-grid` 分组分隔线、`.bdnsync-quick-group-label` 间距。
+   - 移动端：`@media (max-width: 640px)` 设置页/选择卡/工具栏换行、状态栏文字隐藏、浮层 88vw、冲突面板纵向。
+
+7. **复核未改（附带说明，避免误判回潮）**
+   - `connection-modal.ts`：已用 `createCard`/`createIconButton`/`bdnsync-modal-head` 统一徽标，判定无需改动。
+   - `status-bar.ts` / `onboarding.ts` / `modals.ts`：设计令牌统一、键盘/aria 到位。
+   - 三大视图：各有 `bdnsync-explorer-*` / `bdnsync-dash-*` / `bdnsync-preview-*` 连贯子令牌，仅接入共享空态，不重写布局。
+
+### 6.3 验证结果
+
+| 闸门 | 命令 | 结果 |
+| --- | --- | --- |
+| 类型检查 | `tsc --noEmit -skipLibCheck` | ✅ 通过 |
+| 规范 | `node node_modules/eslint/bin/eslint.js src/main.ts src/lab/git-change-source.ts src/ui/views/netdisk-browser-view.ts src/ui/notices.ts src/ui/components.ts` | ✅ 无告警 |
+| 生产构建 | `node esbuild.config.mjs production` | ✅ 通过（产物 `main.js` 529 KB） |
+| 提示迁移 | `scripts_migrate_notices.py`（29 处 `new Notice` → `Notices.*`） | ✅ 残留 0 |
+
+> 注：两轮优化累计 `styles.css` 约 135 KB（一致性增强层累加）；所有改动均不改变对外接口与同步行为。移动端/浮层视觉效果仍需在 Obsidian 内人工确认。
+
+---
+
+## 七、第三轮：接口 / 数据通信全链路排查与微交互打磨（2026-08-28）
+
+> 回答上一轮收尾后的延续诉求——「全面排查并验证所有前端与后端的接口链接及数据通信」「逐一测试各功能模块，修复失效或断层」。本轮分两条线：**(A) 接口 / 通信健壮性**（偏数据安全，高危项闭环）；**(B) 前端微交互打磨**（偏视觉细节与反馈）。
+
+### 7.1 接口 / 数据通信全链路排查（A 线）
+
+#### 7.1.1 排查范围与结论
+
+| 链路 | 实现 | CORS / 鉴权风险 | 结论 |
+| --- | --- | --- | --- |
+| 云端 API（百度） | `requestUrl`（Electron net） | 无浏览器 CORS（不走 `fetch`） | ✅ 真实语境不构成 CORS 风险 |
+| 本地媒体流预览 | 浏览器 `fetch` → `http://127.0.0.1:<port>/stream` | `StreamServer` 已下发 `Access-Control-Allow-Origin` | ✅ CORS 已闭合 |
+| 局域网 P2P | `TcpLink` 原始 TCP + AES-256-GCM | 无 HTTP / 无 CORS | ✅ 无相关风险面 |
+| 百度 OpenAPI 鉴权 | `access_token` 拼 query + `refreshAccessToken` 刷新 | token 过期处理 | ⚠️ 此前客户端健壮性不足 |
+
+**核心结论**：Obsidian 插件语境下 CORS 不是真实风险点；真正问题在**百度 API 客户端对「非预期响应」的健壮性**，已闭环 4 处（A8 / A9 / 分片上传刷新 / getUserInfo 可观测性）。
+
+#### 7.1.2 缺陷修复清单（已落地）
+
+| 编号 | 严重程度 | 问题 | 位置 | 修复 |
+| --- | --- | --- | --- | --- |
+| A9 | 🔴 高（数据安全） | `safeJson` 返回 `null` 时 `Number(null?.errno ?? 0) === 0` 被误判成功 → `listDir` 误判空目录 → 引擎同步**删除本地文件** | `api.ts` `openRequest` | `data === null \|\| resp.status >= 400` 一律抛 `BaiduApiError`（5xx/status 0 标 `transient`），鉴权类 errno 先刷新重试 |
+| A8 | 🟡 中 | openapi POST 缺 `Content-Type`，部分端点拒绝 | `api.ts` `openRequest` | POST 显式 `application/x-www-form-urlencoded`（cookie 模式原本已带） |
+| A10 | 🟡 中 | 分片上传遇 token 过期整批失败，需人工重授权 | `api.ts` `superfileUpload` | 捕获 `AUTH_ERRNOS`（111/-6/50305）→ `sawAuthErrno`；抛错前若未重试且刷新成功则自递归一次 |
+| A11 | 🟢 低 | `getUserInfo` 静默吞错掩盖未授权 | `api.ts` `getUserInfo` | `catch (e)` 对 `AUTH_FAILED`/`Error` `console.debug` 脱敏记录后返回默认值 |
+
+#### 7.1.3 第三方 QR 服务审计（info 级，不改动）
+
+`device-auth-modal.ts` 中 `setQr()` **优先**使用百度返回的 `qrcodeUrl`（`qrcode_url`），仅当缺失时回退 `api.qrserver.com` 生成二维码，且 `img.onerror` 已降级到「手动码」文案。属 info 级隐私关切（第三方服务仅在百度不出码时触达），既有降级完备，**本轮不改动**，仅在此文档化。
+
+### 7.2 前端微交互打磨（B 线）
+
+| 编号 | 问题 | 位置 | 严重程度 | 处置 |
+| --- | --- | --- | --- | --- |
+| M1 | 按钮禁用态无明确视觉反馈（opacity 不改、仍可点） | `styles.css` | 中 | 统一 `:disabled` 态 `opacity:.45;cursor:not-allowed;pointer-events:none` |
+| M2 | 长耗时操作（上传/同步）无「进行中」指示 | `styles.css` | 中 | `.bdnsync-status[aria-busy]` / `.bdnsync-btn[aria-busy] .bdnsync-btn-icon` 旋转动画 |
+| M3 | 表单输入非法无即时反馈 | `styles.css` + `components.ts` | 中 | 新增 `.bdnsync-input-invalid` + `.bdnsync-field-hint/-error/-ok` 三态；`createValidatedText` 组件 |
+| M4 | LAN 端口超出范围被静默忽略（断层） | `settings.ts` | 高 | 两个端口 `addText` 内联 hint 即时校验 1–65535，留空对端端口提示「回退默认」 |
+| M5 | 系统「减弱动效」设置未完全尊重 | `styles.css` | 低 | `@media (prefers-reduced-motion: reduce)` 覆盖全部关键帧 + 过渡 |
+
+### 7.3 验证结果
+
+| 闸门 | 命令 | 结果 |
+| --- | --- | --- |
+| 类型检查 | `tsc --noEmit -skipLibCheck` | ✅ 通过（TSC_EXIT=0） |
+| 规范 | `node node_modules/eslint/bin/eslint.js` 6 个改动文件 | ✅ 无告警（ESLINT_EXIT=0） |
+| 单元测试 | `vitest run` | ✅ 268 项全过（18 文件） |
+| 生产构建 | `node esbuild.config.mjs production` | ✅ 通过（产物 `main.js` 531 KB，已重构建确认含本轮源码） |
+
+> 注：需真实百度凭据的在线场景（授权 / 上传 / 同步 / 预览）与 Office 预览 `iframe`（依赖 WebView Cookie 罐、可用性脆弱）沙箱无法跑，属环境限制，非本轮回退；已在 `CHANGELOG.md [1.0.6]` 标注为已知限制。

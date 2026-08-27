@@ -440,6 +440,39 @@ export function createProgressBar(container: HTMLElement, label?: string): Progr
   };
 }
 
+// ---------------- 空状态 / 加载态（跨弹窗与视图统一） ----------------
+
+export interface EmptyStateOpts {
+  icon?: IconName;
+  title: string;
+  desc?: string;
+  /** 追加到根节点的额外 class（如保留各视图自身样式） */
+  cls?: string;
+}
+
+/** 统一空状态：图标 + 标题 + 可选描述，跨网盘浏览器 / 看板 / 日志 / 弹窗复用，视觉一致 */
+export function createEmptyState(container: HTMLElement, opts: EmptyStateOpts): HTMLElement {
+  const wrap = container.createDiv({
+    cls: `bdnsync-emptystate ${opts.cls ?? ''}`.trim(),
+  });
+  if (opts.icon) {
+    const iconEl = wrap.createDiv({ cls: 'bdnsync-emptystate-icon' });
+    setIcon(iconEl, opts.icon, 28);
+  }
+  wrap.createDiv({ cls: 'bdnsync-emptystate-title', text: opts.title });
+  if (opts.desc) wrap.createDiv({ cls: 'bdnsync-emptystate-desc', text: opts.desc });
+  return wrap;
+}
+
+/** 骨架屏占位：加载中显示若干 shimmer 行，避免「空白闪烁」 */
+export function createSkeleton(container: HTMLElement, lines = 3): HTMLElement {
+  const wrap = container.createDiv({ cls: 'bdnsync-skeleton' });
+  for (let i = 0; i < lines; i++) {
+    wrap.createDiv({ cls: 'bdnsync-skeleton-line' });
+  }
+  return wrap;
+}
+
 // ---------------- 小型浮层 Popover ----------------
 
 export interface PopoverHandle {
@@ -649,6 +682,76 @@ export function createEl<K extends keyof HTMLElementTagNameMap>(
   const el = container.createEl(tag, cls ? { cls } : undefined);
   if (text) el.setText(text);
   return el;
+}
+
+// ---------------- 内联表单校验（微交互：即时反馈，不依赖弹窗） ----------------
+
+export interface ValidatedTextHandle {
+  input: HTMLInputElement;
+  /** 手动设置校验结果（error 非空即非法，显示红框 + 提示） */
+  setResult: (error: string | null, okHint?: string) => void;
+}
+
+/**
+ * 带内联校验提示的文本输入：失焦/输入时调用 validator，
+ * 非法时输入框加 `.bdnsync-input-invalid` 红框并下方显示错误提示，合法时显示可选的 OK 提示。
+ * 校验为纯前端即时反馈，不改变既有 onChange 的数据写入逻辑。
+ *
+ * @param validator 返回错误文案（非空=非法）；返回空字符串表示合法。
+ *                  可用返回值区分「错误」与「提示」：返回 {error, hint} 时用对象形式。
+ */
+export function createValidatedText(
+  container: HTMLElement,
+  opts: {
+    value?: string;
+    placeholder?: string;
+    type?: string;
+    validator?: (v: string) => string | null;
+    onChange?: (v: string, handle: ValidatedTextHandle) => void;
+  },
+): ValidatedTextHandle {
+  const wrap = container.createDiv({ cls: 'bdnsync-field' });
+  const input = wrap.createEl('input', {
+    type: opts.type ?? 'text',
+    value: opts.value ?? '',
+    placeholder: opts.placeholder ?? '',
+    cls: 'bdnsync-input',
+  });
+  const hint = wrap.createDiv({ cls: 'bdnsync-field-hint', attr: { style: 'display:none' } });
+
+  const setResult = (error: string | null, okHint?: string) => {
+    if (error) {
+      input.classList.add('bdnsync-input-invalid');
+      hint.classList.remove('bdnsync-field-hint-ok');
+      hint.classList.add('bdnsync-field-hint-error');
+      hint.textContent = error;
+      hint.style.display = '';
+    } else if (okHint) {
+      input.classList.remove('bdnsync-input-invalid');
+      hint.classList.remove('bdnsync-field-hint-error');
+      hint.classList.add('bdnsync-field-hint-ok');
+      hint.textContent = okHint;
+      hint.style.display = '';
+    } else {
+      input.classList.remove('bdnsync-input-invalid');
+      hint.classList.remove('bdnsync-field-hint-error', 'bdnsync-field-hint-ok');
+      hint.textContent = '';
+      hint.style.display = 'none';
+    }
+  };
+
+  const handle: ValidatedTextHandle = { input, setResult };
+
+  input.addEventListener('input', () => {
+    if (opts.validator) setResult(opts.validator(input.value));
+    opts.onChange?.(input.value, handle);
+  });
+  input.addEventListener('blur', () => {
+    if (opts.validator) setResult(opts.validator(input.value));
+  });
+
+  if (opts.validator && opts.value) setResult(opts.validator(opts.value));
+  return handle;
 }
 
 // ---------------- 轻量小弹窗（确认 / 提示 / 输入） ----------------
