@@ -514,7 +514,10 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     const avatarInner = avatar.createDiv({ cls: 'bdnsync-vip-avatar-inner' });
     const vip = this.plugin.lastVipInfo;
     const vipTier = vip?.vipType === 2 ? 'is-svip' : vip?.vipType === 1 ? 'is-vip' : 'is-normal';
-    avatar.classList.add(`bdnsync-vip-avatar-${vipTier}`);
+    // 注意：CSS 定义为 `.bdnsync-vip-avatar.is-svip`（**两个**类），这里必须 add 独立的
+    // 状态类。历史写法拼成 `bdnsync-vip-avatar-is-svip`（连写）无任何匹配规则，
+    // 导致会员金色 / 普通蓝等配色**全部不生效**（验收发现）。
+    avatar.classList.add(vipTier);
 
     // 真实头像：uinfo 接口返回的 avatar_url（或 uk 兜底拼接的默认头像）。
     // 头像加载失败（404 / 网络问题）时回退到默认 user-round 图标，避免出现破图。
@@ -557,7 +560,8 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       text: vip?.name || this.plugin.lastTestedUser || '百度网盘',
       cls: 'bdnsync-vip-name',
     });
-    const vipBadge = headRow.createSpan({ cls: `bdnsync-vip-badge bdnsync-vip-badge-${vipTier}` });
+    // 同上：状态类必须与基础类并列（`.bdnsync-vip-badge.is-svip`），不能连写
+    const vipBadge = headRow.createSpan({ cls: `bdnsync-vip-badge ${vipTier}` });
     vipBadge.setText(vip?.vipLabel ?? '账号');
     const resultEl = headRow.createSpan({ cls: 'bdnsync-vip-connresult' });
     resultEl.setText('已连接');
@@ -570,7 +574,8 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         : vip?.vipType === 1
           ? '可解锁 1080P 及以下'
           : '账号等级 ≤ 720P';
-    const tierEl = subRow.createSpan({ cls: `bdnsync-vip-tier bdnsync-vip-tier-${vipTier}` });
+    // 同上：`.bdnsync-vip-tier.is-svip`
+    const tierEl = subRow.createSpan({ cls: `bdnsync-vip-tier ${vipTier}` });
     tierEl.setText(tierText);
     const timeEl = subRow.createSpan({ cls: 'bdnsync-vip-time' });
     timeEl.setText(

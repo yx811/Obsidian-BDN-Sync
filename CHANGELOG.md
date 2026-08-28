@@ -2,9 +2,47 @@
 
 本文件记录 BDNSync 的所有版本变更。版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-> 📌 最新版本：**1.0.6**（2026-08-28）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+> 📌 最新版本：**1.0.7**（2026-08-29）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
 
 ---
+
+## [1.0.7] - 2026-08-29
+
+### 修复：插件启用后设置弹窗自动关闭 / 需要反复重新启用 / 界面不稳定（生命周期与交互稳定性）
+
+- **① 设置弹窗被强制关闭（主因）**（`src/main.ts`）：`syncNow()` 与 `runQuickSync()` 开头**无条件**调用 `closeSettingsIfOpen()`（内部强制 `app.setting.close()`）。而 `syncOnStartup` 默认为 `true`，在「设置 → 第三方插件」中启用插件时 `onLayoutReady` 立即触发 startup 同步 → 设置弹窗被当场关闭；日常编辑笔记触发 quickSync 时也会无故关闭正在配置的设置页。修复：移除无条件关闭，改为仅在**确实要弹出 Modal** 时（`openExclusive` 内创建弹窗后）才关闭设置页，保留「避免弹窗叠加在设置容器上方造成 z-index 混乱」的原意。
+- **② 会话中启用插件不再抢占 UI**：注册 `onLayoutReady` 时用 `registrationDone` 判定回调是否**同步**触发——同步触发即「用户在会话中手动启用」（而非随 Obsidian 应用启动），此时传 `skipStartupSync: true` 跳过启动同步，避免抢占用户正在操作的设置页；随应用启动加载的场景行为完全不变（仍会执行启动同步）。
+- **③ 需要反复重新启用（加载韧性）**：`onload()` 中 `addSettingTab` 原位于末尾，此前任何一步（设置读取 / 日志器 / 后端 / 视图 / 状态栏 / 命令）抛错都会让 Obsidian 判定「插件加载失败」→ 设置页不注册、功能全部不可用，只能反复关闭再启用。修复：改为三段式——① 设置加载 `try/catch`、失败回退 `DEFAULT_SETTINGS`；② **设置页最先注册**（任何情况下都能进设置页排查 / 重配）；③ 其余子系统抽到 `initSubsystems()` 整体 `try/catch` 隔离 + 日志器二次隔离，单点失败只记日志并降级该功能，不再拖垮整体加载。
+- **④ 界面不稳定（未处理的 Promise rejection）**：`void this.onLayoutReady()`（其内 `await syncNow('startup')` 无任何保护）、`void logger.purge()`、`void loadTransferStateForRetry()`、`void retryQueue.flush()`、`void syncNow('online')` 均缺 `.catch`；`RetryQueue` 轮询内 `void this.flush()` / `void this.persist()` 同样裸调用（每 15s 一次）。同步失败即产生未处理 rejection 污染 Obsidian 宿主，是「页面不稳定」的常见诱因。修复：全部补 `.catch`；`onLayoutReady` 方法整体 `try/catch`、启动同步单独 `try/catch`；30s 调度定时器回调加保护。
+- **⑤ `registerInterval(window.setTimeout(...))` 类型误用**：`registerInterval` 内部按 `clearInterval` 清理，把 `setTimeout` 的 id 交给它语义不等价。API 探查的 15s 一次性延迟启动改为 `this.register(() => clearTimeout(id))`。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` 268 项全过（18 文件）；`main.js` 重构建（533 KB）。
+
+### 修复：全面质量验收发现的问题（数据安全 / 重试闭环 / 样式完整性 / 构建流程）
+
+- **① 密钥文件模式未接线 → 静默明文上传（🔴 数据安全）**（`src/main.ts`、`src/util/keyfile.ts`）：`makeEncryptor()` 只读 `settings.encryptionPassword`，而 `resolveEncryptionPassword()` **全仓零调用**。用户开启「端到端加密」并只配置「密钥文件路径」、密码留空时，加密器返回 `null` → 文件以**明文上传且无任何提示**。修复：新增 `refreshEncryptionKey()` 异步解析密钥文件并缓存，在 `initSubsystems()` 构造后端前与 `saveSettings()` 中各调用一次；解析失败时记录醒目告警并保留 `encryptionKeyError`，杜绝「以为加密了实则明文」的黑盒降级。
+- **② 重试队列退避与次数上限失效 → 永久失败项无限重试（🔴）**（`src/sync/retry-queue.ts`）：`flush()` 在调用 `flushFn` **之前**就把到期条目移出 `items`，而 `flushFn`（`runQuickSync`）内部 catch 后再调 `registerFailure`；此时条目已不在队列中，`registerFailure` 恒以 `attempts=1` 重建 → 指数退避永远停在最小值（1s）、`MAX_ATTEMPTS`(8) 永远触不到，永久失败的文件每 15s 被无限重试、空耗 API 配额。修复：新增 `attemptsMemo` 跨 flush 周期保留 attempts；超过上限即放弃并 `console.warn`；成功后清除记忆，避免历史累计次数误伤后续偶发失败。
+- **③ 孤儿清理弹窗约 25 个 CSS 类零样式 → 界面塌陷（🔴）**（`src/styles.css`）：TS 中使用 37 个 `bdnsync-orphan-*` 类，样式表仅覆盖 15 个 —— 头部统计 / 分组 / 工具栏 / 类型标签 / 失败明细 / 来源说明 / 回收站提示全是裸 div。已一次性补齐，统一沿用设计令牌与 Obsidian 主题变量。
+- **④ 会员等级配色不生效（🟡）**（`src/settings.ts`）：TS 拼出连写类名 `bdnsync-vip-avatar-is-svip`，而 CSS 定义为 `.bdnsync-vip-avatar.is-svip`（**两个**类），导致金色 / 蓝色会员配色全部失效。修复：改为添加独立状态类；并补上此前完全无样式的 `.bdnsync-vip-tier`。
+- **⑤ 构建产物覆盖样式源码（🔴 可维护性）**（`esbuild.config.mjs`）：生产构建把压缩后的 `main.css` 复制回 `styles.css`，而 `styles.css` 正是 `src/main.ts` 导入的**源码** —— 每次构建都用单行压缩产物覆盖手写样式（仓库里一度只剩 1 行 136 KB 的压缩 CSS，无法维护、无法 code review）。修复：**源码迁至 `src/styles.css`**，根目录 `styles.css` 仅作 Obsidian 加载的构建产物，并在构建中加安全阀校验源码存在（缺失即报错退出）。
+- **⑥ 可点击路径无视觉提示 / 减弱动效覆盖不全（🟡）**：补 `.bdnsync-log-path-clickable` 的 `cursor:pointer` 与虚线下划线；`@media (prefers-reduced-motion: reduce)` 补齐 `hub-pulse` / `shimmer` / `blink` / `pulse` / `vip-warn` / `modal-in` / `orphan-scan-spinner` 等无限循环动画。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` 268 项全过；`main.js` 535 KB，产物 `styles.css` 140 KB，源码 `src/styles.css` 98 行（构建后仍完好，不再被覆盖）。
+
+### 修复：验收遗留的非阻断问题全部闭环（收尾）
+
+- **① 接线 `engine.cancel()` 取消同步能力**（`src/main.ts`、`src/sync/engine.ts`）：`cancel()` 此前**零调用**，其 6 处阶段 / 文件边界守卫（`engine.ts:913 / 993 / 1201 / 1225 / 1246`）全部不可达，注释承诺的「用户可中止」实际没有任何入口。新增命令「BDNSync：取消当前同步」与 `cancelSync()`；引擎在下个阶段 / 文件边界安全中止（不会在写盘或网络请求中途硬切），无进行中同步时给出明确提示。
+- **② 接线 `RetryQueue.markSuccess()`**：此前零调用，成功出队完全依赖「flush 提前移除条目」的副作用，语义不清晰且状态栏重试计数不会及时回落。现在在 `runQuickSync` 的**部分成功**与**全部成功**两条路径显式调用，成功 / 失败两条半环才算真正闭环。
+- **③ 接线 `DirtySet.matchRename()` 跨批次重命名配对**：此前零调用（死代码）。修复时**修正了其语义** —— 命中后不再把 oldPath 从脏集合移除（调用方并不执行 move，移除会让引擎看不到删除侧、造成远端残留旧文件），而是把 old / new **双双加回脏集合**，使两端同批提交，由引擎按内容 hash 判定为 move（保留云端 fsId、不重传内容）。同时在 vault `create` 事件中调用并写入日志。
+- **④ API 健康探查：限频字段启用 + 开关热生效**（`src/main.ts`、`src/types.ts`）：`lastApiProbeAt` 此前在 `src/` 中**零读写**（假设置项）；探查定时器只在 `onload` 注册一次，设置页改动「启用探查 / 探查周期」后必须重载插件才生效。修复：抽出 `restartApiProbe()` 并在 `saveSettings()` 中调用以热生效；`runApiProbe()` 写入 `lastApiProbeAt`，启动后的首次探查按「距上次不足半个周期则跳过」限频，避免反复重启刷接口。
+- **⑤ 删除死代码 `src/ui/netdisk-browser.ts`**（705 行）：其中的 `NetdiskBrowserModal` 已被 `NetdiskBrowserView`（独立标签页）取代，全仓无 import、无 `new`、无测试引用。已删除。
+- **⑥ 跨设备看板轮询打磨**（`src/ui/views/cross-device-dashboard-view.ts`）：每 15s 的 `renderCanvas()` 内部 `canvas.empty()` 是整块重建，会丢失滚动位置、打断文本选择，且后台标签页仍在空耗。修复：`document.hidden` 时跳过重绘；重绘前后保存并恢复 `scrollTop`。
+- **⑦ 无障碍与窄屏细节**：媒体播放器 15 个图标按钮只设了 `title`，统一同步为 `aria-label`（读屏软件支持更强）；孤儿清理「手动录入」行补 `flex-wrap`，避免窄弹窗下输入框横向溢出；看板画布补 `overflow-y: auto`。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`（0 error）、`esbuild production` 全绿；`vitest run` **268 项全过**（18 文件）；`main.js` 537 KB。
+
+### 发布元数据
+
+- 版本号：**1.0.7**（自 1.0.6 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` / `package.json` 同步更新为 1.0.7。
+- 构建产物 `main.js` / `styles.css` 由 CI 自动生成，不在版本控制中。
+- 样式**源码**为 `src/styles.css`（自 v1.0.6 起与根目录的构建产物分离，避免被生产构建覆盖）。
 
 ## [1.0.6] - 2026-08-28
 

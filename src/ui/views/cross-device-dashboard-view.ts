@@ -92,8 +92,15 @@ export class CrossDeviceDashboardView extends ItemView {
     const foot = root.createDiv({ cls: 'bdnsync-dash-foot' });
     this.updatedEl = foot.createSpan({ cls: 'bdnsync-dash-updated', text: '准备中…' });
 
-    // 轻量轮询：仅重算本地索引聚合（无网络往返）
-    this.pollTimer = window.setInterval(() => this.renderCanvas(), 15000);
+    // 轻量轮询：仅重算本地索引聚合（无网络往返）。
+    // 两处打磨（验收发现）：
+    //   1) 标签页不可见时跳过重绘 —— renderCanvas() 内部 canvas.empty() 是整块重建，
+    //      在后台标签页里纯属空耗 CPU；
+    //   2) 重绘前后恢复滚动位置 —— 整块重建会丢失 scrollTop 并打断用户的文本选择。
+    this.pollTimer = window.setInterval(() => {
+      if (document.hidden) return;
+      this.renderCanvasPreserveScroll();
+    }, 15000);
     window.addEventListener('online', this.onOnline);
     window.addEventListener('offline', this.onOffline);
 
@@ -128,6 +135,13 @@ export class CrossDeviceDashboardView extends ItemView {
   }
 
   // ---- 画布整体渲染 ----
+
+  /** 重绘画布并在整块重建后恢复滚动位置（canvas.empty() 会丢失 scrollTop、打断文本选择） */
+  private renderCanvasPreserveScroll(): void {
+    const prev = this.canvasEl ? this.canvasEl.scrollTop : 0;
+    this.renderCanvas();
+    if (this.canvasEl && prev > 0) this.canvasEl.scrollTop = prev;
+  }
 
   private renderCanvas(cloud?: CloudSnapshot): void {
     const idx = this.plugin.store?.lastLoadedIndex ?? null;

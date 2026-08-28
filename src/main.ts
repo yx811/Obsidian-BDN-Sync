@@ -76,7 +76,7 @@ import {
   type ClassifyOptions,
 } from './util/orphan-scan';
 import { sealSecretsInPlace, unsealSecretsInPlace } from './security/secrets';
-import { keyFileTemplate, DEFAULT_KEY_FILE } from './util/keyfile';
+import { keyFileTemplate, DEFAULT_KEY_FILE, resolveEncryptionPassword } from './util/keyfile';
 import { RetryQueue } from './sync/retry-queue';
 import { DirtySet } from './sync/dirty-set';
 import { StreamServer } from './stream-server';
@@ -86,8 +86,11 @@ import { evaluateSyncHealth } from './lab/health-score';
 import { GitChangeSource, isGitRepo } from './lab/git-change-source';
 import { LanBackend, LanPeer } from './lab/lan/lan-backend';
 import { LanDiscovery } from './lab/lan/discovery';
-// 引入插件样式：esbuild 会将其打包并通过 onload 注入，缺失会导致全部 UI 弹窗无样式
-import '../styles.css';
+// 引入插件样式：esbuild 会将其打包并通过 onload 注入，缺失会导致全部 UI 弹窗无样式。
+// 注意：源码固定为 src/styles.css（可维护、可 code review）；仓库根目录的 styles.css
+// 是 esbuild 产出的、供 Obsidian 自动加载的**构建产物**，二者不可混为一谈——
+// 历史上二者是同一个文件，导致每次生产构建都用压缩产物覆盖手写源码（样式源码被毁）。
+import './styles.css';
 
 const PLUGIN_DIR = '.obsidian/plugins/bdnsync';
 /** 局域网 P2P 同步专用本地索引目录（与云端索引隔离，避免 index namespace 冲突） */
@@ -113,6 +116,16 @@ export default class BDNSyncPlugin extends Plugin {
 
   private api!: BaiduApi;
   private cloudAdapter!: BaiduAdapter;
+  /**
+   * 密钥文件模式（#3.5）解析后的实际加密密码缓存。
+   * 密钥文件读取是异步的（vault 文件 IO），而 makeEncryptor() 是同步的，
+   * 因此在这里缓存解析结果，由 refreshEncryptionKey() 在构造后端前刷新。
+   */
+  private resolvedEncryptionPassword = '';
+  /** 密钥解析失败原因（供日志/设置页呈现，杜绝「以为加密了实则明文」的黑盒） */
+  private encryptionKeyError: string | null = null;
+  /** API 健康探查的定时器句柄（周期 + 一次性），供 restartApiProbe 重建时统一清理 */
+  private apiProbeTimers: number[] = [];
   /** 局域网 P2P：本机作为「被同步对端」时的服务实例（另一台设备连它拉/推） */
   private lanPeer: LanPeer | null = null;
   /** 局域网 P2P：UDP 信标广播（让同网段其他设备发现本机） */
@@ -142,31 +155,81 @@ export default class BDNSyncPlugin extends Plugin {
   /** 本地流式代理：供预览 Modal 免落盘在线打开/播放网盘文件（还原澜库 /stream 能力） */
   private streamServer: StreamServer | null = null;
 
+  /**
+   * 插件加载入口（韧性优先）。
+   *
+   * 背景：此前 onload 内任何一步抛错（data.json 损坏、日志目录异常、视图注册失败…）
+   * 都会让 Obsidian 判定「插件加载失败」——设置页不注册、功能全部不可用，用户只能
+   * 反复「关闭再启用」，且每次重启都要重来。
+   *
+   * 现改为三段式：
+   *   1) 设置加载：单独兜底，失败回退默认值；
+   *   2) 设置页**最先**注册：保证任何情况下用户都能进设置页排查/重配；
+   *   3) 其余子系统整体隔离 + 日志器二次隔离：单点失败只记日志并降级该功能，
+   *      不再拖垮整体加载。
+   */
   async onload(): Promise<void> {
-    await this.loadSettings();
-    // #2.2 移动端：按平台下调并发/分片/风暴阈值（桌面端原样返回；已自定义值不覆盖）
-    applyMobileDefaults(this.settings);
+    // 1) 设置（最关键，单独兜底）
+    try {
+      await this.loadSettings();
+      // #2.2 移动端：按平台下调并发/分片/风暴阈值（桌面端原样返回；已自定义值不覆盖）
+      applyMobileDefaults(this.settings);
+    } catch (e) {
+      console.error('[BDNSync] 设置加载失败，已回退默认设置：', e);
+      this.settings = { ...DEFAULT_SETTINGS };
+    }
+    // 2) 设置页最先注册：即便后续初始化全部失败，用户仍能看到并配置插件
+    try {
+      this.addSettingTab(new BDNSyncSettingTab(this.app, this));
+    } catch (e) {
+      console.error('[BDNSync] 设置页注册失败：', e);
+    }
+    // 3) 其余子系统：整体隔离
+    try {
+      await this.initSubsystems();
+    } catch (e) {
+      console.error('[BDNSync] 子系统初始化失败（插件已加载，部分功能可能降级）：', e);
+    }
+  }
 
+  /** 除「设置加载 + 设置页注册」外的全部初始化；异常由 onload 统一兜底 */
+  private async initSubsystems(): Promise<void> {
     // 日志器：按日期分文件持久化 + 大小轮转 + retentionDays 自动清理 + 墓碑宽限期
-    const LOGS_DIR = `${PLUGIN_DIR}/logs`;
-    const maxLogFileBytes = 4 * 1024 * 1024; // 单日文件上限 4MB，超出追加分片
-    const store = new LogStore(this.app.vault.adapter, LOGS_DIR, {
-      retentionDays: this.settings.logRetentionDays,
-      maxFileSizeBytes: maxLogFileBytes,
-    });
-    this.logStore = store;
-    this.logger = new Logger({
-      level: this.settings.logLevel,
-      maxEntries: this.settings.logMaxEntries,
-      retentionDays: this.settings.logRetentionDays,
-      tombstoneGraceHours: this.settings.logTombstoneGraceHours,
-      maxFileSizeBytes: maxLogFileBytes,
-      store,
-    });
-    await this.logger.ensureLoaded();
-    // 启动墓碑自动清理（每 6 小时一次；onload 时先跑一次）
-    void this.logger.purge();
-    this.registerInterval(window.setInterval(() => void this.logger.purge(), 6 * 3600_000));
+    // 二次隔离：日志目录异常时只降级为「不持久化」，不影响其余子系统初始化。
+    try {
+      const LOGS_DIR = `${PLUGIN_DIR}/logs`;
+      const maxLogFileBytes = 4 * 1024 * 1024; // 单日文件上限 4MB，超出追加分片
+      const store = new LogStore(this.app.vault.adapter, LOGS_DIR, {
+        retentionDays: this.settings.logRetentionDays,
+        maxFileSizeBytes: maxLogFileBytes,
+      });
+      this.logStore = store;
+      this.logger = new Logger({
+        level: this.settings.logLevel,
+        maxEntries: this.settings.logMaxEntries,
+        retentionDays: this.settings.logRetentionDays,
+        tombstoneGraceHours: this.settings.logTombstoneGraceHours,
+        maxFileSizeBytes: maxLogFileBytes,
+        store,
+      });
+      await this.logger.ensureLoaded();
+      // 启动墓碑自动清理（每 6 小时一次；onload 时先跑一次）
+      // 注：fire-and-forget 必须 catch —— 未处理的 Promise rejection 会污染 Obsidian
+      // 宿主（控制台刷屏、界面不稳定），是「页面不稳定」的常见诱因。
+      void this.logger.purge().catch(() => {});
+      this.registerInterval(
+        window.setInterval(() => void this.logger.purge().catch(() => {}), 6 * 3600_000),
+      );
+    } catch (e) {
+      console.error('[BDNSync] 日志器初始化失败，已降级为不持久化日志：', e);
+      this.logger = new Logger({
+        level: this.settings.logLevel,
+        maxEntries: this.settings.logMaxEntries,
+        retentionDays: this.settings.logRetentionDays,
+        tombstoneGraceHours: this.settings.logTombstoneGraceHours,
+        maxFileSizeBytes: 4 * 1024 * 1024,
+      });
+    }
 
     // 注册工作区视图（文件浏览器 / 同步日志）—— 作为 Obsidian 标签页打开，避免 Modal 截断
     this.registerView(VIEW_TYPE_BDNSYNC_BROWSER, (leaf) => new NetdiskBrowserView(leaf, this));
@@ -194,7 +257,8 @@ export default class BDNSyncPlugin extends Plugin {
     );
     this.statusBar.mount(sbEl);
 
-    // 后端
+    // 后端（先解析加密密钥：密钥文件模式需异步读取 vault 文件，必须就位后再构造加密器）
+    await this.refreshEncryptionKey();
     this.rebuildBackend();
 
     // 脏集合（方案3）：跨批次累积待同步路径
@@ -208,13 +272,27 @@ export default class BDNSyncPlugin extends Plugin {
       },
       () => this.statusBar.setRetryCount(this.retryQueue.size),
     );
-    // 恢复磁盘上残留的待重试条目
-    void this.loadTransferStateForRetry();
+    // 恢复磁盘上残留的待重试条目（catch：避免未处理 rejection 污染宿主）
+    void this.loadTransferStateForRetry().catch((e) =>
+      console.error('[BDNSync] 恢复待重试条目失败：', e),
+    );
 
-    // 布局就绪：恢复断点会话 + 启动同步
+    // 布局就绪：恢复断点会话 + 启动同步。
+    // 若布局此刻**已经**就绪（用户在「设置 → 第三方插件」中手动启用本插件，而非随
+    // Obsidian 应用启动），Obsidian 会在注册的同时同步回调。此时立刻跑 startup 同步
+    // 会抢占用户正在操作的设置页/弹窗（正是「启用插件后设置弹窗被关掉」的触发链），
+    // 因此这种情况下跳过启动同步：自动模式由调度器接管，手动模式本就由用户触发。
+    // 随 Obsidian 应用启动加载的场景行为保持不变。
+    let registrationDone = false;
     this.app.workspace.onLayoutReady(() => {
-      void this.onLayoutReady();
+      const triggeredDuringRegistration = !registrationDone;
+      // 必须 catch：onLayoutReady 内任何未处理的 rejection 都会污染 Obsidian 宿主
+      // （控制台刷屏 / 界面不稳定），此前这里是裸 void 调用。
+      void this
+        .onLayoutReady({ skipStartupSync: triggeredDuringRegistration })
+        .catch((e) => console.error('[BDNSync] 布局就绪后初始化失败：', e));
     });
+    registrationDone = true;
 
     // 文件监听
     this.watcher = new FileWatcher({
@@ -234,7 +312,15 @@ export default class BDNSyncPlugin extends Plugin {
     };
     this.registerEvent(
       this.app.vault.on('create', (f: TAbstractFile) => {
-        if (f instanceof TFile) onFileChanged(f.path);
+        if (f instanceof TFile) {
+          // 跨批次 rename：delete 在上一批次已被 drain、create 现在才到达时，两端分处
+          // 不同批次，引擎无从配对会退化成「删远端 + 重传」。这里把 oldPath 重新加回
+          // 脏集合，使 old/new 同批提交，由引擎按 hash 判定为 move（保留 fsId、不重传）。
+          // 此前 matchRename 从未被调用，等于该能力一直未生效（验收发现的死代码）。
+          const oldPath = this.dirtySet.matchRename(f.path);
+          if (oldPath) this.log('info', `识别重命名（跨批次配对）：${oldPath} → ${f.path}`);
+          onFileChanged(f.path);
+        }
       }),
     );
     this.registerEvent(
@@ -277,6 +363,13 @@ export default class BDNSyncPlugin extends Plugin {
       id: 'bdnsync-sync-now',
       name: '立即同步',
       callback: () => void this.syncNow('manual'),
+    });
+    this.addCommand({
+      id: 'bdnsync-cancel-sync',
+      name: '取消当前同步',
+      // 注：engine.cancel() 此前**零调用**，其 6 处阶段/文件边界守卫全部不可达，
+      // 注释里承诺的「用户可中止」实际没有任何入口（验收发现的死代码）。此处补上。
+      callback: () => this.cancelSync(),
     });
     this.addCommand({
       id: 'bdnsync-force-upload',
@@ -395,16 +488,20 @@ export default class BDNSyncPlugin extends Plugin {
     // 实验功能：网盘媒体直嵌 Markdown PostProcessor
     this.registerMarkdownPostProcessor((el) => rewriteBdnRefs(this, el));
 
-    // 设置页
-    this.addSettingTab(new BDNSyncSettingTab(this.app, this));
+    // 注：设置页已在 onload 最前面注册，此处不再重复注册（避免设置里出现两个 BDNSync 页签）
 
     // 网络恢复自动同步
     const onlineHandler = () => {
       if (this.settings.syncMode !== 'manual') {
         this.log('info', '网络已恢复');
         // 方案1：网络恢复后先 flush 失败重试队列，再触发常规同步
-        void this.retryQueue.flush();
-        void this.syncNow('online');
+        // catch：避免未处理的 rejection 污染 Obsidian 宿主（界面不稳定）
+        void this.retryQueue
+          .flush()
+          .catch((e) => console.error('[BDNSync] 重试队列 flush 失败：', e));
+        void this
+          .syncNow('online')
+          .catch((e) => console.error('[BDNSync] 网络恢复后同步失败：', e));
       }
       // 实验功能：离线占位符在网络恢复后自动重新加载
       recoverBdnRefs(this);
@@ -422,25 +519,51 @@ export default class BDNSyncPlugin extends Plugin {
 
     // 自动同步调度
     this.restartScheduler();
-    this.registerInterval(window.setInterval(() => this.tickScheduler(), 30_000));
+    // 定时器回调加保护：调度逻辑偶发抛错不应变成未捕获异常反复污染宿主（界面不稳定）
+    this.registerInterval(
+      window.setInterval(() => {
+        try {
+          this.tickScheduler();
+        } catch (e) {
+          console.error('[BDNSync] 自动同步调度异常：', e);
+        }
+      }, 30_000),
+    );
 
     // #2.1 API 稳定性与容灾：轻量探查（list/upload/quota）调度，按设置周期运行；
     // 探测到 OpenAPI 不可用且 Cookie 可用时给出降级引导（best-effort，失败不影响主流程）。
-    if (this.settings.apiProbeEnabled) {
-      this.registerInterval(
-        window.setInterval(
-          () => void this.runApiProbe().catch(() => {}),
-          Math.max(1, this.settings.apiProbeIntervalHours) * 3600_000,
-        ),
-      );
-      // 启动后稍延迟跑一次（避免在 onload 高峰期抢占网络）。
-      // 用 registerInterval 托管该一次性定时器：onunload 时会自动 clearInterval，
-      // 避免在插件已卸载（实例正在释放）后回调仍调用 this.runApiProbe 触碰已释放资源。
-      this.registerInterval(
-        window.setTimeout(() => void this.runApiProbe().catch(() => {}), 15_000),
-      );
-    }
+    this.restartApiProbe();
+  }
 
+  /**
+   * （重新）建立 API 健康探查调度。
+   *
+   * 此前定时器只在 onload 注册一次，设置页改动「启用探查 / 探查周期」后必须重载插件才生效；
+   * 且 lastApiProbeAt 字段在 src 中零读写（假设置项）。现在把调度抽成方法：
+   * 设置变更时调用即可热生效，并用 lastApiProbeAt 做启动限频，避免频繁开关/重启刷接口。
+   */
+  private restartApiProbe(): void {
+    for (const t of this.apiProbeTimers) {
+      window.clearInterval(t);
+      window.clearTimeout(t);
+    }
+    this.apiProbeTimers = [];
+    if (!this.settings.apiProbeEnabled) return;
+    const intervalMs = Math.max(1, this.settings.apiProbeIntervalHours) * 3600_000;
+    const periodic = window.setInterval(
+      () => void this.runApiProbe().catch(() => {}),
+      intervalMs,
+    );
+    this.apiProbeTimers.push(periodic);
+    this.register(() => window.clearInterval(periodic));
+    // 启动后稍延迟跑一次（避开 onload 高峰期）。若距上次探查不足半个周期则跳过，
+    // 避免反复启用 / 重启插件时频繁打接口（lastApiProbeAt 此前从未被读写）。
+    const since = Date.now() - (this.settings.lastApiProbeAt || 0);
+    if (since >= intervalMs / 2) {
+      const once = window.setTimeout(() => void this.runApiProbe().catch(() => {}), 15_000);
+      this.apiProbeTimers.push(once);
+      this.register(() => window.clearTimeout(once));
+    }
   }
 
   onunload(): void {
@@ -539,7 +662,12 @@ export default class BDNSyncPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.writeSettings();
+    // 设置可能改动了加密开关 / 密码 / 密钥文件路径，需重新解析密钥再重建后端，
+    // 否则「改成密钥文件模式」不会生效（历史缺陷：解析链路根本没被接上）。
+    await this.refreshEncryptionKey();
     this.refreshBackend();
+    // 「启用 API 健康探查 / 探查周期」改动即时生效（此前定时器只在 onload 注册，需重载插件）
+    this.restartApiProbe();
     this.applyTheme();
     this.applyRuntimeConfig();
   }
@@ -660,10 +788,74 @@ export default class BDNSyncPlugin extends Plugin {
     return ok;
   }
 
+  /**
+   * 解析实际用于加密的密码（密钥文件模式优先），结果缓存到 resolvedEncryptionPassword。
+   *
+   * 背景（验收发现的高危缺陷）：此前 makeEncryptor() 只读 settings.encryptionPassword，
+   * 而 util/keyfile.ts 的 resolveEncryptionPassword() **全仓零调用** —— 用户在设置里开启
+   * 「端到端加密」并只配置「密钥文件路径」、密码留空时，加密器会返回 null，文件以
+   * **明文上传**且没有任何提示。这是静默的数据安全缺陷，现已补上这条解析链路。
+   */
+  private async refreshEncryptionKey(): Promise<void> {
+    const s = this.settings;
+    if (!s.encryptionEnabled) {
+      this.resolvedEncryptionPassword = '';
+      this.encryptionKeyError = null;
+      return;
+    }
+    try {
+      const pw = (await resolveEncryptionPassword(this.app, s)).trim();
+      if (!pw) {
+        this.resolvedEncryptionPassword = '';
+        this.encryptionKeyError = s.keyFilePath?.trim()
+          ? `密钥文件「${s.keyFilePath.trim()}」内容为空，请填入密码或清空该路径。`
+          : '未设置加密密码：请在设置中填写密码，或指定密钥文件路径。';
+        return;
+      }
+      this.resolvedEncryptionPassword = pw;
+      this.encryptionKeyError = null;
+    } catch (e) {
+      this.resolvedEncryptionPassword = '';
+      this.encryptionKeyError = e instanceof Error ? e.message : String(e);
+      console.error('[BDNSync] 加密密钥解析失败：', e);
+    }
+  }
+
+  /**
+   * 取消进行中的同步。
+   *
+   * 引擎在**阶段 / 文件边界**检查 cancelled 标志后安全中止（不会在写盘或网络请求中途
+   * 硬切），所以这只是「请求」取消，真正生效点由引擎在下个边界决定。
+   * 对应命令：BDNSync：取消当前同步。
+   */
+  cancelSync(): void {
+    const engine = this.engine;
+    if (!engine || !engine.isBusy()) {
+      new Notice('BDNSync：当前没有正在进行的同步');
+      return;
+    }
+    engine.cancel();
+    new Notice('BDNSync：已请求取消，将在当前阶段 / 文件边界安全中止');
+    // 注：log() 首参是业务分类（'info'|'error'|'upload'…），级别由 logM 的第 3 参指定
+    this.logM('general', 'info', 'warn', '用户请求取消当前同步');
+  }
+
   private makeEncryptor(): Encryptor | null {
-    if (!this.settings.encryptionEnabled || !this.settings.encryptionPassword) return null;
+    if (!this.settings.encryptionEnabled) return null;
+    // 密钥文件模式优先（已由 refreshEncryptionKey 解析并缓存），回退手动密码
+    const pw = this.resolvedEncryptionPassword || this.settings.encryptionPassword;
+    if (!pw) {
+      // 开启了加密却拿不到可用密钥：记一条醒目告警，避免「以为加密了实则明文」。
+      // 这里不抛错，以免阻断插件加载与同步流程。
+      if (this.encryptionKeyError) {
+        console.warn(
+          `[BDNSync] 端到端加密已开启但密钥不可用，本次将按未加密处理：${this.encryptionKeyError}`,
+        );
+      }
+      return null;
+    }
     return new Encryptor(
-      this.settings.encryptionPassword,
+      pw,
       this.settings.encryptionSalt || undefined,
       // 首次加密时生成的库级 salt 需要持久化，否则下次启动会换 salt，
       // 导致密钥缓存失效、每个文件重新跑 PBKDF2。
@@ -760,10 +952,14 @@ export default class BDNSyncPlugin extends Plugin {
     trigger: 'manual' | 'startup' | 'auto' | 'online' | 'conflict-resolve' = 'manual',
     direction: 'bidirectional' | 'force-upload' | 'force-download' = 'bidirectional',
   ): Promise<SyncResult> {
-    // 同步弹窗（预览/冲突/首次引导 Modal 与错误 Notice）统一在全局容器弹出。
-    // 若用户停留在设置页（Obsidian 设置为 Modal 形式），先关闭它，避免同步弹窗
-    // 叠加/渲染在设置容器区域上方造成「弹窗嵌在设置页里」的观感与 z-index 混乱。
-    this.closeSettingsIfOpen();
+    // 注：此处**不再**无条件关闭设置页。
+    // 原实现在每次同步（含 startup 同步、保存触发的 quickSync）一开始就强制
+    // app.setting.close()。而 syncOnStartup 默认开启，插件被启用时 onLayoutReady
+    // 会立刻触发 startup 同步 —— 用户刚在「设置 → 第三方插件」里打开开关，设置弹窗
+    // 就被当场关掉；日常编辑笔记触发 quickSync 时也会无故关闭正在配置的设置页。
+    // 这是「设置弹窗自动关闭 / 界面不稳定」的直接原因。
+    // 现改为：仅在**确实要弹出 Modal** 时才关闭设置页（见 openExclusive），
+    // 既保留「避免弹窗叠加在设置容器上」的原意，又不再打断用户操作。
     // 防重入短路：引擎已在同步时，直接返回「占用中」结果，不再走到预览弹窗/配额
     // 查询等后续步骤（否则连续点击「立即同步」会重复 buildPreviewPlan + 重复弹窗，
     // 且每次都会重复「已有同步正在进行」Notice）。
@@ -1265,8 +1461,6 @@ export default class BDNSyncPlugin extends Plugin {
   private async runQuickSync(paths: string[]): Promise<void> {
     if (this.disposing) return; // 卸载中：不发起新同步
     if (!this.engine || !this.settings.syncOnSave || this.settings.syncMode === 'manual') return;
-    // 同步通知统一在全局容器弹出，避免叠加在设置容器区域
-    this.closeSettingsIfOpen();
     if (!navigator.onLine) {
       this.statusBar.setOffline();
       // 离线：把路径计入脏集合，恢复后补齐
@@ -1313,6 +1507,8 @@ export default class BDNSyncPlugin extends Plugin {
             this.retryQueue.registerFailure(p, firstMsg, transient, 0);
           }
           this.dirtySet.clearPaths(successSet.size ? Array.from(successSet) : []);
+          // 部分成功时，已成功的那些也要出队（见下方 markSuccess 说明）
+          for (const p of successSet) this.retryQueue.markSuccess(p);
           this.dirtySet.keep(failed);
           this.statusBar.setError(firstMsg);
           this.log('error', `保存同步失败：${(result.errorMessages || []).join('；')}`);
@@ -1323,6 +1519,10 @@ export default class BDNSyncPlugin extends Plugin {
         // 被 bail 的文件）保留在脏集合中，待下次 flush 补齐——避免「被跳过却误清空脏集合」
         // 导致改动永久丢失（🔴#3）。
         this.dirtySet.clearPaths(Array.from(successSet));
+        // 成功的路径同时从重试队列出队。此前 RetryQueue.markSuccess() 从未被调用，
+        // 成功出队完全依赖「flush 提前移除条目」这一副作用，语义不清晰且状态栏的
+        // 重试计数不会及时回落；显式调用后成功/失败两条半环才算真正闭环。
+        for (const p of successSet) this.retryQueue.markSuccess(p);
         if (successSet.size === allPaths.length) {
           this.statusBar.setDone(`同步完成（${allPaths.length}）`);
           this.log('info', `保存同步完成：${allPaths.length} 个文件`);
@@ -1417,38 +1617,50 @@ export default class BDNSyncPlugin extends Plugin {
     }, 1500);
   }
 
-  private async onLayoutReady(): Promise<void> {
+  private async onLayoutReady(opts: { skipStartupSync?: boolean } = {}): Promise<void> {
+    // 整体兜底：启动期任何异常都不应冒泡成未处理的 rejection 污染 Obsidian 宿主
+    // （此前 syncNow('startup') 是裸 await，一旦失败就是未处理 rejection → 界面不稳定）。
     try {
-      const ts = await this.store.loadTransferState();
-      this.cloudAdapter.restoreSessions(ts.uploads);
-      const idx = await this.store.loadLocalIndex();
-      this.statusBar.setConflicts(idx.conflicts.filter((c) => !c.resolved).length);
-    } catch {
-      /* ignore */
-    }
-    if (this.settings.syncOnStartup && this.hasAuth()) {
-      await this.syncNow('startup');
-    }
-    // 启动后静默拉取网盘配额（存储使用情况），避免连接卡片一直显示「尚未测试连接」/ 0B。
-    // 仅在已有凭据且尚未获取过配额时触发，失败静默忽略，不阻断其它流程。
-    if (this.hasAuth() && !this.lastQuota && navigator.onLine) {
-      void this.refreshQuota();
-    }
-    // 后台拉取账号/会员等级，用于设置页会员中心卡片 + 状态栏徽标
-    if (this.hasAuth() && navigator.onLine) {
-      void this.refreshVipInfo();
-    }
-    // 拉起本地流式代理，使预览 Modal 可免落盘在线打开/播放网盘文件
-    if (this.hasAuth() && navigator.onLine) {
-      void this.ensureStreamServer();
-    }
-    // P0-orphan-prevention 启动时巡检：即使今天没做过任何同步，也能发现「外部力量」
-    // （其它同步工具 / 手动网盘操作 / 多设备并发）造成的孤儿。
-    // 24h 限频由 runAutoOrphanScanIfDue 自身保证，与同步结束钩子共用同一时间窗。
-    if (this.hasAuth() && navigator.onLine) {
-      void this.runAutoOrphanScanIfDue({ from: 'startup' }).catch(() => {
-        /* 静默 */
-      });
+      try {
+        const ts = await this.store.loadTransferState();
+        this.cloudAdapter.restoreSessions(ts.uploads);
+        const idx = await this.store.loadLocalIndex();
+        this.statusBar.setConflicts(idx.conflicts.filter((c) => !c.resolved).length);
+      } catch {
+        /* ignore */
+      }
+      // skipStartupSync：用户在会话中手动启用插件时为 true，避免抢占其正在操作的设置页
+      if (this.settings.syncOnStartup && this.hasAuth() && !opts.skipStartupSync) {
+        // 启动同步失败不应影响后续配额 / 账号 / 流服务初始化
+        try {
+          await this.syncNow('startup');
+        } catch (e) {
+          console.error('[BDNSync] 启动同步失败：', e);
+        }
+      }
+      // 启动后静默拉取网盘配额（存储使用情况），避免连接卡片一直显示「尚未测试连接」/ 0B。
+      // 仅在已有凭据且尚未获取过配额时触发，失败静默忽略，不阻断其它流程。
+      if (this.hasAuth() && !this.lastQuota && navigator.onLine) {
+        void this.refreshQuota();
+      }
+      // 后台拉取账号/会员等级，用于设置页会员中心卡片 + 状态栏徽标
+      if (this.hasAuth() && navigator.onLine) {
+        void this.refreshVipInfo();
+      }
+      // 拉起本地流式代理，使预览 Modal 可免落盘在线打开/播放网盘文件
+      if (this.hasAuth() && navigator.onLine) {
+        void this.ensureStreamServer();
+      }
+      // P0-orphan-prevention 启动时巡检：即使今天没做过任何同步，也能发现「外部力量」
+      // （其它同步工具 / 手动网盘操作 / 多设备并发）造成的孤儿。
+      // 24h 限频由 runAutoOrphanScanIfDue 自身保证，与同步结束钩子共用同一时间窗。
+      if (this.hasAuth() && navigator.onLine) {
+        void this.runAutoOrphanScanIfDue({ from: 'startup' }).catch(() => {
+          /* 静默 */
+        });
+      }
+    } catch (e) {
+      console.error('[BDNSync] onLayoutReady 执行失败：', e);
     }
   }
 
@@ -1646,6 +1858,9 @@ export default class BDNSyncPlugin extends Plugin {
     const api = this.makeApi();
     const root = this.settings.remoteRoot;
     const result = await probeHealth(api, root);
+    // 记录本次探查时间：restartApiProbe() 用它做启动限频（该字段此前从未被读写，属假设置项）
+    this.settings.lastApiProbeAt = Date.now();
+    void this.writeSettings().catch(() => {});
     const summary = `API 探查：${result.ok ? '正常' : '异常'}（list=${result.listOk ? '✓' : '✗'}${result.quota ? ' quota=✓' : ' quota=✗'}${result.diagnose ? ` ${result.diagnose.zh}` : ''}）`;
     this.logM('engine', 'info', result.ok ? 'info' : 'warn', summary);
     if (!result.ok) {
@@ -1714,6 +1929,11 @@ export default class BDNSyncPlugin extends Plugin {
       }
     }
     const modal = create();
+    // 确实要弹出 Modal 时，才关闭设置页：避免弹窗叠加/渲染在设置容器区域上方
+    // （z-index 混乱、观感像「弹窗嵌在设置页里」）。
+    // 这是原 syncNow / runQuickSync 里「无条件关闭设置页」的正确落点——只在真弹窗
+    // 时关闭，平时同步（后台/保存触发）不再打断用户，也不再于插件启用瞬间关掉设置弹窗。
+    this.closeSettingsIfOpen();
     this.openModals.set(key, modal);
     const origClose = modal.close.bind(modal);
     modal.close = () => {

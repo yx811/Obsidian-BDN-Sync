@@ -1153,6 +1153,12 @@ export function mountMediaPlayer(
 
   document.addEventListener('fullscreenchange', onFsChange);
 
+  // 无障碍：控制栏 15 个图标按钮只设了 title，读屏软件对 title 的支持弱于 aria-label。
+  // 这里统一把 title 同步为 aria-label，一次覆盖全部按钮（含后续新增的静态按钮）。
+  host.querySelectorAll<HTMLButtonElement>('button[title]').forEach((b) => {
+    if (!b.getAttribute('aria-label')) b.setAttribute('aria-label', b.getAttribute('title') || '');
+  });
+
   return {
     destroy(): void {
       document.removeEventListener('fullscreenchange', onFsChange);

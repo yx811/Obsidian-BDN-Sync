@@ -33,6 +33,17 @@ export class RetryQueue {
   private persist: () => Promise<void>;
   private flushFn: (paths: string[]) => Promise<void>;
   private onUpdate?: () => void;
+  /**
+   * 跨 flush 周期的 attempts 记忆（path → 已尝试次数）。
+   *
+   * 背景（验收发现的真实缺陷）：flush() 会在调用 flushFn **之前**把到期条目移出 items
+   * （避免与自身重试竞争），而 flushFn（即 runQuickSync）内部会 catch 掉全部异常、
+   * 再调用 registerFailure 登记失败。此时条目已不在 items 中，registerFailure 走
+   * 「新建」分支、恒以 attempts=1 重建 —— 结果是退避永远停留在最小值（1s）、
+   * MAX_ATTEMPTS 永远触不到，永久失败的文件每 15s 被无限重试，空耗 API 配额。
+   * 这里用一张记忆表把 attempts 跨周期保留下来，让指数退避与次数上限真正生效。
+   */
+  private attemptsMemo = new Map<string, number>();
 
   constructor(
     persist: () => Promise<void>,
@@ -73,19 +84,33 @@ export class RetryQueue {
   registerFailure(path: string, err: unknown, transient: boolean, cooldownMs = 0): void {
     if (!transient) return; // 非瞬态：直接报错，不入队列，避免无意义重试
     const existing = this.items.find((it) => it.path === path);
-    const attempts = existing ? existing.attempts + 1 : 1;
+    // 条目已被 flush 提前摘出时，用记忆表中的次数继续累加（详见 attemptsMemo 注释）
+    const prevAttempts = existing ? existing.attempts : (this.attemptsMemo.get(path) ?? 0);
+    const attempts = prevAttempts + 1;
     const msg = err instanceof Error ? err.message : String(err);
     const errno = err instanceof BaiduApiError ? err.errno : undefined;
-    const nextAt = Date.now() + computeDelay(existing ? existing.attempts + 1 : 1, cooldownMs);
+    const nextAt = Date.now() + computeDelay(attempts, cooldownMs);
+    // 达到上限：放弃该路径并清除记忆，避免永久失败项无限占用轮询与 API 配额
+    if (attempts > MAX_ATTEMPTS) {
+      this.items = this.items.filter((it) => it.path !== path);
+      this.attemptsMemo.delete(path);
+      console.warn(
+        `[BDNSync] 重试已达上限（${MAX_ATTEMPTS} 次），放弃自动重试：${path}（最后错误：${msg}）`,
+      );
+      void this.persist().catch(() => {});
+      this.notify();
+      return;
+    }
     if (existing) {
       existing.attempts = attempts;
       existing.nextAt = nextAt;
       existing.lastError = msg;
       existing.lastErrno = errno;
     } else {
-      this.items.push({ path, attempts: 1, nextAt, lastError: msg, lastErrno: errno });
+      this.items.push({ path, attempts, nextAt, lastError: msg, lastErrno: errno });
     }
-    void this.persist();
+    this.attemptsMemo.set(path, attempts);
+    void this.persist().catch(() => {});
     this.notify();
   }
 
@@ -94,7 +119,7 @@ export class RetryQueue {
     const before = this.items.length;
     this.items = this.items.filter((it) => it.path !== path);
     if (this.items.length !== before) {
-      void this.persist();
+      void this.persist().catch(() => {});
       this.notify();
     }
   }
@@ -107,39 +132,38 @@ export class RetryQueue {
     const paths = due.map((it) => it.path);
     // 临时移除以免 flush 与自身重试竞争；若仍失败由 flushFn 再次 registerFailure。
     // 注意：移除后无法再通过 .find 拿到原 attempts，必须先用快照保留原状态。
-    const snapshot = new Map(due.map((it) => [it.path, it]));
+    const snapshot = new Set(paths);
     this.items = this.items.filter((it) => !snapshot.has(it.path));
     this.notify();
     try {
       await this.flushFn(paths);
-      // 成功路径会在各自同步流程里 markSuccess；这里不再重复移除
+      // 仍失败的路径由 flushFn 内部调用 registerFailure 重新入队（attempts 经
+      // attemptsMemo 累加）；成功的路径不再回到队列，等同于成功出队。
     } catch (e) {
-      // flush 整体失败：基于快照恢复条目，attempts 在当前值上 +1（本次重试又失败），
-      // 退避基数与 attempts 口径统一（去掉原逻辑「双重 +1 或重置为 1」的问题）。
-      // 保留本次失败的最新错误信息（审计：原逻辑丢失新错误，用户看到的永远是旧消息）
-      const newMsg = e instanceof Error ? e.message : String(e);
-      const newErrno = e instanceof BaiduApiError ? e.errno : undefined;
+      // flushFn 整体抛出（正常情况下它会自行 catch 并 registerFailure）：
+      // 仅对「尚未被重新登记」的路径补一次失败登记，避免重复计数。
+      const msg = e instanceof Error ? e.message : String(e);
       for (const p of paths) {
-        const prev = snapshot.get(p);
-        const attempts = (prev?.attempts ?? 0) + 1;
-        this.items.push({
-          path: p,
-          attempts,
-          nextAt: Date.now() + computeDelay(attempts, 0),
-          lastError: newErrno !== undefined ? `errno=${newErrno} ${newMsg}` : newMsg,
-          lastErrno: newErrno ?? prev?.lastErrno,
-        });
+        if (!this.items.some((it) => it.path === p)) {
+          this.registerFailure(p, new Error(msg), true, 0);
+        }
       }
-      void this.persist();
-      this.notify();
     }
+    // 本轮未被重新登记 ⇒ 该路径已成功（或不再需要重试）：清除其 attempts 记忆，
+    // 使后续偶发的新失败从 1 重新开始，不被很久以前的历史累计次数误伤。
+    for (const p of paths) {
+      if (!this.items.some((it) => it.path === p)) this.attemptsMemo.delete(p);
+    }
+    void this.persist().catch(() => {});
+    this.notify();
   }
 
   /** 调度一次带超时的 flush（供后台定时器调用） */
   schedulePoll(intervalMs: number): void {
     if (this.timer !== null) return;
     this.timer = window.setInterval(() => {
-      if (navigator.onLine) void this.flush();
+      // catch：轮询每 15s 触发一次，未处理的 rejection 会持续污染宿主（界面不稳定）
+      if (navigator.onLine) void this.flush().catch(() => {});
     }, intervalMs);
   }
 
