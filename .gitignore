@@ -6,7 +6,7 @@ node_modules/
 # 根目录 styles.css 仅作 Obsidian 加载的构建产物，不再纳入版本控制。
 main.js
 main.css
-styles.css
+/styles.css
 lib/
 
 # ── Obsidian plugin data (NEVER commit user data / credentials) ──
