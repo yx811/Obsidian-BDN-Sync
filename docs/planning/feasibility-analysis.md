@@ -1,3 +1,10 @@
+﻿---
+title: BDNSync 功能可行性 & 开发难度分析
+type: planning
+version: v1.0.4
+date: 2026-08-26
+status: stable
+---
 # BDNSync 功能可行性 & 开发难度分析
 
 > 评估对象：`Obsidian-BDN-Sync` 插件（`version 1.0.4`，工作区 `C:\Users\yuan_\Desktop\Obsidian-BDN-Sync-main`）  
@@ -443,3 +450,4 @@
 **验证结果（本波）**：`tsc -noEmit -skipLibCheck` 通过（0 错误）；`esbuild production` 通过；`vitest` 全部通过（exit 0）。
 
 **说明**：3.7「一键复制诊断」按钮与 4.8（冲突合并视角）的 canvas/excalidraw 节点级三方合并已在后续补齐并验证；4.7 第三方存储实际后端经讨论废弃、代码占位已移除，仅保留双队列并发隔离。实验室规划项（#5.9 / #5.10 / #8 插件生态）暂不开发。
+

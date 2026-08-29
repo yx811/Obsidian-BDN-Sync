@@ -1,3 +1,10 @@
+﻿---
+title: BDNSync 编码规范
+type: standard
+version: v1.0.0
+date: 2026-08-25
+status: stable
+---
 # BDNSync 编码规范
 
 > 适用范围：`bdnsync/` 全部 TypeScript 源码、测试与构建配置
@@ -158,3 +165,4 @@
 - 公共 API、复杂算法（diff3、乐观锁、分片索引）必须有 JSDoc
 - 禁止无信息注释（`// do something`、`// fix`）
 - 历史 bug 修复注释保留根因 + 修复方式说明
+
