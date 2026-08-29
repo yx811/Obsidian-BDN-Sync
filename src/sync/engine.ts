@@ -1,5 +1,13 @@
 // 同步引擎：三方对比（本地 / 云端 / 上次同步）、决策矩阵、墓碑、乐观锁竞态检测、断点续传
 
+/** 同步预览被用户取消时由 buildPreviewPlan 抛出，便于上层区分「主动取消」与「真实错误」。 */
+export class SyncAbortedError extends Error {
+  constructor() {
+    super('sync aborted by user');
+    this.name = 'SyncAbortedError';
+  }
+}
+
 import { type App, Notice } from 'obsidian';
 import { BaiduApiError } from '../baidu/api';
 import { Encryptor } from '../crypto/encryption';
@@ -18,6 +26,7 @@ import type {
   ConflictRecord,
   FileState,
   LocalIndex,
+  RemoteEntry,
   SyncStats,
   SyncPlanPreview,
   VaultSnapshot,
@@ -65,21 +74,24 @@ export type FirstSyncAsker = (
   remoteCount: number,
 ) => Promise<'merge' | 'cloud' | 'local' | 'cancel'>;
 
-/** 增量同步的「无操作」结果占位（被跳过时不改变统计） */
-const NOTHING: SyncResult = {
-  ok: true,
-  uploaded: 0,
-  downloaded: 0,
-  deletedLocal: 0,
-  deletedRemote: 0,
-  conflicts: 0,
-  skipped: 0,
-  errors: 0,
-  bytesUp: 0,
-  bytesDown: 0,
-  dirsCreated: 0,
-  errorMessages: [],
-};
+/** 增量同步的「无操作」结果占位（被跳过时不改变统计）。每次返回新对象，防止调用方修改共享引用。 */
+function nothingResult(extra?: Partial<SyncResult>): SyncResult {
+  return {
+    ok: true,
+    uploaded: 0,
+    downloaded: 0,
+    deletedLocal: 0,
+    deletedRemote: 0,
+    conflicts: 0,
+    skipped: 0,
+    errors: 0,
+    bytesUp: 0,
+    bytesDown: 0,
+    dirsCreated: 0,
+    errorMessages: [],
+    ...extra,
+  };
+}
 
 /**
  * 同步方向。
@@ -202,6 +214,23 @@ export class SyncEngine {
   private bandwidthCarry = 0;
   /** 下载校验（hash 不一致）连续失败计数：超过阈值说明本地索引与云端严重失配，引导重置 */
   private downloadVerifyFails = 0;
+  /**
+   * 预览计划 ↔ 完整同步之间的「计算复用缓存」。
+   * 手动同步开启预览时，buildPreviewPlan 已完整读取远端索引 / 远端目录树 / 本地扫描，
+   * 紧接着的 fullSync 若再读一遍等于把全部重活（尤其 listTree 的整树网络往返、scanLocal 的目录遍历）
+   * 重复做一次，大库下手动同步明显变慢（且「点完按钮预览弹出来后，实际同步更慢」正是此因）。
+   * 这里把结果暂存，fullSync 在显式复用标志下直接取用，用完即弃，避免重复 I/O。
+   */
+  private previewCache:
+    | {
+        localIndex: LocalIndex;
+        remoteIndex: ResolvedRemoteIndex;
+        remoteTree: Map<string, RemoteEntry>;
+        localScan: Map<string, FileState>;
+        localDirs: Set<string>;
+        filter: PathFilter;
+      }
+    | null = null;
   /** 网盘容量不足标志：下载阶段命中 31326 后置位，剩余下载短路 */
   private quotaExhausted = false;
   /**
@@ -252,14 +281,9 @@ export class SyncEngine {
     private askFirstSync: FirstSyncAsker,
     private onConflictsChanged: (n: number) => void,
     private askMassDelete: MassDeleteAsker,
-    /** UI 通知回调（解耦引擎与 Obsidian Notice：默认回退到 new Notice，便于测试注入） */
+    /** UI 通知回调（解耦引擎与 Obsidian Notice：默认用 Notice，便于测试注入） */
     private onNotice: (msg: string, timeout?: number) => void = (msg, timeout) => {
-      // 延迟到运行时引用，避免模块顶层直接依赖 obsidian 的 Notice
-      const NoticeCtor: typeof Notice | undefined =
-        (globalThis as { require?: (m: string) => { Notice?: typeof Notice } | undefined })
-          .require?.('obsidian')?.Notice ??
-        (globalThis as { Notice?: typeof Notice }).Notice;
-      if (NoticeCtor) new NoticeCtor(msg, timeout);
+      new Notice(msg, timeout);
     },
   ) {}
 
@@ -429,8 +453,12 @@ export class SyncEngine {
     }
     const exists = await this.vadapter().exists(relPath);
     if (exists && backup) {
-      const old = new Uint8Array(await this.vadapter().readBinary(relPath));
-      this.bufferBackup(relPath, old);
+      try {
+        const old = new Uint8Array(await this.vadapter().readBinary(relPath));
+        this.bufferBackup(relPath, old);
+      } catch {
+        /* 备份读取失败不阻断写入：文件可能已被锁定或删除（TOCTOU） */
+      }
     }
     const dir = relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : '';
     await this.ensureLocalDir(dir);
@@ -519,11 +547,14 @@ export class SyncEngine {
     onProgress?: (n: number) => void,
     /** 输出参数：收集所有「非排除、需镜像」的本地目录（相对 root），供空文件夹补建使用 */
     localDirs?: Set<string>,
+    /** 取消信号：用户取消预览时中止本地遍历 */
+    signal?: AbortSignal,
   ): Promise<Map<string, FileState>> {
     const out = new Map<string, FileState>();
     const visited = new Set<string>();
     const walk = async (dir: string): Promise<void> => {
-      // 防御符号链接成环 / 适配器返回自身导致的无限递归
+      // 取消优先 / 防御符号链接成环 / 适配器返回自身导致的无限递归
+      if (signal?.aborted) return;
       if (visited.has(dir)) return;
       visited.add(dir);
 
@@ -533,7 +564,9 @@ export class SyncEngine {
       } catch {
         return;
       }
+      if (signal?.aborted) return;
       for (const rawFile of listing.files || []) {
+        if (signal?.aborted) return;
         const rel = toVaultPath(dir, rawFile);
         if (filter.isExcluded(rel)) continue;
         const st = await this.vadapter()
@@ -567,6 +600,7 @@ export class SyncEngine {
         if (onProgress && out.size % 100 === 0) onProgress(out.size);
       }
       for (const rawDir of listing.folders || []) {
+        if (signal?.aborted) return;
         const rel = toVaultPath(dir, rawDir);
         if (rel === dir) continue; // 适配器把自身也列出来的极端情况
         if (filter.isExcluded(rel)) continue;
@@ -709,14 +743,41 @@ export class SyncEngine {
    * 仅统计将要进行的操作类型与数量，并抽样展示样例。供手动同步前确认。
    * 注意：调用方需先完成 listRemote/scanLocal（与 fullSync 同流程），成本在于扫描本身，
    * 预览本身只是对 actions 数组的聚合，几乎零额外开销。
+   * @param signal 取消信号：用户取消预览时中止计算（不进入 fullSync）。
    */
-  async buildPreviewPlan(direction: SyncDirection = 'bidirectional'): Promise<SyncPlanPreview> {
+  async buildPreviewPlan(
+    direction: SyncDirection = 'bidirectional',
+    onProgress?: (msg: string) => void,
+    signal?: AbortSignal,
+  ): Promise<SyncPlanPreview> {
     const settings = this.s();
     const filter = new PathFilter(settings);
-    const localIndex = await this.store.loadLocalIndex();
-    const remoteIndex = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
-    const remoteTree = await this.backend.listTree();
-    const localScan = await this.scanLocal(filter, localIndex.files);
+    // 并发拉取：本地索引（磁盘）与远端索引（网络）同时开始；随后远端目录树列举（网络）与本地扫描（磁盘）并发执行
+    const localIndexP = this.store.loadLocalIndex();
+    const remoteIndexP = this.backend.readRemoteIndex();
+    const localIndex = await localIndexP;
+    if (signal?.aborted) throw new SyncAbortedError();
+    onProgress?.('正在读取云端同步索引…');
+    const remoteIndex = (await remoteIndexP) || this.newRemoteIndex();
+    if (signal?.aborted) throw new SyncAbortedError();
+    onProgress?.('正在列出云端文件清单…');
+    const localDirs = new Set<string>(); // 收集本地目录，供完整同步的空文件夹补建复用
+    const [remoteTree, localScan] = await Promise.all([
+      this.backend.listTree(
+        (n) => onProgress?.(`正在列出云端文件清单…（已列出 ${n}）`),
+        signal,
+      ),
+      this.scanLocal(
+        filter,
+        localIndex.files,
+        (n) => onProgress?.(`正在扫描本地文件…（已扫描 ${n}）`),
+        localDirs,
+        signal,
+      ),
+    ]);
+    if (signal?.aborted) throw new SyncAbortedError();
+    // 暂存本次计算结果，供紧随其后的 fullSync 复用，避免重复网络/本地 I/O（见 previewCache 说明）
+    this.previewCache = { localIndex, remoteIndex, remoteTree, localScan, localDirs, filter };
     const isFirst = localIndex.lastSyncAt === 0;
     const dir: SyncDirection =
       isFirst && localScan.size > 0 && remoteTree.size > 0
@@ -725,6 +786,7 @@ export class SyncEngine {
           : 'bidirectional'
         : direction;
     const actions = this.buildPlan(localScan, remoteTree, remoteIndex, localIndex, filter, dir);
+    if (signal?.aborted) throw new SyncAbortedError();
     const samples: SyncPlanPreview['samples'] = [];
     let upload = 0,
       download = 0,
@@ -770,11 +832,18 @@ export class SyncEngine {
 
   // ---------------- 完整同步 ----------------
 
+  /** 丢弃预览计算缓存（用户取消预览、或需要强制重新拉取时调用） */
+  discardPreviewCache(): void {
+    this.previewCache = null;
+  }
+
   async fullSync(
     trigger: 'manual' | 'startup' | 'auto' | 'online' | 'conflict-resolve' = 'manual',
     direction: SyncDirection = 'bidirectional',
     /** 由 quickSync 委托调用时传入：此时 syncing 由 quickSync 自身持有，语义安全，允许重入 */
     reentrant = false,
+    /** 由「预览确认后」的手动同步传入：直接复用 buildPreviewPlan 刚算好的索引/目录树/扫描，避免重复 I/O */
+    reusePreviewCache = false,
   ): Promise<SyncResult | null> {
     if (this.syncing && !reentrant) {
       this.notify('BDNSync：已有同步正在进行，请稍候');
@@ -815,20 +884,45 @@ export class SyncEngine {
     try {
       this.statusBar.setSyncing('正在对比…');
       const filter = new PathFilter(settings);
-      const localIndex = await this.store.loadLocalIndex();
-      const remoteIndex = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
-      this.statusBar.setSyncing('正在扫描远程目录…');
-      const remoteTree = await this.backend.listTree();
-      this.statusBar.setSyncing('正在扫描本地文件…');
-      const localDirs = new Set<string>(); // 收集本地目录，供空文件夹补建
-      const localScan = await this.scanLocal(
-        filter,
-        localIndex.files,
-        (n) => {
-          this.statusBar.setSyncing(`正在扫描本地文件…（已扫描 ${n}）`);
-        },
-        localDirs,
-      );
+      let localIndex: LocalIndex;
+      let remoteIndex: ResolvedRemoteIndex;
+      let remoteTree: Map<string, RemoteEntry>;
+      let localDirs = new Set<string>(); // 收集本地目录，供空文件夹补建
+      let localScan: Map<string, FileState>;
+      if (reusePreviewCache && this.previewCache) {
+        // 性能优化：复用预览计划已算好的数据，跳过重复的远端索引/目录树读取与本地目录遍历
+        // （大库下 listTree 是整树网络往返、scanLocal 是整库遍历，重复一次即翻倍耗时）。
+        // 数据由 syncNow 在「本次」手动同步前刚刚计算并展示给用户确认，新鲜度等同直接重算。
+        localIndex = this.previewCache.localIndex;
+        remoteIndex = this.previewCache.remoteIndex;
+        remoteTree = this.previewCache.remoteTree;
+        localDirs = this.previewCache.localDirs;
+        localScan = this.previewCache.localScan;
+        this.previewCache = null; // 用完即弃，确保下次同步重新拉取最新数据
+        engineLog('info', '完整同步复用预览计算结果，跳过重复 I/O');
+      } else {
+        localIndex = await this.store.loadLocalIndex();
+        remoteIndex = (await this.backend.readRemoteIndex()) || this.newRemoteIndex();
+        this.statusBar.setSyncing('正在扫描远程目录…');
+        // 并发：远端目录树列举（网络 I/O）与本地扫描（磁盘 I/O）重叠执行，缩短对比阶段墙钟时间
+        const [rt, ls] = await Promise.all([
+          this.backend.listTree((n) =>
+            this.statusBar.setSyncing(`正在扫描远程目录…（已列出 ${n}）`),
+          ),
+          this.scanLocal(
+            filter,
+            localIndex.files,
+            (n) => {
+              this.statusBar.setSyncing(`正在扫描本地文件…（已扫描 ${n}）`);
+            },
+            localDirs,
+          ),
+        ]);
+        remoteTree = rt;
+        localScan = ls;
+        // 非预览路径（startup/auto/quickSync 委托）不使用、也不该残留旧的预览缓存，主动清空避免误用
+        this.previewCache = null;
+      }
 
       // 崩溃/断线安全：本地文件已落盘但索引未提交时，下次同步会把它们误判为「新文件」
       // 导致重复上传或错误冲突。启动对账：用云端 hash 校准这些「孤儿文件」的锚点。
@@ -2064,11 +2158,11 @@ export class SyncEngine {
   // ---------------- 实时增量同步（Sync On Save） ----------------
 
   async quickSync(paths: string[]): Promise<SyncResult> {
-    if (this.syncing) return NOTHING; // 正在完整同步时忽略（完整同步会覆盖增量）
+    if (this.syncing) return nothingResult(); // 正在完整同步时忽略（完整同步会覆盖增量）
     const settings = this.s();
     // 5.10 局域网后端不需要百度云鉴权：仅当「后端需要云鉴权 且 未配置任何凭证」才短路返回。
     if (this.backend.requiresCloudAuth && !settings.bduss && !settings.cookies && !settings.accessToken)
-      return NOTHING;
+            return nothingResult();
 
     this.syncing = true;
     this.cancelled = false;
@@ -2085,7 +2179,7 @@ export class SyncEngine {
         // 从未建立索引 → 退化为完整同步（保持 busy 锁，用 reentrant 委托，避免重入被 busy 检查吞掉）
         await this.fullSync('manual', 'bidirectional', true);
         // 完整同步已覆盖这批路径 → 标记为已处理，让上层清空脏集合（🔴#3）
-        return { ...NOTHING, successPaths: paths };
+        return nothingResult({ successPaths: paths });
       }
 
       const remoteChanges = new Map<string, FileState>();
@@ -2247,11 +2341,11 @@ export class SyncEngine {
         this.statusBar.setSyncing('检测到并发修改，转交完整同步合并…');
         await this.fullSync('manual', 'bidirectional', true);
         // 完整同步已覆盖这批路径 → 标记为已处理，让上层清空脏集合（🔴#3）
-        return { ...NOTHING, successPaths: paths };
+        return nothingResult({ successPaths: paths });
       }
 
       // 本批路径经评估均与远端一致（无新增/修改/删除）→ 已确认同步，清空脏集合（🔴#3）
-      if (remoteChanges.size === 0) return { ...NOTHING, successPaths: paths };
+      if (remoteChanges.size === 0) return nothingResult({ successPaths: paths });
 
       // 增量同步的「大规模删除保护」：fullSync 有 checkDeleteGuard 兜底，但增量路径
       // 直接走 deleteRemote，若 remoteRoot 误指空目录 / 凭据换账号（旧库内容云端全缺），
@@ -2282,7 +2376,7 @@ export class SyncEngine {
           if (choice === 'cancel') {
             this.notify('BDNSync：已取消本次增量同步，未删除任何云端文件');
             this.statusBar.setIdle();
-            return NOTHING;
+            return nothingResult();
           }
           if (choice === 'skip-deletes') {
             this.notify(`BDNSync：已跳过 ${pendingDeletes.length} 个删除操作，仅同步新增与修改`);

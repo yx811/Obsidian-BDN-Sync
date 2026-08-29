@@ -194,7 +194,14 @@ export class LocalStore {
   private async loadBaseManifest(): Promise<Record<string, { size: number; mtime: number }>> {
     const data = await this.readJson('base-manifest.json');
     if (data && typeof data === 'object' && !Array.isArray(data)) {
-      return data as Record<string, { size: number; mtime: number }>;
+      const m = data as Record<string, unknown>;
+      const validated: Record<string, { size: number; mtime: number }> = {};
+      for (const [k, v] of Object.entries(m)) {
+        if (v && typeof v === 'object' && typeof (v as { size?: unknown }).size === 'number' && typeof (v as { mtime?: unknown }).mtime === 'number') {
+          validated[k] = v as { size: number; mtime: number };
+        }
+      }
+      return validated;
     }
     return {};
   }

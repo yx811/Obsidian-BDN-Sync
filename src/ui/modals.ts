@@ -1,6 +1,6 @@
 // 弹窗：首次同步引导 / 冲突面板 / 统计面板 / 同步日志 / 确认框
 
-import { App, Modal, Notice } from 'obsidian';
+import { App, Modal, Notice, TFile } from 'obsidian';
 import type {
   ConflictRecord,
   CumulativeStats,
@@ -31,10 +31,12 @@ import type { Logger } from '../util/logger';
 import {
   createBadge,
   createCard,
+  createEmptyState,
   createIconButton,
   createModalHeader,
   createProgressBar,
   createSection,
+  createSkeleton,
   setIcon,
   showConfirmModal,
 } from './components';
@@ -401,6 +403,8 @@ const STRATEGY_ICON: Record<ResolveStrategy, Parameters<typeof setIcon>[1]> = {
 export class ConflictModal extends Modal {
   private choices = new Map<string, ResolveStrategy>();
   private selectedPath: string | null = null;
+  private diffPreviewEnabled = true;
+  private diffCache = new Map<string, { local?: string; remote?: string; base?: string }>();
 
   constructor(
     app: App,
@@ -488,6 +492,42 @@ export class ConflictModal extends Modal {
 
     detailEl.createEl('h4', { text: active.path, cls: 'bdnsync-conflict-detail-title' });
     detailEl.createEl('p', { text: active.reason, cls: 'bdnsync-conflict-detail-reason' });
+
+    // 冲突元信息卡片
+    const metaCard = createCard(detailEl, 'bdnsync-conflict-meta-card');
+    const metaGrid = metaCard.createDiv({ cls: 'bdnsync-conflict-meta-grid' });
+    const metaItem = (label: string, value: string, icon: Parameters<typeof setIcon>[1]) => {
+      const item = metaGrid.createDiv({ cls: 'bdnsync-conflict-meta-item' });
+      const iconEl = item.createSpan({ cls: 'bdnsync-conflict-meta-icon' });
+      setIcon(iconEl, icon, 14);
+      item.createSpan({ text: label, cls: 'bdnsync-conflict-meta-label' });
+      item.createSpan({ text: value, cls: 'bdnsync-conflict-meta-value' });
+    };
+    if (active.deviceA) metaItem('设备 A', active.deviceA, 'monitor');
+    if (active.deviceB) metaItem('设备 B', active.deviceB, 'smartphone');
+    if (active.baseHash) metaItem('基准哈希', active.baseHash.slice(0, 8) + '…', 'git-branch');
+    if (active.localHash) metaItem('本地哈希', active.localHash.slice(0, 8) + '…', 'hard-drive');
+    if (active.remoteHash) metaItem('云端哈希', active.remoteHash.slice(0, 8) + '…', 'cloud');
+
+    // Diff 预览区域（可折叠）
+    const diffSection = createSection(detailEl, {
+      title: '内容预览',
+      icon: 'eye',
+      collapsible: true,
+      defaultOpen: this.diffPreviewEnabled,
+    });
+
+    const diffToggle = diffSection.header.createSpan({ cls: 'bdnsync-diff-toggle' });
+    const diffToggleIcon = diffToggle.createSpan();
+    setIcon(diffToggleIcon, this.diffPreviewEnabled ? 'eye' : 'eye-off', 14);
+    diffToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.diffPreviewEnabled = !this.diffPreviewEnabled;
+      setIcon(diffToggleIcon, this.diffPreviewEnabled ? 'eye' : 'eye-off', 14);
+      this.renderDiffPreview(diffSection.body, active);
+    });
+
+    this.renderDiffPreview(diffSection.body, active);
 
     createSection(detailEl, { title: '选择处理方式', icon: 'git-merge' });
     const strategyGrid = detailEl.createDiv({ cls: 'bdnsync-strategy-grid' });
@@ -590,7 +630,157 @@ export class ConflictModal extends Modal {
     }
   }
 
+  private async renderDiffPreview(
+    container: HTMLElement,
+    conflict: ConflictRecord,
+  ): Promise<void> {
+    container.empty();
+
+    if (!this.diffPreviewEnabled) {
+      createEmptyState(container, {
+        icon: 'eye-off',
+        title: '预览已关闭',
+        desc: '点击眼睛图标开启内容预览',
+      });
+      return;
+    }
+
+    // 检查是否为二进制文件
+    const isBinary = /\.(png|jpg|jpeg|gif|webp|mp3|mp4|wav|pdf|zip|gz|tar|exe|dll|so|dylib)$/i.test(conflict.path);
+    if (isBinary) {
+      createEmptyState(container, {
+        icon: 'file-question',
+        title: '二进制文件',
+        desc: '无法预览二进制文件内容，请使用冲突策略选择处理方式',
+      });
+      return;
+    }
+
+    // 加载或使用缓存的文件内容
+    let content = this.diffCache.get(conflict.path);
+    if (!content) {
+      const loading = createSkeleton(container, 5);
+      try {
+        content = await this.loadConflictContent(conflict);
+        this.diffCache.set(conflict.path, content);
+        loading.remove();
+      } catch {
+        loading.remove();
+        createEmptyState(container, {
+          icon: 'alert-triangle',
+          title: '加载失败',
+          desc: '无法读取文件内容进行预览',
+        });
+        return;
+      }
+    }
+
+    const { local, remote, base } = content;
+
+    if (!local && !remote && !base) {
+      createEmptyState(container, {
+        icon: 'file-text',
+        title: '无内容可预览',
+        desc: '该冲突文件可能已被删除或为空',
+      });
+      return;
+    }
+
+    // 三栏 diff 视图
+    const diffView = container.createDiv({ cls: 'bdnsync-diff-view' });
+
+    const renderColumn = (
+      title: string,
+      text: string | undefined,
+      icon: Parameters<typeof setIcon>[1],
+      type: 'local' | 'remote' | 'base',
+    ) => {
+      const col = diffView.createDiv({ cls: `bdnsync-diff-column bdnsync-diff-${type}` });
+      const header = col.createDiv({ cls: 'bdnsync-diff-col-header' });
+      const iconEl = header.createSpan({ cls: 'bdnsync-diff-col-icon' });
+      setIcon(iconEl, icon, 14);
+      header.createSpan({ text: title, cls: 'bdnsync-diff-col-title' });
+      if (text !== undefined) {
+        header.createSpan({
+          text: `${text.split('\n').length} 行`,
+          cls: 'bdnsync-diff-col-meta',
+        });
+      }
+
+      const body = col.createDiv({ cls: 'bdnsync-diff-col-body' });
+      if (text === undefined) {
+        body.createDiv({
+          cls: 'bdnsync-diff-empty',
+          text: type === 'base' ? '无基准版本' : type === 'local' ? '本地已删除' : '云端已删除',
+        });
+      } else {
+        const lines = text.split('\n');
+        const code = body.createEl('pre', { cls: 'bdnsync-diff-code' });
+        const codeEl = code.createEl('code');
+        lines.forEach((line, i) => {
+          const lineEl = codeEl.createDiv({ cls: 'bdnsync-diff-line' });
+          lineEl.createSpan({ text: String(i + 1), cls: 'bdnsync-diff-line-num' });
+          lineEl.createSpan({ text: line || ' ', cls: 'bdnsync-diff-line-content' });
+        });
+      }
+    };
+
+    renderColumn('本地版本', local, 'hard-drive', 'local');
+    renderColumn('基准版本', base, 'git-branch', 'base');
+    renderColumn('云端版本', remote, 'cloud', 'remote');
+
+    // 简单 diff 统计
+    const stats = container.createDiv({ cls: 'bdnsync-diff-stats' });
+    const localLines = local?.split('\n') ?? [];
+    const remoteLines = remote?.split('\n') ?? [];
+    const baseLines = base?.split('\n') ?? [];
+    const added = Math.max(0, localLines.length - baseLines.length) + Math.max(0, remoteLines.length - baseLines.length);
+    const removed = Math.max(0, baseLines.length - localLines.length) + Math.max(0, baseLines.length - remoteLines.length);
+
+    stats.createSpan({
+      text: `本地 ${localLines.length} 行 · 云端 ${remoteLines.length} 行 · 基准 ${baseLines.length} 行`,
+      cls: 'bdnsync-diff-stats-info',
+    });
+    if (added > 0 || removed > 0) {
+      stats.createSpan({ text: `+${added}`, cls: 'bdnsync-diff-stat-add' });
+      stats.createSpan({ text: `-${removed}`, cls: 'bdnsync-diff-stat-del' });
+    }
+  }
+
+  private async loadConflictContent(
+    conflict: ConflictRecord,
+  ): Promise<{ local?: string; remote?: string; base?: string }> {
+    const result: { local?: string; remote?: string; base?: string } = {};
+
+    // 尝试读取本地文件
+    try {
+      const localFile = this.app.vault.getAbstractFileByPath(conflict.path);
+      if (localFile instanceof TFile) {
+        const content = await this.app.vault.read(localFile);
+        result.local = content;
+      }
+    } catch {
+      // 忽略读取错误
+    }
+
+    // 尝试读取草稿文件（如果有）
+    if (conflict.draftPath) {
+      try {
+        const draftFile = this.app.vault.getAbstractFileByPath(conflict.draftPath);
+        if (draftFile instanceof TFile) {
+          const content = await this.app.vault.read(draftFile);
+          result.remote = content;
+        }
+      } catch {
+        // 忽略读取错误
+      }
+    }
+
+    return result;
+  }
+
   onClose(): void {
+    this.diffCache.clear();
     this.contentEl.empty();
   }
 }
@@ -618,10 +808,23 @@ function svgLine(title: string, labels: string[], series: { color: string; vals:
   const n = labels.length;
   const x = (i: number) => P + (i * (W - 2 * P)) / Math.max(1, n - 1);
   const y = (v: number) => H - P - (v / maxV) * (H - 2 * P);
+  
+  // 折线和数据点
   const paths = series
     .map((s) => {
       const pts = s.vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
-      return `<polyline fill="none" stroke="${s.color}" stroke-width="2" points="${pts}"/>`;
+      const polyline = `<polyline class="bdnsync-viz-line" fill="none" stroke="${s.color}" stroke-width="2" points="${pts}"/>`;
+      // 添加数据点圆点和tooltip
+      const dots = s.vals
+        .map((v, i) => {
+          const cx = x(i).toFixed(1);
+          const cy = y(v).toFixed(1);
+          const label = labels[i];
+          const value = v > 0 ? formatBytes(v) : '0';
+          return `<circle class="bdnsync-viz-point" cx="${cx}" cy="${cy}" r="3" fill="${s.color}" stroke="var(--background-primary)" stroke-width="1.5"><title>${escHtml(label)}: ${value}</title></circle>`;
+        })
+        .join('');
+      return polyline + dots;
     })
     .join('');
   const grid = [0.25, 0.5, 0.75, 1]
@@ -637,12 +840,20 @@ function svgLine(title: string, labels: string[], series: { color: string; vals:
         : '',
     )
     .join('');
-  return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${title}</div><svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">${grid}${paths}${xlabels}</svg></div>`;
+  // 图例
+  const legendItems = series
+    .map((s, i) => {
+      const label = i === 0 ? '上传' : i === 1 ? '下载' : `系列${i + 1}`;
+      return `<div class="bdnsync-viz-legend-item"><span class="bdnsync-viz-legend-dot" style="background:${s.color}"></span>${escHtml(label)}</div>`;
+    })
+    .join('');
+  const legend = series.length > 1 ? `<div class="bdnsync-viz-legend-row">${legendItems}</div>` : '';
+  return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${escHtml(title)}</div>${legend}<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet">${grid}${paths}${xlabels}</svg></div>`;
 }
 
 function svgPie(title: string, segs: { label: string; value: number; color: string }[]): string {
   if (segs.length === 0)
-    return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${title}</div><div class="bdnsync-viz-empty">暂无数据</div></div>`;
+    return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${escHtml(title)}</div><div class="bdnsync-viz-empty">暂无数据</div></div>`;
   const total = segs.reduce((a, s) => a + s.value, 0) || 1;
   const R = 50,
     cx = 60,
@@ -658,16 +869,22 @@ function svgPie(title: string, segs: { label: string; value: number; color: stri
       const x1 = cx + R * Math.cos(a1),
         y1 = cy + R * Math.sin(a1);
       const large = a1 - a0 > Math.PI ? 1 : 0;
-      return `<path d="M${cx},${cy} L${x0.toFixed(1)},${y0.toFixed(1)} A${R},${R} 0 ${large} 1 ${x1.toFixed(1)},${y1.toFixed(1)} Z" fill="${s.color}"/>`;
+      const percentage = ((s.value / total) * 100).toFixed(1);
+      return `<path class="bdnsync-viz-arc" d="M${cx},${cy} L${x0.toFixed(1)},${y0.toFixed(1)} A${R},${R} 0 ${large} 1 ${x1.toFixed(1)},${y1.toFixed(1)} Z" fill="${s.color}"><title>${escHtml(s.label)}: ${formatBytes(s.value)} (${percentage}%)</title></path>`;
     })
     .join('');
   const legend = segs
     .map(
       (s) =>
-        `<div class="bdnsync-viz-legend"><span style="background:${s.color}"></span>${s.label} ${formatBytes(s.value)}</div>`,
+        `<div class="bdnsync-viz-legend"><span class="bdnsync-viz-legend-dot" style="background:${s.color}"></span>${escHtml(s.label)} ${formatBytes(s.value)}</div>`,
     )
     .join('');
-  return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${title}</div><svg viewBox="0 0 120 120" width="120" height="120">${arcs}</svg><div class="bdnsync-viz-legends">${legend}</div></div>`;
+  return `<div class="bdnsync-viz-card"><div class="bdnsync-viz-title">${escHtml(title)}</div><div class="bdnsync-viz-pie-container"><svg class="bdnsync-viz-pie" viewBox="0 0 120 120" width="120" height="120">${arcs}</svg><div class="bdnsync-viz-legends">${legend}</div></div></div>`;
+}
+
+/** HTML 实体转义：防止用户可控数据（文件扩展名等）注入 SVG/HTML */
+function escHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 /** 聚合日志条目，生成「每日流量折线 / 耗时趋势 / 类型占比饼图」三张自绘 SVG */
@@ -948,26 +1165,47 @@ export class VersionHistoryModal extends Modal {
 }
 
 /** 同步预览（dry-run）确认弹窗：手动同步前展示计划，用户确认后再执行 */
+/**
+ * 同步预览确认弹窗（居中 Modal）：
+ * 在 buildPreviewPlan 计算完成后弹出，展示完整的同步计划（统计卡片 + 操作样例），
+ * 用户确认后才真正执行 fullSync。这是「最终预览弹窗」，样式与旧版一致（居中模态框）。
+ */
 export class SyncPreviewModal extends Modal {
   private resolveP: ((confirm: boolean) => void) | null = null;
+  private plan: SyncPlanPreview | null = null;
 
-  constructor(
-    app: App,
-    private plan: SyncPlanPreview,
-  ) {
+  constructor(app: App) {
     super(app);
     this.modalEl.addClass('bdnsync-modal', 'bdnsync-preview-modal');
   }
 
-  open(): Promise<boolean> {
-    super.open();
+  /**
+   * 弹出居中模态框并展示计划，返回用户确认承诺。
+   * 注意：open() 若因渲染异常抛出，Obsidian 不会调用 onClose，Promise 将无人 resolve，
+   * 导致调用方 await 永久悬挂、同步锁无法释放。这里显式兜底 resolve(false)。
+   */
+  show(plan: SyncPlanPreview): Promise<boolean> {
+    this.plan = plan;
     return new Promise((resolve) => {
       this.resolveP = resolve;
+      try {
+        super.open();
+      } catch (e) {
+        this.resolveP = null;
+        console.error('[BDNSync] 同步预览弹窗打开失败：', e);
+        resolve(false);
+      }
     });
   }
 
   onOpen(): void {
-    const { contentEl, plan } = this;
+    const { contentEl } = this;
+    const plan = this.plan;
+    // 防御：未通过 show(plan) 直接 open() 时不渲染半成品 UI
+    if (!plan) {
+      contentEl.createEl('p', { text: '同步计划已失效，请重新发起同步。', cls: 'bdnsync-empty-state' });
+      return;
+    }
     const shell = contentEl.createDiv({ cls: 'bdnsync-modal-shell' });
     const dirText =
       plan.direction === 'force-upload'
@@ -983,6 +1221,7 @@ export class SyncPreviewModal extends Modal {
 
     const body = shell.createDiv({ cls: 'bdnsync-modal-body' });
 
+    // 统计卡片网格
     const metrics = body.createDiv({ cls: 'bdnsync-preview-grid' });
     const cards: { label: string; value: number; accent: 'blue' | 'green' | 'amber' | 'rose' }[] = [
       { label: '将上传', value: plan.upload, accent: 'green' },
@@ -1001,6 +1240,7 @@ export class SyncPreviewModal extends Modal {
       card.createEl('div', { text: c.label, cls: 'bdnsync-preview-card-label' });
     }
 
+    // 操作样例列表
     if (plan.samples.length) {
       const sampleWrap = body.createDiv({ cls: 'bdnsync-preview-samples' });
       sampleWrap.createEl('div', { text: '操作样例：', cls: 'bdnsync-preview-samples-title' });
@@ -1026,18 +1266,20 @@ export class SyncPreviewModal extends Modal {
       createCard(body).createEl('p', { text: '没有需要同步的变更 ✅', cls: 'bdnsync-empty-state' });
     }
 
-    const done = (confirm: boolean) => {
-      this.resolveP?.(confirm);
-      this.resolveP = null;
-      this.close();
-    };
+    // 底部按钮
     const footer = shell.createDiv({ cls: 'bdnsync-modal-foot' });
     footer
       .createEl('button', { text: '取消', cls: 'bdnsync-btn' })
-      .addEventListener('click', () => done(false));
+      .addEventListener('click', () => this.done(false));
     footer
       .createEl('button', { text: '确认同步', cls: 'bdnsync-btn bdnsync-btn-primary' })
-      .addEventListener('click', () => done(true));
+      .addEventListener('click', () => this.done(true));
+  }
+
+  private done(confirm: boolean): void {
+    this.resolveP?.(confirm);
+    this.resolveP = null;
+    this.close();
   }
 
   onClose(): void {
@@ -1893,6 +2135,32 @@ export class OrphanCleanupModal extends Modal {
       activeCount++;
       break;
     }
+
+    // 分步向导指引（仅在有候选时显示）
+    if (activeCount > 0) {
+      const wizard = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-wizard' });
+      const steps = [
+        { num: 1, text: '审查候选', icon: 'eye' as const, desc: '检查列表中的孤儿备份' },
+        { num: 2, text: '勾选清理', icon: 'check' as const, desc: '选择要删除的项目' },
+        { num: 3, text: '确认删除', icon: 'trash-2' as const, desc: '点击底部删除按钮' },
+      ];
+      const currentStep = this.summary.selectedCount > 0 ? 2 : 1;
+      for (const step of steps) {
+        const stepEl = wizard.createDiv({
+          cls: `bdnsync-orphan-wizard-step${step.num === currentStep ? ' bdnsync-orphan-wizard-step-active' : ''}${step.num < currentStep ? ' bdnsync-orphan-wizard-step-done' : ''}`,
+        });
+        const numEl = stepEl.createDiv({ cls: 'bdnsync-orphan-wizard-num' });
+        if (step.num < currentStep) {
+          setIcon(numEl, 'check', 12);
+        } else {
+          numEl.createSpan({ text: String(step.num) });
+        }
+        const textEl = stepEl.createDiv({ cls: 'bdnsync-orphan-wizard-text' });
+        textEl.createDiv({ text: step.text, cls: 'bdnsync-orphan-wizard-title' });
+        textEl.createDiv({ text: step.desc, cls: 'bdnsync-orphan-wizard-desc' });
+      }
+    }
+
     if (activeCount === 0) {
       const wrap = this.bodyEl.createDiv({ cls: 'bdnsync-orphan-empty' });
       wrap.createEl('p', {

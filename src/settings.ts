@@ -22,17 +22,35 @@ import { VIEW_TYPE_BDNSYNC_BROWSER, setOnSelectDirCallback } from './ui/views/ne
 
 export class BDNSyncSettingTab extends PluginSettingTab {
   private plugin: BDNSyncPlugin;
-  private rerenderToken = 0;
+  /** 文本输入防抖保存定时器：避免每敲一个字符就全量落盘 + 刷新后端 */
+  private saveTimer: number | null = null;
+  // ── 增量 DOM 更新引用（quota / vip listener 局部刷新，避免 display() 全量重建） ──
+  private quotaMetaSize: HTMLElement | null = null;
+  private quotaMetaPct: HTMLElement | null = null;
+  private quotaProgressBar: ReturnType<typeof createProgressBar> | null = null;
+  private quotaResultEl: HTMLElement | null = null;
+  private vipTierEl: HTMLElement | null = null;
+  private vipTimeEl: HTMLElement | null = null;
+  private vipBadge: HTMLElement | null = null;
   private quotaListener = (): void => {
     // 配额后台刷新完成后自动重绘连接卡片，避免一直显示「未检测」
     if (!this.containerEl.isConnected) return;
-    this.display();
+    this.updateQuotaDisplay();
   };
   private vipListener = (): void => {
     // VIP 信息后台刷新完成后自动重绘个人卡片
     if (!this.containerEl.isConnected) return;
-    this.display();
+    this.updateVipDisplay();
   };
+
+  /** 文本类 onChange 专用：300ms 防抖后执行 saveSettings，避免高频写盘 */
+  private debouncedSave(): void {
+    if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+    this.saveTimer = window.setTimeout(() => {
+      this.saveTimer = null;
+      void this.plugin.saveSettings();
+    }, 300);
+  }
 
   constructor(app: App, plugin: BDNSyncPlugin) {
     super(app, plugin);
@@ -241,6 +259,8 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     // 实验功能 10：局域网 P2P 同步
     const labLanEnabled = bool('labLanEnabled');
     if (labLanEnabled !== undefined) out.labLanEnabled = labLanEnabled;
+    const labSelfCheckEnabled = bool('labSelfCheckEnabled');
+    if (labSelfCheckEnabled !== undefined) out.labSelfCheckEnabled = labSelfCheckEnabled;
     const lanPassphrase = str('lanPassphrase');
     if (lanPassphrase !== undefined) out.lanPassphrase = lanPassphrase;
     const lanListenPort = num('lanListenPort', 1, 65535);
@@ -290,6 +310,8 @@ export class BDNSyncSettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
+    // 守卫：若容器已脱离文档（标签页切走/插件卸载），跳过渲染
+    if (!containerEl.isConnected) return;
     containerEl.empty();
     containerEl.addClass('bdnsync-setting-tab', 'bdnsync-root');
 
@@ -435,7 +457,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .onChange(async (v) => {
             s.logLevel = v as BDNSyncSettings['logLevel'];
             this.plugin.logger?.updateOptions({ level: s.logLevel });
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -451,7 +473,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
             const n = Math.max(0, Math.min(3650, parseInt(v, 10) || 0));
             s.logRetentionDays = n;
             this.plugin.logger?.updateOptions({ retentionDays: n });
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -467,7 +489,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
             const n = Math.max(50, Math.min(50000, parseInt(v, 10) || 1000));
             s.logMaxEntries = n;
             this.plugin.logger?.updateOptions({ maxEntries: n });
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -483,7 +505,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
             const n = Math.max(0, Math.min(720, parseInt(v, 10) || 24));
             s.logTombstoneGraceHours = n;
             this.plugin.logger?.updateOptions({ tombstoneGraceHours: n });
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -589,12 +611,23 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       timeEl.addClass('is-error');
     }
 
+    // 存储 VIP 引用供增量更新
+    this.vipTierEl = tierEl;
+    this.vipTimeEl = timeEl;
+    this.vipBadge = vipBadge;
+
     // 配额进度条
     const progressHost = info.createDiv({ cls: 'bdnsync-vip-progress' });
     const progressBar = createProgressBar(progressHost);
     const meta = info.createDiv({ cls: 'bdnsync-vip-meta' });
     const metaSize = meta.createSpan({ cls: 'bdnsync-vip-meta-size' });
     const metaPct = meta.createSpan({ cls: 'bdnsync-vip-meta-pct' });
+
+    // 存储引用供增量更新使用
+    this.quotaMetaSize = metaSize;
+    this.quotaMetaPct = metaPct;
+    this.quotaProgressBar = progressBar;
+    this.quotaResultEl = resultEl;
 
     const setQuotaDisplay = (used: number, total: number) => {
       const ratio = total > 0 ? used / total : 0;
@@ -609,10 +642,12 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         setQuotaDisplay(q.used, q.total);
         resultEl.addClass('is-success');
       } else {
-        metaSize.setText('存储用量获取失败');
-        metaPct.setText('点击下方「刷新用量」重试');
+        // total === 0 表示接口调用成功但未返回有效容量（多为 Cookie 缺 STOKEN），
+        // 与「请求失败」不是一回事，文案需区分，避免误导用户以为是网络/鉴权错误。
+        metaSize.setText('网盘未返回容量信息');
+        metaPct.setText('请补充含 STOKEN 的 Cookie 后点击「刷新用量」');
         progressBar.setRatio(0);
-        resultEl.setText('未获取配额');
+        resultEl.setText('容量未知');
         resultEl.addClass('is-warning');
       }
     } else if (this.plugin.lastQuotaError) {
@@ -765,6 +800,81 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     });
   }
 
+  /** 增量更新配额显示（避免全量 display() 重建整个设置页） */
+  private updateQuotaDisplay(): void {
+    const { quotaMetaSize: metaSize, quotaMetaPct: metaPct, quotaProgressBar: progressBar, quotaResultEl: resultEl } = this;
+    if (!metaSize || !metaPct || !progressBar || !resultEl) return;
+
+    // 清除旧状态类
+    resultEl.removeClass('is-success', 'is-warning', 'is-error', 'is-muted');
+
+    if (this.plugin.lastQuota) {
+      const q = this.plugin.lastQuota;
+      if (q.total > 0) {
+        const ratio = q.used / q.total;
+        metaSize.setText(`已用 ${formatBytes(q.used)} / ${formatBytes(q.total)}`);
+        metaPct.setText(`${(ratio * 100).toFixed(1)}%`);
+        progressBar.setRatio(ratio);
+        resultEl.setText('已连接');
+        resultEl.addClass('is-success');
+      } else {
+        // total === 0 表示接口调用成功但未返回有效容量（多为 Cookie 缺 STOKEN），
+        // 与「请求失败」不是一回事，文案需区分，避免误导用户以为是网络/鉴权错误。
+        metaSize.setText('网盘未返回容量信息');
+        metaPct.setText('请补充含 STOKEN 的 Cookie 后点击「刷新用量」');
+        progressBar.setRatio(0);
+        resultEl.setText('容量未知');
+        resultEl.addClass('is-warning');
+      }
+    } else if (this.plugin.lastQuotaError) {
+      const err = this.plugin.lastQuotaError;
+      metaSize.setText('存储用量获取失败');
+      metaPct.setText(err.length > 60 ? `${err.slice(0, 58)}…` : err);
+      metaPct.setAttr('title', err);
+      progressBar.setRatio(0);
+      resultEl.setText('未获取配额');
+      resultEl.addClass('is-error');
+    }
+  }
+
+  /** 增量更新 VIP 显示（避免全量 display() 重建整个设置页） */
+  private updateVipDisplay(): void {
+    const { vipTierEl: tierEl, vipTimeEl: timeEl, vipBadge: badge } = this;
+    if (!tierEl || !timeEl || !badge) return;
+
+    const vip = this.plugin.lastVipInfo;
+    const vipTier = vip?.vipType === 2 ? 'is-svip' : vip?.vipType === 1 ? 'is-vip' : 'is-normal';
+
+    // 更新等级文字
+    const tierText =
+      vip?.vipType === 2
+        ? '原画/4K 直链已解锁'
+        : vip?.vipType === 1
+          ? '可解锁 1080P 及以下'
+          : '账号等级 ≤ 720P';
+    tierEl.className = `bdnsync-vip-tier ${vipTier}`;
+    tierEl.setText(tierText);
+
+    // 更新检测时间
+    timeEl.removeClass('is-error');
+    if (this.plugin.lastVipInfoError) {
+      timeEl.setText(`检测失败：${this.plugin.lastVipInfoError.slice(0, 60)}`);
+      timeEl.setAttr('title', this.plugin.lastVipInfoError);
+      timeEl.addClass('is-error');
+    } else {
+      timeEl.setText(
+        vip && this.plugin.lastVipInfoAt
+          ? `上次检测 ${formatTime(this.plugin.lastVipInfoAt)}`
+          : '尚未检测会员等级',
+      );
+      timeEl.removeAttribute('title');
+    }
+
+    // 更新 VIP 徽标
+    badge.className = `bdnsync-vip-badge ${vipTier}`;
+    badge.setText(vip?.vipLabel ?? '账号');
+  }
+
   private renderRemoteRoot(container: HTMLElement): void {
     const s = this.plugin.settings;
     new Setting(container)
@@ -775,7 +885,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.setValue(s.remoteRoot);
         t.onChange(async (v) => {
           s.remoteRoot = v.trim();
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       })
       .addButton((b) => {
@@ -827,7 +937,16 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       card.createEl('div', { text: m.desc, cls: 'bdnsync-choice-desc' });
       card.addEventListener('click', async () => {
         s.syncMode = m.key;
-        await this.plugin.saveSettings();
+        // 联动触发开关：切换模式时自动调整 startup/save 的默认值，
+        // 避免"设了 manual 但 syncOnStartup 仍开着 → 启动时仍然同步"的语义错位。
+        if (m.key === 'manual') {
+          s.syncOnSave = false;
+          s.syncOnStartup = false;
+        } else {
+          s.syncOnSave = true;
+          s.syncOnStartup = true;
+        }
+        this.debouncedSave();
         this.plugin.restartScheduler();
         this.display();
       });
@@ -843,7 +962,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
             .setDynamicTooltip()
             .onChange(async (v) => {
               s.autoSyncInterval = v;
-              await this.plugin.saveSettings();
+              this.debouncedSave();
               this.plugin.restartScheduler();
             });
         });
@@ -855,7 +974,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.syncOnStartup).onChange(async (v) => {
           s.syncOnStartup = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -865,7 +984,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.syncOnSave).onChange(async (v) => {
           s.syncOnSave = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
   }
@@ -884,7 +1003,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         d.setValue(s.conflictStrategy);
         d.onChange(async (v) => {
           s.conflictStrategy = v as BDNSyncSettings['conflictStrategy'];
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -899,7 +1018,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         d.setValue(s.deleteStrategy);
         d.onChange(async (v) => {
           s.deleteStrategy = v as BDNSyncSettings['deleteStrategy'];
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -909,7 +1028,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.autoBackup).onChange(async (v) => {
           s.autoBackup = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -922,7 +1041,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = Number(v);
           s.bulkDeleteConfirm = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 50;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -933,7 +1052,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.mergeDraftEnabled).onChange(async (v) => {
           s.mergeDraftEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1121,7 +1240,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (!Number.isNaN(n) && n > 0 && n <= 4096) {
             s.maxFileSizeMB = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1132,7 +1251,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.skipHiddenFiles).onChange(async (v) => {
           s.skipHiddenFiles = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1142,7 +1261,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.syncConfigDir).onChange(async (v) => {
           s.syncConfigDir = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1156,7 +1275,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = Number(v);
           s.configSnapshotRetention = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 5;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -1176,7 +1295,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.encryptionEnabled).onChange(async (v) => {
           s.encryptionEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           this.display();
         }),
       );
@@ -1190,7 +1309,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         placeholder: '所有设备使用同一密码',
         onChange: async (v) => {
           s.encryptionPassword = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           const st = passwordStrength(v);
           meter.setText(`强度：${st.label} · ${st.hint}`);
           meter.className = `bdnsync-pw-meter bdnsync-pw-meter-${st.score}`;
@@ -1214,7 +1333,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       hintInput.value = s.passwordHint;
       hintInput.addEventListener('change', async () => {
         s.passwordHint = hintInput.value;
-        await this.plugin.saveSettings();
+        this.debouncedSave();
       });
 
       // P1-3.5 密钥文件模式：从 vault 内 .bdnsync-key 读取密码，避免每次输入
@@ -1227,7 +1346,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       keyInput.value = s.keyFilePath;
       keyInput.addEventListener('change', async () => {
         s.keyFilePath = keyInput.value.trim();
-        await this.plugin.saveSettings();
+        this.debouncedSave();
       });
       container.createEl('p', {
         cls: 'bdnsync-help-text',
@@ -1266,7 +1385,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (Number.isFinite(n) && n >= 0 && n <= 50) {
             s.maxVersions = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1315,7 +1434,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(enabled).onChange(async (v) => {
           s.labEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           this.display();
         }),
       );
@@ -1336,6 +1455,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
     this.renderLabHealthScore(container);
     this.renderLabGit(container);
     this.renderLabLan(container);
+    this.renderLabSelfCheck(container);
 
     // ---- 一键复位：把全部实验功能子开关恢复默认（不影响主开关） ----
     const footer = container.createDiv({ cls: 'bdnsync-lab-footer' });
@@ -1347,6 +1467,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       s.cloudMediaEnabled = false;
       s.cloudMediaLazyLoad = true;
       s.cloudMediaOfflinePlaceholder = true;
+      s.labSelfCheckEnabled = false;
       s.cloudMediaMaxInlineMB = 50;
       s.labBacklinksEnabled = false;
       s.labOfflinePinEnabled = false;
@@ -1361,7 +1482,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       s.lanListenPort = 51820;
       s.lanTargetHost = '';
       s.lanTargetPort = 0;
-      await this.plugin.saveSettings();
+      this.debouncedSave();
       this.display();
     });
   }
@@ -1392,7 +1513,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(on).onChange(async (v) => {
           s.cloudMediaEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           this.refreshLabStatusBadge(sec.header, v);
         }),
       );
@@ -1403,7 +1524,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.cloudMediaLazyLoad).onChange(async (v) => {
           s.cloudMediaLazyLoad = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1413,7 +1534,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.cloudMediaOfflinePlaceholder).onChange(async (v) => {
           s.cloudMediaOfflinePlaceholder = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1427,7 +1548,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             s.cloudMediaMaxInlineMB = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
   }
@@ -1456,7 +1577,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(on).onChange(async (v) => {
           s.labBacklinksEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           this.refreshLabStatusBadge(sec.header, v);
         }),
       );
@@ -1488,7 +1609,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(on).onChange(async (v) => {
           s.labOfflinePinEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           this.refreshLabStatusBadge(sec.header, v);
         }),
       );
@@ -1503,7 +1624,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             s.labOfflinePinMaxMB = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
   }
@@ -1532,7 +1653,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(on).onChange(async (v) => {
           s.labHealthEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
           this.refreshLabStatusBadge(sec.header, v);
         }),
       );
@@ -1547,7 +1668,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             s.labHealthWarnThreshold = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
   }
@@ -1584,7 +1705,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDisabled(!desktop)
           .onChange(async (v) => {
             s.labGitEnabled = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
             this.refreshLabStatusBadge(sec.header, v);
           }),
       );
@@ -1595,7 +1716,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(!!s.labGitFallbackToScan).onChange(async (v) => {
           s.labGitFallbackToScan = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1640,7 +1761,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDisabled(!desktop)
           .onChange(async (v) => {
             s.labLanEnabled = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
             this.refreshLabStatusBadge(sec.header, v);
           }),
       );
@@ -1654,7 +1775,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setPlaceholder('两端一致的配对码')
           .onChange(async (v) => {
             s.lanPassphrase = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -1693,7 +1814,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = Number(v);
           if (Number.isFinite(n) && n > 0 && n <= 65535) {
             s.lanListenPort = Math.floor(n);
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1707,7 +1828,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setPlaceholder('如 192.168.1.20')
           .onChange(async (v) => {
             s.lanTargetHost = v.trim();
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -1745,9 +1866,46 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = Number(v);
           s.lanTargetPort = Number.isFinite(n) ? Math.floor(n) : 0;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
+  }
+
+  /** 实验室子功能 ⑥：功能自检（Self-Check） */
+  private renderLabSelfCheck(container: HTMLElement): void {
+    const s = this.plugin.settings;
+    const on = !!s.labSelfCheckEnabled;
+    const sec = createSection(container, {
+      title: '⑥ 功能自检（Self-Check）',
+      icon: 'check',
+      collapsible: true,
+      defaultOpen: on,
+    });
+    this.renderLabStatusBadge(sec.header, on);
+
+    const tip = sec.body.createEl('div', { cls: 'bdnsync-callout bdnsync-callout-muted' });
+    tip.createEl('p', {
+      cls: 'bdnsync-callout-text',
+      text: '对插件自身的基础能力（配置 / 授权 / 网络 / 引擎 / 日志 / 重试队列 / 文件监听 / 本地存储 / 加密）做一次性体检，快速定位异常项。',
+    });
+
+    new Setting(sec.body)
+      .setName('启用功能自检')
+      .setDesc('关闭则不在命令面板暴露「运行自检」命令。')
+      .addToggle((t) =>
+        t.setValue(on).onChange(async (v) => {
+          s.labSelfCheckEnabled = v;
+          this.debouncedSave();
+          this.refreshLabStatusBadge(sec.header, v);
+        }),
+      );
+
+    new Setting(sec.body)
+      .setName('立即运行自检')
+      .setDesc('对当前运行状态做一次体检并弹出结果面板。')
+      .addButton((b) =>
+        b.setButtonText('运行自检').setCta().onClick(() => void this.plugin.runSelfCheckCommand()),
+      );
   }
 
   /** 在子区头右侧渲染一个状态徽标（绿/灰） */
@@ -1795,7 +1953,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         d.setValue(String(s.chunkSizeMB));
         d.onChange(async (v) => {
           s.chunkSizeMB = parseInt(v, 10);
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -1809,7 +1967,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             s.uploadConcurrency = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -1823,7 +1981,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             s.downloadConcurrency = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -1838,7 +1996,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (!Number.isNaN(n) && n >= 50 && n <= 5000) {
             s.requestIntervalMs = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1853,7 +2011,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = Number(v);
           if (Number.isFinite(n) && n >= 0) {
             s.bandwidthLimitKBps = Math.floor(n);
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1866,7 +2024,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.syncPreviewEnabled).onChange(async (v) => {
           s.syncPreviewEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1882,7 +2040,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (Number.isInteger(n) && n >= 0) {
             s.stormThreshold = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1899,7 +2057,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (Number.isInteger(n) && n >= 0 && n <= 10000) {
             s.renameGraceMs = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1913,7 +2071,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.adaptiveConcurrency).onChange(async (v) => {
           s.adaptiveConcurrency = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1930,7 +2088,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = Number(v);
           if (Number.isFinite(n) && n >= 0 && n <= 4096) {
             s.largeFileThresholdMB = Math.floor(n);
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1942,7 +2100,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.apiProbeEnabled).onChange(async (v) => {
           s.apiProbeEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -1956,7 +2114,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = Number(v);
           if (Number.isFinite(n) && n >= 1 && n <= 168) {
             s.apiProbeIntervalHours = Math.floor(n);
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -1968,7 +2126,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.crossDeviceDashboardEnabled).onChange(async (v) => {
           s.crossDeviceDashboardEnabled = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
   }
@@ -1984,7 +2142,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setPlaceholder('例如：办公室台式机')
           .onChange(async (v) => {
             s.deviceName = v.trim();
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
 
@@ -2005,7 +2163,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
             ).open();
             if (!ok) return;
             s.deviceId = `device-${Math.random().toString(36).slice(2, 10)}`;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
             this.display();
           }),
       );
@@ -2021,7 +2179,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           .setValue(s.themeMode)
           .onChange(async (v) => {
             s.themeMode = v as 'auto' | 'normal' | 'high-contrast';
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }),
       );
   }
@@ -2035,7 +2193,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.autoSnapshot).onChange(async (v) => {
           this.plugin.settings.autoSnapshot = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
     new Setting(section.body)
@@ -2048,7 +2206,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (Number.isFinite(n) && n >= 1 && n <= 20) {
             this.plugin.settings.maxSnapshots = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -2066,7 +2224,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           if (Number.isFinite(n) && n >= 0 && n <= 1440) {
             this.plugin.settings.snapshotIntervalMinutes = n;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -2237,7 +2395,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.detectOrphanBackupDirs).onChange(async (v) => {
           s.detectOrphanBackupDirs = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -2250,7 +2408,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.autoPruneOrphanBackupDirs).onChange(async (v) => {
           s.autoPruneOrphanBackupDirs = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -2266,7 +2424,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = parseInt(v, 10);
           s.orphanRetentionDays = Number.isFinite(n) && n >= 0 ? Math.min(3650, Math.floor(n)) : 90;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -2286,7 +2444,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         d.setValue(s.orphanScanMode).onChange(async (v) => {
           if (v === 'parent-only' || v === 'scoped' || v === 'full-vault') {
             s.orphanScanMode = v;
-            await this.plugin.saveSettings();
+            this.debouncedSave();
           }
         });
       });
@@ -2303,7 +2461,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = parseInt(v, 10);
           s.orphanScanMaxDepth = Number.isFinite(n) && n >= 0 ? Math.min(32, Math.floor(n)) : 0;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -2319,7 +2477,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = parseInt(v, 10);
           s.orphanScanMaxNodes = Number.isFinite(n) && n >= 0 ? Math.min(1_000_000, Math.floor(n)) : 20000;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -2334,7 +2492,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
           const n = parseInt(v, 10);
           s.orphanScanMaxBytes =
             Number.isFinite(n) && n >= 0 ? Math.min(1_099_511_627_776, Math.floor(n)) : 2 * 1024 * 1024 * 1024;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -2348,7 +2506,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
         t.onChange(async (v) => {
           const n = parseInt(v, 10);
           s.orphanScanConcurrency = Number.isFinite(n) && n >= 1 ? Math.min(8, Math.floor(n)) : 3;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 
@@ -2361,7 +2519,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(s.orphanUseRecycleBin).onChange(async (v) => {
           s.orphanUseRecycleBin = v;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         }),
       );
 
@@ -2379,7 +2537,7 @@ export class BDNSyncSettingTab extends PluginSettingTab {
             .map((x) => x.trim())
             .filter(Boolean);
           s.orphanExtraIgnoreGlobs = arr;
-          await this.plugin.saveSettings();
+          this.debouncedSave();
         });
       });
 

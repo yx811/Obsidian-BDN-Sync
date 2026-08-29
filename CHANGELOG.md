@@ -2,9 +2,116 @@
 
 本文件记录 BDNSync 的所有版本变更。版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-> 📌 最新版本：**1.0.7**（2026-08-29）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
+> 📌 最新版本：**1.0.8**（2026-08-30）。发布前请阅读 [发布前检查清单](../../README.md#发布前检查清单)。
 
 ---
+
+## [1.0.8] - 2026-08-30
+
+### 新增：实验室 ⑥ 功能自检（Self-Check）
+
+- **一次性体检能力**（新增 `src/lab/self-check.ts` + `src/ui/self-check-modal.ts`）：对插件基础能力做结构化体检 —— 配置合法性、授权状态、网络 / API 可达性、同步引擎、日志系统、失败重试队列、文件监听、本地存储、端到端加密。单项抛错互不影响（逐项 `try` 隔离），输出「通过 / 告警 / 失败」三级结论；无 error 级失败即判定健康（warn 不阻断）。
+- **设置入口**（`src/settings.ts`、`src/types.ts`）：新增开关 `labSelfCheckEnabled`（默认**关闭**）；设置 → 实验室新增「⑥ 功能自检（Self-Check）」子区，含「启用功能自检」开关与「立即运行自检」按钮，子区头沿用既有的启用状态徽标。
+- **命令入口**（`src/main.ts`）：新增命令 `bdnsync-self-check`（名称「运行自检（实验室）」），仅在「启用实验室」与「启用功能自检」**同时**开启时注册；结果写入模块化日志（模块 `lab`）并弹出结果面板。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` **291 项全过**（21 文件）。
+
+### 新增：冲突处理面板内容 Diff 预览与元信息
+
+- **三栏 Diff 预览**（`src/ui/modals.ts`）：选中冲突项后展示「基准 / 本地 / 云端」三栏内容对照，可折叠、可记忆开关状态（`diffPreviewEnabled`），带加载骨架屏与内容缓存（`diffCache`）。
+- **冲突元信息卡片**：同区展示设备 A / 设备 B、基准哈希、本地哈希、云端哈希（哈希截断为前 8 位），便于定位「哪两端在冲突」。
+- **二进制降级**：命中常见二进制扩展名（图片 / 音视频 / 压缩包等）时明确提示「无法预览二进制文件内容」，不再尝试按文本渲染；读取失败给出可辨识的空态。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿。
+
+### 新增：状态栏配额微进度条
+
+- 状态栏新增配额微进度条（`src/ui/status-bar.ts`）：按已用 / 总量着色 —— >70% 转警示色、>90% 转危险色，悬停显示 `已用 / 总量 (百分比)` 明细，随空闲态刷新。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿。
+
+### 新增：孤儿清理弹窗三步向导
+
+- 「审查候选 → 勾选清理 → 确认删除」三步指引（`src/ui/modals.ts`），按当前勾选状态高亮所处步骤并标记已完成项，仅在存在候选时显示。删除行为与确认门槛不变。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿。
+
+### 重构：UI 界面全面升级（`src/styles.css` 手写层 105 行 → 2,457 行）
+
+> v1.0.7 的 `src/styles.css` 仅 **105 行**（第 1 行为 136 KB 压缩核心层，第 2–105 行为 v1.0.6 的验收补齐层）。v1.0.8 在**不触碰压缩核心层**的前提下，以「末尾追加 + 高优先级选择器覆盖」的方式补齐了全部手写分层，净增约 2,350 行。
+
+- **① 底部状态栏全面重新设计**（约 200 行）：容器改药丸造型（13px 圆角 / 26px 高）+ 边框 + 次级背景 + 悬停投影 + 按下 `scale(0.97)` 回弹；图标按状态着色（空闲/完成绿、同步中蓝 + 旋转、失败红 + 抖动、离线灰暗）；状态圆点 7px 带光晕（同步中缩放脉冲、失败闪烁、离线无晕）；徽章改渐变背景 + 投影 + 悬停 `scale(1.15)`（冲突红渐变 / 重试金渐变）；配额条渐变填充 + 缓动，>70% 金渐变警示、>90% 红渐变 + 脉冲。新增 `icon-spin` / `shake` / `dot-pulse` / `dot-blink` / `bar-pulse` 五组动效，保留旧 `pulse` / `blink` 兼容名。
+- **② 同步日志浏览器焕新**（约 1,010 行，本版最大单项）：行头部重构为紧凑单行 `[▸ 级别 类型 · 模块] …… [时间]` —— 级别与类型紧邻（视觉权重最高）、模块弱化、时间恒定靠右；级别徽章改为「浅底 + 级别色文字 + 细边框」软芯片，与类型胶囊形成层次；按**级别 + 类型双维度着色**（整行左边框 + 字体颜色，error / warn 加重、debug 弱化）；类型标签改用小色点 + 文案胶囊替代 Obsidian 大图标；展开详情重做为 2 列紧凑字段网格（短字段两两一行、长字段跨满整行，左右半列交替底色弱化分隔线），内容提炼标记改为跟随该条日志的级别色；工具栏 / 筛选栏 / 快筛 Chips / 统计条 / 日期分组 / 行数计数胶囊 / 底栏（清空危险样式、导出菜单、行内操作按钮）全部重做，另含搜索高亮、Tomb 行与窄屏表格横向滚动。
+- **③ 设置页连接卡视觉优化**（约 280 行，覆盖压缩层）：卡片化（12px 圆角 + 边框 + 投影 + `overflow: hidden`）与 flex 分栏（窄屏 ≤600px 自动堆叠）；头像 72×72 加 3px 光环，SVIP 金渐变 + 金色外发光 / VIP 蓝渐变 / 普通灰；徽章 11px / 字重 700 / 大写 / 10px 圆角（SVIP 金底黑字、VIP 蓝底白字）；连接状态新增 `::before` 圆点伪元素（7px + 光晕）区分成功 / 失败 / 警示 / 弱化四态；等级标签按 SVIP 金 / VIP 蓝 / 普通灰着色；配额进度条限宽 320px、数字改用等宽字形 `tabular-nums` 避免跳动；操作按钮组统一 8px 圆角 + 悬停 `translateY(-1px)` + 按下 `scale(.98)`，首个按钮（刷新会员）用强调渐变紫底白字做主次区分；底部说明改 callout（内边距 + 圆角 + 左侧 3px 强调线）。
+- **④ 冲突面板 Diff 预览增强**（约 170 行）：三栏并排（基准 / 本地 / 云端）的列头、图标、等宽正文、分隔与滚动容器；可折叠区头与眼睛图标切换。
+- **⑤ 统计图表交互增强**（约 105 行）：图表卡片悬停抬升、折线数据点悬停放大、饼图扇区悬停高亮、图例项悬停反馈、坐标轴与标签样式统一。
+- **⑥ 功能自检结果面板**（约 120 行）：总览卡（健康绿 / 异常红两套状态）、单项卡片、级别标签（ok / warn / error）。
+- **⑦ 孤儿清理分步向导**（约 80 行）：步骤条含当前步高亮、已完成步打勾、连接线与描述文字。
+- **⑧ 响应式布局优化**（约 80 行）：冲突面板 ≤700px 双栏转垂直堆叠；统计图表 ≤600px 单列；弹窗 ≤480px 宽度自适应；网盘浏览器面包屑换行；同步日志表格横向滚动；跨设备看板适配。
+- **⑨ 样式统一层 v2**（约 290 行）：**零样式类名清零** —— 用脚本比对 TS 实际引用的 617 个 `bdnsync-*` 类与 CSS 已定义的 863 个，补齐全部 **33 个零样式类**（反向链接区块 7 个、批量删除输入门 2 个、规则徽章 `include` 变体、合并面板本地/远端、导入设置文件行、授权面板、各类文本修饰）；**表单控件规范** —— `input` / `select.bdnsync-input` 原先**只有 `flex: 1` 一句**（近乎裸奔），现与 `.bdnsync-textarea` 完全对齐（32px 高 / 6px 圆角 / 边框令牌 / 悬停 / 聚焦焦点环 / 禁用态 / placeholder）；**焦点态统一** —— `.bdnsync-btn`、`.bdnsync-select` 统一 `focus-visible` 焦点环；**窄屏兜底** —— 新增 600px 断点（设置行堆叠、反向链接竖排、确认输入收紧）与 `prefers-reduced-motion` 降级。
+- **⑩ 清理死样式**：删除随「同步预览右下角浮动提示」移除而残留的 `.bdnsync-modal-loading` / `-spinner` / `-loading-text` 与 `@keyframes bdnsync-spin`（45 行）。该浮动提示**从未随任何已发布版本提供**（v1.0.7 为「静默计算后直接弹居中确认框」），故不记作行为变更。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；产物 `styles.css` 由 140 KB 增至约 182 KB；CSS 括号平衡校验通过（balance = 0）。
+
+### 修复：同步触发时机（🔴「点了没反应 / 重开不同步 / 保存不上传」集中治理）
+
+- **① 触发边界收敛为单一事实来源**（新增 `src/sync/trigger-policy.ts`）：此前「是否自动触发」散落在 `onLayoutReady` / `tickScheduler` / `onlineHandler` / `runQuickSync` / `onLocalChange` 五处，各自复读 `syncMode === 'manual'`、重复表达 `auto || realtime`，导致 `auto` 与 `realtime` 都触发了「保存即同步」、二者边界名存实亡。现抽出纯函数 `resolveSyncTriggers()` 统一查表（manual / auto / realtime × 启动 / 周期 / 保存 / 网络恢复），并新增触发策略矩阵单测锁定语义。
+- **② 重开 / 重载不再跳过启动同步**（`src/main.ts`）：两处叠加导致「重载/重开后不自动同步」—— (a) 启动同步要求 `syncOnStartup` 为真，而 `auto` / `realtime` 用户未必勾选该项，选了自动类模式却等不到启动同步；(b) `skipStartupSync`（会话中手动启用插件）**直接跳过**启动同步，重载后要干等一个完整 `autoSyncInterval`。现改为：`auto` / `realtime` 无论 `syncOnStartup` 开关都触发；`skipStartupSync` 不再跳过，而是**延迟约 12 秒执行**，既避开你正在操作的设置页，又保证一定会同步。
+- **③ 手动触发不再「只转图标不执行同步」**（🔴 用户痛点）：引擎正忙时点击同步，**静默放弃**。现置位 `pendingManualSync`，当前同步结束后由 `finally` 自动补做一次完整同步，并提示「本次点击已排队，完成将自动再同步一次」。
+- **④ 点击同步有即时反馈**（🔴 用户痛点）：Ribbon 图标 / 命令 / 状态栏三个入口统一走 `triggerManualSync()` —— 立刻把状态栏置为「同步中」，若本次确实无上传/下载/删除则明确提示「已是最新，无需同步」，消除「点了没反应」的困惑。
+- **⑤ 调度热生效**：`syncMode` / `autoSyncInterval` 改动保存后立即 `restartScheduler()` 重算下次自动同步时间；启动同步结束后对齐周期，避免与启动同步挤在一起或拖太久。
+- **⑥ 离线与未初始化不再静默**：离线时明确提示「当前离线，恢复网络后自动同步」；引擎未初始化时提示检查设置后重载（此前无声返回）。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` **291 项全过**（新增 `tests/trigger-policy.test.ts` 7 项、`tests/file-watcher.test.ts` 8 项）。
+
+### 修复：实时同步丢改动（🔴 数据安全，`src/watcher/file-watcher.ts`）
+
+- **① 同步期间产生的变更被丢弃**：`resume()` 里对 `discardedDuringSync` 逐个 `clearTimer()` —— 等于直接丢弃。改为**重新投递回批次队列**并立即调度，确保实时窗口内的改动最终落盘。
+- **② 批次触发时先清空再判断挂起**：原实现「先 `pendingPaths.clear()` 再 `if (suspended) return`」，挂起期间的累积变更**永久丢失**。改为挂起时原样保留、直接返回，待 `resume()` 重新投递。
+- **③ >100MB 超大文件被静默丢弃**：原 `if (size > HUGE) return;` 直接 return，这类文件**永远不会同步**。改为标记后并入批次，批次触发时降级为一次完整同步，确保不丢。
+- **④ 最小间隔重试时间算错**：重试间隔复用函数入口处的旧 `now`（可能过短），导致反复重排。改为用当前真实时间戳计算，并加 `Math.max(200, …)` 下限。
+- **⑤ 防抖档位可配置**：防抖 / 大文件防抖 / 批次窗口由硬编码改为构造参数，并新增 `setTiming()` 供运行时切换。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` **291 项全过**。
+
+### 修复：完整功能验收发现的问题（状态机 / 资源锁 / 弹窗 / 日志 / 性能）
+
+- **① 状态栏永久卡在「同步中」（🔴 状态机死锁）**（`src/ui/status-bar.ts`、`src/main.ts`）：`setIdle()` 有「非活跃才执行」的自保守卫，而 `setSyncing()` 会把状态置为 `syncing` —— 此后所有 `setIdle()` 恒为 no-op。结果是「取消预览 / 取消同步 / 首同步取消 / 删除保护取消」等 6 条取消路径状态栏**永久转圈**（而错误路径正常，表现为"失败能复位、取消永远转圈"）。修复：新增 `forceIdle()` 作为同步收口，`setIdle()` 委托它；6 处收口改调 `forceIdle()`。
+- **② 预览锁泄漏 + 无 `try/finally`（🔴）**（`src/main.ts`）：`previewPanel = false` 写在 `await modal.show()` **之前**，弹窗等待期间锁是开的（可重复触发计划计算、弹窗叠加）；`show()` 抛错则锁永久为 `true`，之后再也无法手动同步。修复：用 `try { … } finally { previewPanel = false; }` 包裹完整作用域。
+- **③ 预览弹窗 Promise 悬挂（🔴）**（`src/ui/modals.ts`）：`SyncPreviewModal.show()` 在 `super.open()` 抛错时 `onClose` 不会被调用，Promise 无人 resolve → 调用方 `await` **永久挂起**、同步锁无法释放。修复：Promise 内 `try/catch` 兜底 `resolve(false)` 并记日志；同时补 `plan` 为空的渲染防御。
+- **④ 自检报告弹窗永不显示（🔴）**（`src/main.ts`）：`openExclusive()` **只登记不打开**，漏了 `.open()`，弹窗不显示且 key 被占死。修复：补 `?.open()`。
+- **⑤ 统计图表 SVG/HTML 注入（🔴 安全）**（`src/ui/modals.ts`）：`buildStatsSvgs()` 把用户可控数据（文件扩展名等）直接拼进 `innerHTML` 的 SVG 字符串。修复：新增 `escHtml()` 对 `& < > "` 做实体转义后再拼接。
+- **⑥ 预览确认后重复 I/O（🟡 性能）**（`src/sync/engine.ts`）：手动同步开启预览时，`buildPreviewPlan` 已完整读取远端索引 / 远端目录树 / 本地扫描，紧随其后的 `fullSync` 又原样重做一遍 —— 大库下「点完预览后实际同步更慢」正源于此。修复：新增 `previewCache` 与 `fullSync(reusePreviewCache)`，确认后直接复用、用完即弃；非预览路径主动清空避免误用。附性能回归测试（`tests/engine-integration.test.ts`）。
+- **⑦ 远端目录树串行遍历（🟡 性能）**（`src/baidu/adapter.ts`、`src/sync/backend.ts`）：`listTree` 逐目录串行 `listRemoteDir`，每个目录一次网络往返，是「对比阶段」主要耗时。重写为有界并发 BFS（`traverseRemoteTree`，并发取「扫描并发数」设置、上限 8），并支持 `AbortSignal`（取消预览时中止遍历）。另：`fullSync` 的远端列举（网络）与本地扫描（磁盘）改为**并发**执行。附并发遍历单测（`tests/list-tree.test.ts`）。
+- **⑧ 卸载后弹窗遮罩残留（🟡）**（`src/main.ts`）：`onunload()` 不关闭已登记弹窗，插件卸载后遮罩仍在界面上且无法关闭。修复：遍历 `openModals` 逐个 `close()` 后清空。
+- **⑨ 状态栏 `unmount()` 不清定时器（🟡）**：`revertTimer` 未在卸载时清理。修复：`clearTimeout` + 置 `null`。
+- **⑩ 日志订阅退订误伤（🟡）**（`src/util/logger.ts`）：`onEntry()` 返回的退订函数用 `filter(f !== fn)`，会一次移除**所有**相同引用的监听。修复：改用 `indexOf` + `splice`，只移除一个。
+- **⑪ 本地索引清单无类型校验（🟡）**（`src/storage/local-store.ts`）：`base-manifest.json` 直接 `as` 断言返回，脏数据会污染后续的 mtime/size 判定。修复：逐项校验 `size` / `mtime` 均为 number，非法项丢弃。
+- **⑫ 写盘前备份读取失败阻断写入（🟡）**（`src/sync/engine.ts`）：`exists()` 与 `readBinary()` 之间存在 TOCTOU 窗口，文件被锁 / 被删时抛错会中断整个写入。修复：`try/catch` 包裹，备份失败不阻断写入。
+- **⑬ 每次保存设置都重建后端（🟡 性能）**（`src/main.ts`）：改任一设置项（如敲一个字符的输入）都会走昂贵的 `refreshEncryptionKey()`（异步读 vault 文件）+ `refreshBackend()`。修复：新增加密相关字段快照 `encryptionSnapshot()`，仅在快照变化时重建。
+- **⑭ 设置项文本输入高频写盘（🟡）**：日志级别 / 保留天数 / 上限等数值设置每次改动都全量 `saveSettings()`。修复：改用既有的 300ms 防抖保存 `debouncedSave()`。
+- **⑮ 配额刷新无并发去重（🟡）**（`src/main.ts`）：连点「刷新用量」会并发打多次网盘接口。修复：新增 `quotaInFlight` Promise 复用，同一时刻只允许一个请求在飞。
+- **⑯ 设置页在容器脱离文档后仍渲染（🟡）**（`src/settings.ts`）：`display()` 缺连通性守卫。修复：加 `if (!containerEl.isConnected) return;`。
+- **⑰ 文案与死代码（🟢）**：取消日志文案错位（「预览确认未通过」实为「预览计算未完成」）；配额 `total === 0` 文案由「存储用量获取失败」改为「网盘未返回容量信息 / 容量未知」（接口调用成功但未返回有效容量，与请求失败不是一回事）；删除死字段 `rerenderToken`；消除 `SyncPreviewModal` 内 10 处非空断言告警（改为 `const plan = this.plan; if (!plan) return;`）。
+- 验证：`tsc --noEmit -skipLibCheck` ✅ 0 错误、`eslint src` ✅ **0 问题（0 error / 0 warning，历史 10 条 warning 已清零）**、`esbuild production` ✅、`vitest run` ✅ **291 项全过**（21 文件）。
+
+### 变更：行为调整与默认值调整（升级前请务必阅读）
+
+- **⚠️ 默认同步模式 `manual` → `realtime`**（`src/types.ts`）：新装用户开箱即用（保存即同步 + 重开/启动必触发 + 周期兜底对账）。此前默认 `manual` 导致「装完什么都没在同步」的困惑。**已安装用户的 `syncMode` 不受影响**（设置已持久化），如需保持纯手动请到设置 → 同步设置改回「手动模式」。
+- **⚠️ 自动模式（auto）不再「保存即同步」**：这是 trigger-policy 收敛后的语义修正 —— `auto` 与 `realtime` 此前**都**会保存即同步，二者边界名存实亡。现仅 `realtime` 保存即同步；`auto` 的变更由下一个周期的全量扫描覆盖（避免每次保存都打一次网盘）。**如果你此前用 `auto` 依赖保存即同步，请改为 `realtime`。**
+- **⚠️ 实时模式防抖档位收紧**：`realtime` 下普通文件 3s → **800ms**、大文件（>10MB）10s → **3s**、批次窗口 5s → **1.5s**；`auto` / `manual` 维持原档位（3s / 10s / 5s）。切换同步模式时档位即时生效（`setTiming()`），无需重载。
+- **⚠️ 推迟的增量兜底对账不再弹预览框**：引擎忙时推迟的兜底同步由 `syncNow('manual')` 改为 `syncNow('auto')`。此前开启「同步预览」时，每次完整同步结束都会莫名再弹一次预览确认框。
+- **⚠️ 同步预览计算期间显示进度**：此前 `buildPreviewPlan()` 静默执行、大库下长时间无任何反馈。现按阶段在底部状态栏实时显示（读取云端同步索引 → 列出云端文件清单（含已列出数）→ 扫描本地文件（含已扫描数）），并最终弹出原有的居中确认弹窗（样式与位置不变）。
+- **日志视图结构重组**：底栏改为左右分区（左侧「清空 / 复制全部日志 / 复制诊断」，右侧「导出」下拉菜单收纳 JSON / 文本 / CSV / Markdown 四种格式），解决按钮过多互相挤压；新增**日期区间筛选**（起始 / 结束）与搜索框一键清除。原有搜索（含正则）、排序、实时订阅、四种导出格式均**保持不变**。
+- **日志渲染性能**：新增 DOM 行数上限 200（`MAX_DOM_ROWS`）与增量渲染（`renderedIds` / `groupElements`），大日志量下不再整块重建。
+- **设置保存联动**：「同步模式 / 自动同步间隔」改动保存后即时重算调度；切换同步模式即时更新 watcher 防抖档位。
+- 验证：`tsc --noEmit -skipLibCheck`、`eslint`、`esbuild production` 全绿；`vitest run` **291 项全过**。
+
+### 待确认
+
+- 以下项无法从代码差异判定、需真实环境人工验收，**未在本文档中陈述为已修复**：真实百度账号下的授权 / 上传 / 下载 / 在线预览链路（沙箱无法覆盖）；Office 文档 `iframe` 预览在 WebView Cookie 罐下的实际可用性；局域网 P2P 在跨设备真实网络（非 loopback）下的表现。
+- 「扫描并发数」设置现同时用于孤儿扫描与远端目录树并发遍历（默认 3、上限 8）；在超大库下调高该值对百度接口限频的具体影响**待确认**，建议按默认值使用并根据实际表现微调。
+
+### 发布元数据
+
+- 版本号：**1.0.8**（自 1.0.7 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` / `package.json` / `package-lock.json` 同步更新为 1.0.8。
+- 构建产物 `main.js` / `styles.css` 由 CI 自动生成，不在版本控制中。
+- 样式**源码**为 `src/styles.css`（根目录 `styles.css` 仅为 Obsidian 加载的构建产物）。
+- 质量门禁：`tsc` 0 错误 / `eslint` 0 问题 / `vitest` 291 项全过（21 文件）/ 生产构建通过（`main.js` 约 552 KB、`styles.css` 约 182 KB）。
+- 样式源码 `src/styles.css` 由 105 行增至 **2,457 行**（手写分层，压缩核心层未改动）。
 
 ## [1.0.7] - 2026-08-29
 

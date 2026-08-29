@@ -492,6 +492,10 @@ export interface BDNSyncSettings {
   /** 手动指定的对端 TCP 端口（留空则随发现结果） */
   lanTargetPort: number;
 
+  // —— 实验功能 6：功能自检（Self-Check） ——
+  /** 仅当 labEnabled 时生效；开启后在命令面板暴露「运行自检」命令，对插件基础能力做一次性体检 */
+  labSelfCheckEnabled: boolean;
+
   // —— 网盘孤儿备份目录清理 ——
   /** 检测网盘远程根父目录下的「vault 名 + 时间戳段」型疑似孤儿目录；
    *  命中时写 SyncLog（不删、不弹窗），由用户决定是否手动清理 */
@@ -550,7 +554,9 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   tokenExpiresAt: '',
   remoteRoot: '',
 
-  syncMode: 'manual',
+  // 默认 realtime：保存即同步（syncOnSave=true）+ 重开/启动必触发 + 周期兜底对账，
+  // 让新装用户开箱即用。此前默认 manual 导致「什么都没在同步」的困惑（用户反馈痛点）。
+  syncMode: 'realtime',
   autoSyncInterval: 5,
   syncOnSave: true,
   syncOnStartup: true,
@@ -625,6 +631,8 @@ export const DEFAULT_SETTINGS: BDNSyncSettings = {
   lanListenPort: 51820,
   lanTargetHost: '',
   lanTargetPort: 0,
+
+  labSelfCheckEnabled: false,
 
   // 孤儿目录清理（默认保守：只检测、不自动删；保留天数 90；上次扫描 0 = 从未扫过）
   detectOrphanBackupDirs: true,

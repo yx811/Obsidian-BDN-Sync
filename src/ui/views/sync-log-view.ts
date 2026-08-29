@@ -27,7 +27,6 @@ export class SyncLogView extends ItemView {
   private levelFilter: Set<LogLevel> = new Set(); // 精确级别多选；空 = 不过滤
   private moduleFilter: Set<LogModule> = new Set(); // 模块多选；空 = 不过滤
   private keyword = '';
-  private useRegex = false;
   private from = '';
   private to = '';
   private sort: 'desc' | 'asc' = 'desc';
@@ -36,11 +35,24 @@ export class SyncLogView extends ItemView {
   private body!: HTMLElement;
   private listContainer!: HTMLElement;
   private statBar!: HTMLElement;
+  private searchInput!: HTMLInputElement;
   private unsub: (() => void) | null = null;
+  private onDocClick: ((e: MouseEvent) => void) | null = null;
   private pendingRender = false;
   /** 🟡#16：跨实时重渲染保留的「已展开」行集合（按 entry id）。
    *  新日志到达触发整体重建时，已展开的行不会因 DOM 重建而折叠。 */
   private expandedIds = new Set<string>();
+  // ── 增量渲染跟踪状态 ──
+  /** 上次完整渲染时使用的 filter hash，用于判断是否需要全量重建 */
+  private lastFilterKey = '';
+  /** 当前 DOM 中已渲染的 entry id 集合（用于快速判断新增条目） */
+  private renderedIds = new Set<string>();
+  /** 当前 DOM 中日期分组 → list 容器的映射（用于增量追加） */
+  private groupElements = new Map<string, { header: HTMLElement; list: HTMLElement; count: HTMLElement }>();
+  /** DOM 中实际渲染的条目数（用于判断是否超限） */
+  private renderedCount = 0;
+  /** 增量渲染最大 DOM 条目数上限，超出后退化为全量重建并截断 */
+  private static readonly MAX_DOM_ROWS = 200;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -72,32 +84,38 @@ export class SyncLogView extends ItemView {
       subtitle: '按日期分组 · 级别色彩区分 · 支持搜索/过滤/排序/导出',
     });
 
-    // ── 工具栏：搜索 + 正则 + 排序 + 刷新 ──
+    // ── 工具栏：搜索 + 排序 + 刷新 ──
     const toolbar = head.head.createDiv({ cls: 'bdnsync-log-toolbar' });
     const searchWrap = toolbar.createDiv({ cls: 'bdnsync-log-search' });
+    const searchIcon = searchWrap.createSpan({ cls: 'bdnsync-log-search-icon' });
+    setIcon(searchIcon, 'filter', 16);
     const searchInput = searchWrap.createEl('input', {
       cls: 'bdnsync-input bdnsync-log-search-input',
-      attr: { type: 'text', placeholder: '搜索消息/路径/模块（支持正则）…' },
+      attr: { type: 'text', placeholder: '搜索消息、路径或模块…' },
     }) as HTMLInputElement;
+    this.searchInput = searchInput;
     searchInput.value = this.keyword;
     searchInput.addEventListener('input', () => {
       this.keyword = searchInput.value;
+      this.updateSearchClear();
       this.scheduleRender();
     });
-    createIconButton(toolbar, {
-      icon: 'regex',
-      label: '正则',
-      title: '将搜索内容作为正则表达式解析（否则纯文本子串）',
-      primary: this.useRegex,
-      onClick: () => {
-        this.useRegex = !this.useRegex;
-        toolbar.querySelectorAll('.bdnsync-log-regex-btn').forEach((b) => {
-          b.classList.toggle('bdnsync-btn-primary', this.useRegex);
-        });
-        this.scheduleRender();
-      },
-    }).addClass('bdnsync-log-regex-btn');
-    createIconButton(toolbar, {
+    const clearBtn = searchWrap.createEl('button', {
+      cls: 'bdnsync-log-search-clear',
+      attr: { 'aria-label': '清除搜索', title: '清除搜索' },
+    });
+    setIcon(clearBtn, 'x', 14);
+    clearBtn.addEventListener('click', () => {
+      searchInput.value = '';
+      this.keyword = '';
+      this.updateSearchClear();
+      this.scheduleRender();
+    });
+    this.updateSearchClear();
+
+    // 操作按钮组
+    const actions = toolbar.createDiv({ cls: 'bdnsync-log-actions' });
+    createIconButton(actions, {
       icon: 'arrow-down-wide-narrow',
       label: '排序',
       title: '切换排序方向（最新优先 ⇄ 最早优先）',
@@ -111,14 +129,15 @@ export class SyncLogView extends ItemView {
     const body = shell.createDiv({ cls: 'bdnsync-modal-body' });
     this.body = body;
 
-    // ── 筛选栏：时间范围 + 最低级别 + 精确级别 chips + 模块 chips + 墓碑开关 ──
+    // ── 筛选栏：时间范围 + 最低级别 + 墓碑开关 ──
     const filterBar = body.createDiv({ cls: 'bdnsync-log-filterbar' });
-    const mkField = (label: string): HTMLElement => {
-      const f = filterBar.createDiv({ cls: 'bdnsync-log-field' });
-      f.createEl('label', { text: label, cls: 'bdnsync-log-label' });
-      return f;
-    };
-    const fromWrap = mkField('起始');
+    const filterLeft = filterBar.createDiv({ cls: 'bdnsync-log-filter-left' });
+    const filterRight = filterBar.createDiv({ cls: 'bdnsync-log-filter-right' });
+
+    // 时间范围
+    const dateGroup = filterLeft.createDiv({ cls: 'bdnsync-log-date-group' });
+    const fromWrap = dateGroup.createDiv({ cls: 'bdnsync-log-field' });
+    fromWrap.createEl('label', { text: '起始', cls: 'bdnsync-log-label' });
     const fromInput = fromWrap.createEl('input', {
       cls: 'bdnsync-input',
       attr: { type: 'date' },
@@ -128,7 +147,9 @@ export class SyncLogView extends ItemView {
       this.from = fromInput.value;
       this.scheduleRender();
     });
-    const toWrap = mkField('结束');
+    dateGroup.createSpan({ text: '–', cls: 'bdnsync-log-date-sep' });
+    const toWrap = dateGroup.createDiv({ cls: 'bdnsync-log-field' });
+    toWrap.createEl('label', { text: '结束', cls: 'bdnsync-log-label' });
     const toInput = toWrap.createEl('input', {
       cls: 'bdnsync-input',
       attr: { type: 'date' },
@@ -138,13 +159,16 @@ export class SyncLogView extends ItemView {
       this.to = toInput.value;
       this.scheduleRender();
     });
-    const lvlWrap = mkField('最低级别');
+
+    // 最低级别
+    const lvlWrap = filterLeft.createDiv({ cls: 'bdnsync-log-field' });
+    lvlWrap.createEl('label', { text: '级别', cls: 'bdnsync-log-label' });
     const lvlSelect = lvlWrap.createEl('select', { cls: 'bdnsync-input' }) as HTMLSelectElement;
     for (const [v, label] of [
-      ['debug', '调试'],
-      ['info', '信息'],
-      ['warn', '警告'],
-      ['error', '错误'],
+      ['debug', '全部'],
+      ['info', '信息+'],
+      ['warn', '警告+'],
+      ['error', '仅错误'],
     ] as const) {
       const opt = lvlSelect.createEl('option', { text: label, value: v });
       if (v === this.minLevel) opt.selected = true;
@@ -154,8 +178,11 @@ export class SyncLogView extends ItemView {
       this.scheduleRender();
     });
 
-    // 精确级别 chips（彩色）
-    const levelChips = body.createDiv({ cls: 'bdnsync-log-filters bdnsync-log-chips-levels' });
+    // 统计摘要占位
+    this.statBar = filterRight.createDiv({ cls: 'bdnsync-log-statbar' });
+
+    // ── 级别 chips ──
+    const levelChips = body.createDiv({ cls: 'bdnsync-log-filters bdnsync-log-chips' });
     levelChips.createSpan({ text: '级别', cls: 'bdnsync-log-chips-label' });
     for (const l of LEVELS) {
       const chip = levelChips.createSpan({
@@ -170,12 +197,12 @@ export class SyncLogView extends ItemView {
       });
     }
 
-    // 模块 chips
-    const modChips = body.createDiv({ cls: 'bdnsync-log-filters bdnsync-log-chips-modules' });
+    // ── 模块 chips ──
+    const modChips = body.createDiv({ cls: 'bdnsync-log-filters bdnsync-log-chips' });
     modChips.createSpan({ text: '模块', cls: 'bdnsync-log-chips-label' });
     for (const m of MODULES) {
       const chip = modChips.createSpan({
-        cls: `bdnsync-log-chip bdnsync-log-chip-module-${m}`,
+        cls: `bdnsync-log-chip bdnsync-log-chip-module`,
       });
       chip.setText(MODULE_LABEL[m]);
       chip.addEventListener('click', () => {
@@ -186,16 +213,18 @@ export class SyncLogView extends ItemView {
       });
     }
 
-    // ── 列表容器 + 统计条 ──
-    this.statBar = body.createDiv({ cls: 'bdnsync-log-statbar' });
+    // ── 列表容器 ──
     const listContainer = body.createDiv({ cls: 'bdnsync-log-list-container' });
     this.listContainer = listContainer;
 
-    // ── 底部操作：清空 / 复制 / 导出 ──
-    const footer = shell.createDiv({ cls: 'bdnsync-modal-foot' });
-    createIconButton(footer, {
+    // ── 底部操作 ──
+    const footer = shell.createDiv({ cls: 'bdnsync-modal-foot bdnsync-log-footer' });
+    const footerLeft = footer.createDiv({ cls: 'bdnsync-log-footer-left' });
+    const footerRight = footer.createDiv({ cls: 'bdnsync-log-footer-right' });
+
+    createIconButton(footerLeft, {
       icon: 'trash-2',
-      label: '清空全部',
+      label: '清空',
       danger: true,
       onClick: async () => {
         const ok = await showConfirmModal(this.app, {
@@ -211,60 +240,63 @@ export class SyncLogView extends ItemView {
         new Notice('BDNSync：日志已清空');
       },
     });
-    createIconButton(footer, {
+    createIconButton(footerLeft, {
       icon: 'copy',
-      label: '复制结果',
+      label: '复制全部日志',
+      title: '将当前筛选条件下的全部日志以文本格式复制到剪贴板',
       onClick: async () => {
-        await navigator.clipboard.writeText(this.logger.exportText(this.buildFilter()));
-        new Notice('BDNSync：已复制筛选结果到剪贴板');
+        const text = this.logger.exportText(this.buildFilter());
+        await navigator.clipboard.writeText(text);
+        new Notice('BDNSync：已复制筛选日志到剪贴板');
       },
     });
-    createIconButton(footer, {
+    createIconButton(footerLeft, {
       icon: 'info',
-      label: '复制诊断',
-      title: '一键复制脱敏诊断信息（版本/平台/设置摘要/最近错误），便于反馈问题',
+      label: '复制诊断信息',
+      title: '一键复制脱敏诊断快照（插件版本 / 平台 / 设置摘要 / 最近错误 / 日志样本），便于向开发者反馈问题',
       onClick: async () => {
         await navigator.clipboard.writeText(this.logger.exportDiagnostic(this.diagCtx()));
-        new Notice('BDNSync：诊断信息已复制到剪贴板');
+        new Notice('BDNSync：诊断信息已复制到剪贴板（可直接粘贴给开发者）');
       },
     });
-    createIconButton(footer, {
-      icon: 'file-json',
-      label: '导出 JSON',
-      onClick: async () => {
-        const json = this.logger.exportJSON(this.buildFilter());
-        await this.downloadFile('bdnsync-logs.json', json, 'application/json');
-        new Notice('BDNSync：已导出 JSON 日志');
-      },
+
+    // 导出按钮组
+    const exportBtn = footerRight.createDiv({ cls: 'bdnsync-log-export-group' });
+    const exportToggle = exportBtn.createEl('button', {
+      cls: 'bdnsync-btn bdnsync-log-export-toggle',
     });
-    createIconButton(footer, {
-      icon: 'file-text',
-      label: '导出文本',
-      onClick: async () => {
-        const txt = this.logger.exportText(this.buildFilter());
-        await this.downloadFile('bdnsync-logs.txt', txt, 'text/plain');
-        new Notice('BDNSync：已导出文本日志');
-      },
+    setIcon(exportToggle.createSpan(), 'download', 14);
+    exportToggle.createSpan({ text: '导出' });
+    const exportMenu = exportBtn.createDiv({ cls: 'bdnsync-log-export-menu' });
+    exportMenu.style.display = 'none';
+
+    const exportItems: { icon: IconName; label: string; format: () => string; name: string; mime: string }[] = [
+      { icon: 'file-json', label: 'JSON', format: () => this.logger.exportJSON(this.buildFilter()), name: 'bdnsync-logs.json', mime: 'application/json' },
+      { icon: 'file-text', label: '文本', format: () => this.logger.exportText(this.buildFilter()), name: 'bdnsync-logs.txt', mime: 'text/plain' },
+      { icon: 'file-spreadsheet', label: 'CSV', format: () => this.logger.exportCsv(this.buildFilter()), name: 'bdnsync-logs.csv', mime: 'text/csv;charset=utf-8' },
+      { icon: 'file-text', label: 'Markdown', format: () => this.logger.exportMarkdown(this.buildFilter()), name: 'bdnsync-logs.md', mime: 'text/markdown' },
+    ];
+    for (const item of exportItems) {
+      const row = exportMenu.createDiv({ cls: 'bdnsync-log-export-item' });
+      const iconEl = row.createSpan({ cls: 'bdnsync-log-export-icon' });
+      setIcon(iconEl, item.icon, 14);
+      row.createSpan({ text: item.label, cls: 'bdnsync-log-export-label' });
+      row.addEventListener('click', async () => {
+        await this.downloadFile(item.name, item.format(), item.mime);
+        exportMenu.style.display = 'none';
+      });
+    }
+
+    exportToggle.addEventListener('click', () => {
+      const visible = exportMenu.style.display !== 'none';
+      exportMenu.style.display = visible ? 'none' : 'block';
     });
-    // #4.3 审计日志导出：CSV（Excel 友好）与 Markdown（可读性）
-    createIconButton(footer, {
-      icon: 'file-spreadsheet',
-      label: '导出 CSV',
-      onClick: async () => {
-        const csv = this.logger.exportCsv(this.buildFilter());
-        await this.downloadFile('bdnsync-logs.csv', csv, 'text/csv;charset=utf-8');
-        new Notice('BDNSync：已导出 CSV 审计日志');
-      },
-    });
-    createIconButton(footer, {
-      icon: 'file-text',
-      label: '导出 MD',
-      onClick: async () => {
-        const md = this.logger.exportMarkdown(this.buildFilter());
-        await this.downloadFile('bdnsync-logs.md', md, 'text/markdown');
-        new Notice('BDNSync：已导出 Markdown 审计日志');
-      },
-    });
+    this.onDocClick = (e: MouseEvent) => {
+      if (!exportBtn.contains(e.target as Node)) {
+        exportMenu.style.display = 'none';
+      }
+    };
+    document.addEventListener('click', this.onDocClick);
 
     // 实时订阅：新日志到达时刷新（防抖，避免高频写入时 UI 抖动）
     this.unsub = this.logger.onEntry(() => this.scheduleRender());
@@ -272,11 +304,27 @@ export class SyncLogView extends ItemView {
     this.renderList();
   }
 
+  private updateSearchClear(): void {
+    const clearBtn = this.searchInput?.parentElement?.querySelector('.bdnsync-log-search-clear') as HTMLElement | null;
+    if (clearBtn) {
+      clearBtn.style.display = this.keyword ? 'flex' : 'none';
+    }
+  }
+
   async onClose(): Promise<void> {
+    if (this.onDocClick) {
+      document.removeEventListener('click', this.onDocClick);
+      this.onDocClick = null;
+    }
     if (this.unsub) {
       this.unsub();
       this.unsub = null;
     }
+    // 清理增量渲染状态
+    this.groupElements.clear();
+    this.renderedIds.clear();
+    this.renderedCount = 0;
+    this.lastFilterKey = '';
   }
 
   /** 防抖渲染 */
@@ -293,7 +341,6 @@ export class SyncLogView extends ItemView {
     const f: LogFilter = {
       minLevel: this.minLevel,
       sort: this.sort,
-      regex: this.useRegex,
       includeTombstoned: this.includeTomb,
     };
     if (this.moduleFilter.size) f.modules = [...this.moduleFilter];
@@ -311,17 +358,21 @@ export class SyncLogView extends ItemView {
 
   private renderList(): void {
     if (!this.listContainer) return;
-    this.listContainer.empty();
 
-    // 将精确级别多选并入 minLevel 语义：若选了精确级别，则「仅这些级别」（取最高权重作为最小 + 额外包含）
     const filter = this.buildFilter();
-    // 处理精确级别：Logger.query 用 minLevel 阈值；精确多选需在 query 后二次过滤
     const exactLevels = this.levelFilter.size ? this.levelFilter : null;
     const filtered = this.logger.query(filter).filter((e) => !exactLevels || exactLevels.has(e.level));
+    // 过滤被条目应用：后续分组 & 渲染只用 filtered
+    const filterKey = this.computeFilterKey(filter, exactLevels);
 
     this.renderStatBar(filtered);
 
     if (filtered.length === 0) {
+      this.listContainer.empty();
+      this.groupElements.clear();
+      this.renderedIds.clear();
+      this.renderedCount = 0;
+      this.lastFilterKey = '';
       const empty = this.listContainer.createDiv({ cls: 'bdnsync-empty-state' });
       const iconWrap = empty.createSpan({ cls: 'bdnsync-empty-state-icon' });
       setIcon(iconWrap, 'filter', 28);
@@ -329,11 +380,57 @@ export class SyncLogView extends ItemView {
       return;
     }
 
+    // ── 判断是否需要全量重建 ──
+    const needFullRebuild = filterKey !== this.lastFilterKey
+      || this.renderedCount > SyncLogView.MAX_DOM_ROWS
+      || !this.listContainer.isConnected;
+
+    if (needFullRebuild) {
+      this.fullRebuild(filtered, filterKey);
+      return;
+    }
+
+    // ── 增量模式：仅追加新增条目 ──
+    const newEntries = filtered.filter((e) => !this.renderedIds.has(e.id));
+    if (newEntries.length === 0) return;
+
+    // 🔴 排序方向修正：desc（最新优先）时新日志必须插入组内顶部、新日期组置于列表顶部，
+    // 此前统一 appendChild 会把新日志排到旧日志之下（新来的反而在底部），顺序错乱。
+    // 通过「逆序遍历 + prepend」保证：先放较旧的新条目、再放最新的，最终最新在最上。
+    const seq = this.sort === 'desc' ? [...newEntries].reverse() : newEntries;
+    for (const log of seq) {
+      const dayKey = this.dateKey(log.time);
+      let group = this.groupElements.get(dayKey);
+      if (!group) {
+        group = this.createDayGroup(dayKey, this.sort === 'desc');
+      }
+      const row = this.renderRow(log);
+      if (this.sort === 'desc') group.list.prepend(row);
+      else group.list.appendChild(row);
+      this.renderedIds.add(log.id);
+      this.renderedCount++;
+      // 超限 → 退化为全量重建（截断）
+      if (this.renderedCount > SyncLogView.MAX_DOM_ROWS) {
+        this.fullRebuild(filtered, filterKey);
+        return;
+      }
+    }
+    // 更新分组计数
+    this.updateGroupCounts();
+  }
+
+  /** 全量重建：清空容器 + 重建所有分组 & 行 */
+  private fullRebuild(filtered: SyncLogEntry[], filterKey: string): void {
+    this.listContainer.empty();
+    this.groupElements.clear();
+    this.renderedIds.clear();
+    this.renderedCount = 0;
+    this.lastFilterKey = filterKey;
+
     // 按日期分组
     const groups = new Map<string, SyncLogEntry[]>();
     for (const e of filtered) {
-      const d = new Date(e.time);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const key = this.dateKey(e.time);
       const bucket = groups.get(key) ?? [];
       bucket.push(e);
       groups.set(key, bucket);
@@ -345,18 +442,49 @@ export class SyncLogView extends ItemView {
 
     for (const dayKeyStr of groupKeys) {
       const entries = groups.get(dayKeyStr) ?? [];
-      const groupEl = this.listContainer.createDiv({ cls: 'bdnsync-log-group' });
-      const header = groupEl.createDiv({ cls: 'bdnsync-log-group-header' });
-      header.createSpan({ text: dayKeyStr, cls: 'bdnsync-log-group-date' });
-      header.createSpan({
-        text: `${entries.length} 条`,
-        cls: 'bdnsync-log-group-count',
-      });
-      const list = groupEl.createDiv({ cls: 'bdnsync-log-list' });
+      const group = this.createDayGroup(dayKeyStr);
       for (const log of entries) {
-        list.appendChild(this.renderRow(log));
+        group.list.appendChild(this.renderRow(log));
+        this.renderedIds.add(log.id);
+        this.renderedCount++;
       }
+      group.count.textContent = `${entries.length} 条`;
     }
+  }
+
+  /** 创建日期分组 DOM（header + list），并注册到 groupElements。
+   *  prepend=true（desc 增量模式）：新日期组应置于列表顶部，而非末尾。 */
+  private createDayGroup(
+    dayKey: string,
+    prepend = false,
+  ): { header: HTMLElement; list: HTMLElement; count: HTMLElement } {
+    const groupEl = this.listContainer.createDiv({ cls: 'bdnsync-log-group' });
+    if (prepend) this.listContainer.prepend(groupEl);
+    const header = groupEl.createDiv({ cls: 'bdnsync-log-group-header' });
+    header.createSpan({ text: dayKey, cls: 'bdnsync-log-group-date' });
+    const count = header.createSpan({ text: '0 条', cls: 'bdnsync-log-group-count' });
+    const list = groupEl.createDiv({ cls: 'bdnsync-log-list' });
+    const group = { header, list, count };
+    this.groupElements.set(dayKey, group);
+    return group;
+  }
+
+  /** 更新各分组计数标签（增量追加后调用） */
+  private updateGroupCounts(): void {
+    for (const group of this.groupElements.values()) {
+      group.count.textContent = `${group.list.childElementCount} 条`;
+    }
+  }
+
+  /** 生成日期分组 key（YYYY-MM-DD） */
+  private dateKey(ts: number): string {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /** 计算 filter 状态 hash，用于判断是否需要全量重建 */
+  private computeFilterKey(filter: LogFilter, exactLevels: Set<LogLevel> | null): string {
+    return JSON.stringify({ filter, exactLevels: exactLevels ? [...exactLevels].sort() : null });
   }
 
   private renderRow(log: SyncLogEntry): HTMLElement {
@@ -370,56 +498,61 @@ export class SyncLogView extends ItemView {
     if (isOpen) row.classList.add('is-expanded');
     row.setAttribute('aria-label', '展开日志详情');
 
-    // 左侧级别色条
-    row.createSpan({ cls: `bdnsync-log-levelbar bdnsync-log-levelbar-${log.level}` });
+    // 级别色条（grid 第一列 4px）
+    row.createDiv({ cls: `bdnsync-log-levelbar bdnsync-log-levelbar-${log.level}` });
 
     const content = row.createDiv({ cls: 'bdnsync-log-row-content' });
 
     const head = content.createDiv({ cls: 'bdnsync-log-row-head' });
-    // 展开/折叠指示器（点击整行切换）
+    // 展开/折叠指示器
     const caret = head.createSpan({ cls: 'bdnsync-log-row-caret' });
-    setIcon(caret, 'chevron-right', 13);
+    setIcon(caret, 'chevron-right', 12);
+    // 级别徽章（始终显示，与类型标签并用）
     head.createSpan({
       cls: `bdnsync-log-badge bdnsync-log-badge-${log.level}`,
       text: LEVEL_LABEL[log.level],
     });
+    // 类型标签（小色点 + 文案胶囊，按业务类型着色）
+    const typeTag = head.createSpan({
+      cls: `bdnsync-log-type-tag bdnsync-log-type-${log.type}`,
+    });
+    // 前置小色点（替代抽象的大图标，更精致不抢眼）
+    const _dot = typeTag.createSpan({ cls: 'bdnsync-log-type-dot' });
+    typeTag.createSpan({ text: this.typeLabel(log.type), cls: 'bdnsync-log-type-text' });
+    // 模块标签
     head.createSpan({
-      cls: 'bdnsync-log-module',
+      cls: `bdnsync-log-module bdnsync-log-module-${log.module}`,
       text: MODULE_LABEL[log.module],
     });
-    const typeIcon = head.createSpan({ cls: 'bdnsync-log-icon' });
-    // 类型图标
-    this.setRowIcon(typeIcon, log.type);
+    // 时间
     head.createSpan({
       cls: 'bdnsync-log-time',
-      text: new Date(log.time).toLocaleString(),
+      text: this.formatShortTime(log.time),
     });
 
-    // 折叠态：仅显示「一句话结论」（首行），避免整行堆砌冗长堆栈
+    // 消息内容
     const firstLine = log.message.split('\n')[0] ?? '';
     const msg = content.createDiv({ cls: 'bdnsync-log-msg' });
-    msg.innerHTML = this.highlight(firstLine);
+    this.highlightInto(msg, firstLine);
     if (log.message.includes('\n')) {
-      msg.createSpan({ cls: 'bdnsync-log-msg-more', text: ' …' });
+      msg.createSpan({ cls: 'bdnsync-log-msg-more', text: '…' });
     }
+    // 路径
     if (log.path) {
       const pathEl = content.createDiv({ cls: 'bdnsync-log-path' });
-      pathEl.innerHTML = this.highlight(log.path);
+      this.highlightInto(pathEl, log.path);
     }
 
     // 单条操作（hover 显示）
     const actions = content.createDiv({ cls: 'bdnsync-log-row-actions' });
-    this.addRowAction(actions, 'copy', '复制文本', () =>
+    this.addRowAction(actions, 'copy', '复制', () =>
       this.copy(this.logger.exportTextOne(log)),
     );
-    this.addRowAction(actions, 'download', '导出 JSON', () =>
+    this.addRowAction(actions, 'download', '导出', () =>
       this.downloadFile(`log-${log.id}.json`, this.logger.exportJSONOne(log), 'application/json'),
     );
-    this.addRowAction(actions, 'file-text', '导出文本', () =>
-      this.downloadFile(`log-${log.id}.txt`, this.logger.exportTextOne(log), 'text/plain'),
-    );
 
-    // 详情面板（默认折叠，点击整行展开；已展开的行按持久化状态恢复，🟡#16）
+    // 详情面板（默认折叠）
     const details = row.createDiv({ cls: 'bdnsync-log-details' });
     details.style.display = isOpen ? 'block' : 'none';
     this.renderDetails(details, log);
@@ -428,12 +561,10 @@ export class SyncLogView extends ItemView {
       const expanded = row.classList.toggle('is-expanded');
       row.setAttribute('aria-expanded', String(expanded));
       details.style.display = expanded ? 'block' : 'none';
-      // 🟡#16：更新持久化集合，使后续重渲染能恢复展开态
       if (expanded) this.expandedIds.add(log.id);
       else this.expandedIds.delete(log.id);
     };
     row.addEventListener('click', (e) => {
-      // 点击行内操作按钮时不触发折叠
       if ((e.target as HTMLElement).closest('.bdnsync-log-row-action')) return;
       toggle();
     });
@@ -447,16 +578,28 @@ export class SyncLogView extends ItemView {
     return row;
   }
 
+  /** 短时间格式：今天只显示时分，其他显示日期+时分 */
+  private formatShortTime(ts: number): string {
+    const d = new Date(ts);
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    if (isToday) return time;
+    return `${d.getMonth() + 1}/${d.getDate()} ${time}`;
+  }
+
   /** 展开态详情：结构化字段 + 内容提炼（结论 / 上下文 / 折叠技术堆栈 / 原始消息） */
   private renderDetails(container: HTMLElement, log: SyncLogEntry): void {
     const grid = container.createDiv({ cls: 'bdnsync-log-detail-grid' });
+    // ── 紧凑分组：短字段两两一行（2 列），长字段跨满整行 ──
     this.addDetailField(grid, '发生时间', this.formatFullTime(log.time));
     this.addDetailField(grid, '相对时间', this.formatRelative(log.time));
     this.addDetailField(grid, '严重程度', LEVEL_LABEL[log.level]);
-    this.addDetailField(grid, '来源模块', MODULE_LABEL[log.module]);
     this.addDetailField(grid, '业务类型', this.typeLabel(log.type));
+    this.addDetailField(grid, '来源模块', MODULE_LABEL[log.module]);
+    this.addDetailField(grid, '日志编号', log.id);
     if (log.path) {
-      const pathField = this.addDetailField(grid, '相关路径', log.path, true, true);
+      const pathField = this.addDetailField(grid, '相关路径', log.path, true, true, true);
       // 路径点击 → 在 Obsidian 主区域打开对应文件/笔记
       pathField.classList.add('bdnsync-log-path-clickable');
       pathField.addEventListener('click', () => {
@@ -470,15 +613,14 @@ export class SyncLogView extends ItemView {
     // errno 解析（如果 message 里出现 "errno=N" 形式，识别并显示人话说明）
     const errnoHit = this.extractErrno(log.message);
     if (errnoHit !== null) {
-      this.addDetailField(grid, '错误码', `errno=${errnoHit}（${this.errnoHint(errnoHit)}）`);
+      this.addDetailField(grid, '错误码', `errno=${errnoHit}（${this.errnoHint(errnoHit)}）`, false, false, true);
     }
     if (log.deleted) {
       const st = log.deletedAt
         ? `已标记删除（${this.formatRelative(log.deletedAt)}标记）`
         : '已标记删除';
-      this.addDetailField(grid, '处理状态', st);
+      this.addDetailField(grid, '处理状态', st, false, false, true);
     }
-    this.addDetailField(grid, '日志编号', log.id);
 
     const section = container.createDiv({ cls: 'bdnsync-log-detail-section' });
     section.createDiv({ cls: 'bdnsync-log-detail-h', text: '内容提炼' });
@@ -500,6 +642,8 @@ export class SyncLogView extends ItemView {
       d.createEl('summary', {
         text: `技术堆栈（开发者排查用，共 ${parsed.stack.length} 帧）`,
       });
+      // 🔴 阻止 details 点击冒泡到行 toggle，避免展开堆栈时整行被折叠
+      d.addEventListener('click', (e) => e.stopPropagation());
       const pre = d.createEl('pre', { cls: 'bdnsync-log-stack-pre' });
       pre.textContent = parsed.stack.join('\n');
     }
@@ -507,8 +651,47 @@ export class SyncLogView extends ItemView {
     // 原始消息全文：默认折叠，用户主动展开时查看（区别于"内容提炼"）
     const raw = section.createEl('details', { cls: 'bdnsync-log-raw' });
     raw.createEl('summary', { text: '原始消息（全文）' });
+    // 🔴 阻止 details 点击冒泡到行 toggle，避免展开原始消息时整行被折叠
+    raw.addEventListener('click', (e) => e.stopPropagation());
     const pre = raw.createEl('pre', { cls: 'bdnsync-log-raw-pre' });
-    pre.textContent = log.message;
+
+    // ── 丰富原始消息内容：结构化展示所有可用字段 ──
+    const richLines: string[] = [];
+    richLines.push(`【消息正文】`);
+    richLines.push(log.message);
+    richLines.push('');
+    // 操作元数据
+    const metaParts: string[] = [];
+    if (log.durationMs != null) metaParts.push(`耗时 ${log.durationMs}ms`);
+    if (log.bytesUp != null) metaParts.push(`上传 ${(log.bytesUp / 1024).toFixed(1)} KB`);
+    if (log.bytesDown != null) metaParts.push(`下载 ${(log.bytesDown / 1024).toFixed(1)} KB`);
+    if (metaParts.length) {
+      richLines.push(`【操作统计】${metaParts.join(' · ')}`);
+      richLines.push('');
+    }
+    // 变更前后对比（审计）
+    if (log.beforeHash || log.beforeSize != null || log.beforeMtime != null) {
+      const beforeParts: string[] = [];
+      if (log.beforeSize != null) beforeParts.push(`大小 ${log.beforeSize} B`);
+      if (log.beforeMtime != null) beforeParts.push(`mtime ${new Date(log.beforeMtime).toISOString()}`);
+      if (log.beforeHash) beforeParts.push(`hash ${log.beforeHash.slice(0, 12)}…`);
+      richLines.push(`【变更前】${beforeParts.join(' | ')}`);
+      richLines.push('');
+    }
+    // 触发方式（从 message 中提取）
+    const triggerMatch = log.message.match(/\((manual|auto|realtime|startup|online)\)/);
+    if (triggerMatch) {
+      const triggerMap: Record<string, string> = { manual: '手动触发', auto: '定时自动', realtime: '实时监听', startup: '启动同步', online: '上线恢复' };
+      richLines.push(`【触发方式】${triggerMatch[1] ?? triggerMatch[1]}（${triggerMap[triggerMatch[1]] ?? '未知'}）`);
+      richLines.push('');
+    }
+    // 结构化解析结果
+    if (parsed.summary) richLines.push(`【提炼结论】${parsed.summary}`);
+    if (parsed.context.length) {
+      richLines.push(`【上下文（${parsed.context.length} 行）】`);
+      for (const line of parsed.context) richLines.push(`  ${line}`);
+    }
+    pre.textContent = richLines.join('\n');
   }
 
   /** 从日志文本中提取 errno=N（百度/Node 错误常见形式） */
@@ -542,8 +725,9 @@ export class SyncLogView extends ItemView {
     value: string,
     mono = false,
     clickable = false,
+    full = false,
   ): HTMLElement {
-    const item = grid.createDiv({ cls: 'bdnsync-log-detail-field' });
+    const item = grid.createDiv({ cls: `bdnsync-log-detail-field${full ? ' bdnsync-log-detail-field--full' : ''}` });
     item.createSpan({ cls: 'bdnsync-log-detail-label', text: label });
     const v = item.createSpan({
       cls: `bdnsync-log-detail-value${mono ? ' is-mono' : ''}${clickable ? ' is-clickable' : ''}`,
@@ -625,18 +809,27 @@ export class SyncLogView extends ItemView {
     setIcon(el, map[type] ?? 'info', 13);
   }
 
-  private highlight(text: string): string {
-    // 转义 HTML，避免 XSS / 破坏结构
-    const esc = text.replace(/[&<>"]/g, (c) => {
-      return c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&quot;';
-    });
-    if (!this.keyword.trim()) return esc;
+  private highlightInto(el: HTMLElement, text: string): void {
+    el.textContent = '';
+    if (!this.keyword.trim()) {
+      el.textContent = text;
+      return;
+    }
     try {
-      const kw = this.useRegex ? this.keyword.trim() : this.escapeRegex(this.keyword.trim());
+      const kw = this.escapeRegex(this.keyword.trim());
       const re = new RegExp(`(${kw})`, 'gi');
-      return esc.replace(re, '<mark class="bdnsync-log-hl">$1</mark>');
+      const parts = text.split(re);
+      const lcKw = this.keyword.trim().toLowerCase();
+      for (const part of parts) {
+        if (part.toLowerCase() === lcKw) {
+          const mark = el.createEl('mark', { cls: 'bdnsync-log-hl', text: part });
+          mark.textContent = part;
+        } else {
+          el.appendChild(document.createTextNode(part));
+        }
+      }
     } catch {
-      return esc;
+      el.textContent = text;
     }
   }
 
@@ -646,17 +839,22 @@ export class SyncLogView extends ItemView {
 
   private renderStatBar(filtered: SyncLogEntry[]): void {
     this.statBar.empty();
-    const stats = this.logger.tombstoneStats();
-    const counts = this.logger.levelCounts(this.buildFilter());
-    const summary = this.statBar.createSpan({ cls: 'bdnsync-log-stat-summary' });
-    summary.setText(`匹配 ${filtered.length} 条 · 总计 ${stats.total} 条（墓碑 ${stats.tombstoned}）`);
+    // 🔴 用「已过滤后的列表」直接统计，而非再查一次 levelCounts(buildFilter())——
+    // 后者不含级别 chip 过滤，级别 chip 激活时统计数字与列表内容不一致。
+    const counts: Record<LogLevel, number> = { debug: 0, info: 0, warn: 0, error: 0 };
+    for (const e of filtered) counts[e.level]++;
 
-    const chips = this.statBar.createSpan({ cls: 'bdnsync-log-stat-levels' });
+    const summary = this.statBar.createDiv({ cls: 'bdnsync-log-stat-summary' });
+    summary.createSpan({ text: `${filtered.length}`, cls: 'bdnsync-log-stat-num' });
+    summary.createSpan({ text: ' 条匹配', cls: 'bdnsync-log-stat-text' });
+
+    const chips = this.statBar.createDiv({ cls: 'bdnsync-log-stat-levels' });
     for (const l of LEVELS) {
+      if (counts[l] === 0) continue;
       const c = chips.createSpan({
         cls: `bdnsync-log-stat-chip bdnsync-log-stat-chip-${l}`,
       });
-      c.setText(`${LEVEL_LABEL[l]} ${counts[l]}`);
+      c.setText(`${counts[l]}`);
     }
   }
 

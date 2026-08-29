@@ -42,8 +42,12 @@ export interface SyncBackend {
    */
   readRemoteIndex(): Promise<ResolvedRemoteIndex | null>;
 
-  /** 列出远端目录树：path → { size, mtime, fsId } */
-  listTree(onProgress?: (count: number) => void): Promise<Map<string, RemoteEntry>>;
+  /** 列出远端目录树：path → { size, mtime, fsId }。
+   *  可选 signal：用户取消预览时中止遍历（仅停止后续目录列举，已发出的网络请求不可撤销）。 */
+  listTree(
+    onProgress?: (count: number) => void,
+    signal?: AbortSignal,
+  ): Promise<Map<string, RemoteEntry>>;
 
   /** 按远程条目下载内容（可选校验 hash） */
   download(entry: RemoteEntry, expectHash?: string): Promise<Uint8Array>;

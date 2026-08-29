@@ -523,3 +523,38 @@ describe('引擎集成：空文件夹同步（放宽限制修复点）', () => {
     expect(dirPaths.some((k) => k === '/apps' || k === '/apps/bdnsync')).toBe(false);
   });
 });
+
+describe('预览计算复用缓存（性能回归）', () => {
+  it('手动同步预览→fullSync 复用缓存，不重复读取远端目录树', async () => {
+    const hh = harness({
+      vaultSeed: { 'a.md': '# A' },
+      remoteSeed: { '/apps/bdnsync/TestVault/a.md': enc('# A') },
+    });
+    const listTreeSpy = vi.spyOn(hh.adapter as any, 'listTree');
+    const readRemoteSpy = vi.spyOn(hh.adapter as any, 'readRemoteIndex');
+    // 模拟 syncNow 的预览路径：先 buildPreviewPlan（写缓存），再 fullSync(reusePreviewCache=true)
+    await hh.engine.buildPreviewPlan('bidirectional');
+    const callsAfterPreview = listTreeSpy.mock.calls.length + readRemoteSpy.mock.calls.length;
+    expect(callsAfterPreview).toBeGreaterThan(0); // 预览确实发起了 I/O
+    const listBefore = listTreeSpy.mock.calls.length;
+    const result = await hh.engine.fullSync('manual', 'bidirectional', false, true);
+    expect(result).toBeTruthy();
+    // 复用后，本次 fullSync 的「初始对比阶段」不应再发起 listTree（远端目录树已被复用）
+    expect(listTreeSpy.mock.calls.length).toBe(listBefore);
+  });
+
+  it('非预览路径 fullSync 仍独立拉取（不复用已丢弃的缓存）', async () => {
+    const hh = harness({
+      vaultSeed: { 'a.md': '# A' },
+      remoteSeed: { '/apps/bdnsync/TestVault/a.md': enc('# A') },
+    });
+    const listTreeSpy = vi.spyOn(hh.adapter as any, 'listTree');
+    await hh.engine.buildPreviewPlan('bidirectional'); // 写一份缓存
+    hh.engine.discardPreviewCache(); // 丢弃
+    const listBefore = listTreeSpy.mock.calls.length;
+    const result = await hh.engine.fullSync('manual', 'bidirectional', false, false);
+    expect(result).toBeTruthy();
+    // 缓存已失效，普通 fullSync 必须重新 listTree
+    expect(listTreeSpy.mock.calls.length).toBeGreaterThan(listBefore);
+  });
+});

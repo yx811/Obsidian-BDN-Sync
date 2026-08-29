@@ -24,6 +24,9 @@ export class StatusBar {
   private conflictBadge: HTMLElement | null = null;
   /** 重试队列独立徽章（之前与 conflict 共用一个 DOM 元素导致互相覆盖、显示错位） */
   private retryBadge: HTMLElement | null = null;
+  /** 配额微进度条 */
+  private quotaBar: HTMLElement | null = null;
+  private quotaFill: HTMLElement | null = null;
   private revertTimer: number | null = null;
   private conflictCount = 0;
   private retryCount = 0;
@@ -59,6 +62,9 @@ export class StatusBar {
     // 独立 retry 徽章：避免与 conflict 互相覆盖
     this.retryBadge = this.el.createSpan({ cls: 'bdnsync-status-retry-badge' });
     this.retryBadge.style.display = 'none';
+    // 配额微进度条
+    this.quotaBar = this.el.createSpan({ cls: 'bdnsync-status-quota-bar' });
+    this.quotaFill = this.quotaBar.createSpan({ cls: 'bdnsync-status-quota-fill' });
 
     this.el.addEventListener('click', (e) => {
       e.preventDefault();
@@ -70,6 +76,8 @@ export class StatusBar {
   }
 
   unmount(): void {
+    if (this.revertTimer) window.clearTimeout(this.revertTimer);
+    this.revertTimer = null;
     this.el?.remove();
     this.el = null;
   }
@@ -90,13 +98,46 @@ export class StatusBar {
     this.revertTimer = window.setTimeout(() => this.setIdle(), ms);
   }
 
-  setIdle(): void {
-    if (this.state === 'syncing' || this.state === 'uploading' || this.state === 'downloading')
-      return;
+  /** 强制复位到空闲状态（用于同步结束/取消/失败后的统一收口） */
+  forceIdle(): void {
+    if (this.revertTimer) window.clearTimeout(this.revertTimer);
+    this.revertTimer = null;
     this.setIconAndState('cloud-check', 'idle');
     if (this.textEl) this.textEl.setText('');
     if (this.dotEl) this.dotEl.className = 'bdnsync-status-dot';
     this.setAria('BDNSync：已同步，点击打开快速操作');
+    this.updateQuotaBar();
+  }
+
+  setIdle(): void {
+    // 仅在非活跃状态下才执行（避免覆盖正在进行的 syncing/uploading/downloading）
+    // 注意：syncing/uploading/downloading 结束后应调用 forceIdle() 而非本方法
+    if (this.state === 'syncing' || this.state === 'uploading' || this.state === 'downloading')
+      return;
+    this.forceIdle();
+  }
+
+  /** 更新配额微进度条 */
+  private updateQuotaBar(): void {
+    const summary = this.getStatusSummary();
+    const ratio = summary.quotaTotal > 0 ? summary.quotaUsed / summary.quotaTotal : 0;
+    if (this.quotaFill) {
+      this.quotaFill.style.width = `${Math.round(ratio * 100)}%`;
+      // 根据使用率设置颜色
+      if (ratio > 0.9) {
+        this.quotaFill.className = 'bdnsync-status-quota-fill bdnsync-status-quota-danger';
+      } else if (ratio > 0.7) {
+        this.quotaFill.className = 'bdnsync-status-quota-fill bdnsync-status-quota-warning';
+      } else {
+        this.quotaFill.className = 'bdnsync-status-quota-fill';
+      }
+    }
+    if (this.quotaBar) {
+      this.quotaBar.setAttribute(
+        'title',
+        `网盘容量 ${formatBytes(summary.quotaUsed)} / ${formatBytes(summary.quotaTotal)} (${Math.round(ratio * 100)}%)`,
+      );
+    }
   }
 
   setSyncing(msg = '同步中…'): void {

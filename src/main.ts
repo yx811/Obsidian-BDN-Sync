@@ -11,9 +11,12 @@ import {
 } from './baidu/api';
 import { BaiduAdapter } from './baidu/adapter';
 import { Encryptor } from './crypto/encryption';
-import { SyncEngine, type SyncResult } from './sync/engine';
+import { SyncEngine, SyncAbortedError, type SyncResult } from './sync/engine';
+import { resolveSyncTriggers, type SyncTriggerPolicy } from './sync/trigger-policy';
 import { LocalStore } from './storage/local-store';
 import { FileWatcher } from './watcher/file-watcher';
+import { runSelfCheck, type SelfCheckHost } from './lab/self-check';
+import { SelfCheckModal } from './ui/self-check-modal';
 import { StatusBar } from './ui/status-bar';
 import {
   ConflictModal,
@@ -113,6 +116,8 @@ export default class BDNSyncPlugin extends Plugin {
   lastVipInfoError: string | null = null;
   /** 上一次主动刷新 VIP 引起的设置页重绘 token，避免并发 refresh 重复 dispatch */
   private vipRerenderToken = 0;
+  /** 配额刷新 in-flight 去重：连点「刷新用量」时复用同一次请求，避免并发打网盘接口 */
+  private quotaInFlight: Promise<QuotaInfo | null> | null = null;
 
   private api!: BaiduApi;
   private cloudAdapter!: BaiduAdapter;
@@ -132,6 +137,8 @@ export default class BDNSyncPlugin extends Plugin {
   private lanDiscovery: LanDiscovery | null = null;
   /** 局域网 P2P：防止并发发起多次 LAN 同步（与云端同步互斥） */
   private lanSyncing = false;
+  /** 当前打开的同步预览面板（非模态，右下角）；用于防止重复打开 */
+  private previewPanel: boolean = false;
   /** 本地持久化存储（LocalStore）：实验功能读写索引/报告等使用 */
   store!: LocalStore;
   private nextAutoSyncAt = 0;
@@ -144,6 +151,9 @@ export default class BDNSyncPlugin extends Plugin {
   logStore!: LogStore;
   /** 增量同步因引擎忙被推迟时，置位后由当前同步结束兜底一次完整对账，避免并发编辑丢失上传 */
   private pendingQuickSync = false;
+  /** 🔴 用户手动触发同步时引擎正忙：置位后由当前同步结束自动补做一次完整同步，
+   *  确保「点击同步按钮」在任何情况下都不会只更新图标而不执行实际数据同步（用户反馈痛点 #1/#2）。 */
+  private pendingManualSync = false;
   /** 插件卸载标志：置位后不再发起新的同步（进行中的同步由 flush 等待完成后才 dispose） */
   private disposing = false;
   /** 反向引用索引 debounce 重建定时器（vault 变更后轻量触发） */
@@ -245,7 +255,7 @@ export default class BDNSyncPlugin extends Plugin {
     const sbEl = this.addStatusBarItem();
     this.statusBar = new StatusBar(
       this.app,
-      () => void this.syncNow('manual'),
+      () => this.triggerManualSync(),
       () => this.openConflictPanel(),
       () => void this.openStats(),
       () => this.openNetdiskBrowser(),
@@ -302,6 +312,12 @@ export default class BDNSyncPlugin extends Plugin {
         const f = this.app.vault.getAbstractFileByPath(path);
         return f instanceof TFile ? f.stat.size : 0;
       },
+      // 实时模式使用更跟手的防抖档位：普通文件 800ms、大文件 3s、批次窗口 1.5s，
+      // 让"保存即同步"真正接近实时（此前统一 3s/10s/5s，明显偏慢，用户反馈痛点 #2）。
+      // 非实时（auto/manual）保持原档位，避免过于频繁地打断完整同步节奏。
+      ...(this.settings.syncMode === 'realtime'
+        ? { debounceMs: 800, largeDebounceMs: 3000, batchWindowMs: 1500 }
+        : {}),
     });
     // 本地文件变更：统一路由到「保存同步」与「实验功能反向引用重建」两个关注点。
     // 合并到单一处理器，避免对同一事件重复注册（此前 create/modify/delete 各注册两次，
@@ -357,12 +373,12 @@ export default class BDNSyncPlugin extends Plugin {
     );
 
     // Ribbon + 命令
-    this.addRibbonIcon('cloud', 'BDNSync：立即同步', () => void this.syncNow('manual'));
+    this.addRibbonIcon('cloud', 'BDNSync：立即同步', () => this.triggerManualSync());
 
     this.addCommand({
       id: 'bdnsync-sync-now',
       name: '立即同步',
-      callback: () => void this.syncNow('manual'),
+      callback: () => this.triggerManualSync(),
     });
     this.addCommand({
       id: 'bdnsync-cancel-sync',
@@ -467,6 +483,14 @@ export default class BDNSyncPlugin extends Plugin {
         callback: () => void this.runLanSync(),
       });
     }
+    // 实验室 #5.11：功能自检（仅当开启对应开关）
+    if (this.settings.labEnabled && this.settings.labSelfCheckEnabled) {
+      this.addCommand({
+        id: 'bdnsync-self-check',
+        name: '运行自检（实验室）',
+        callback: () => void this.runSelfCheckCommand(),
+      });
+    }
 
     // 实验功能：插入 bdn:// 网盘媒体引用（相对 remoteRoot，需开启网盘媒体直嵌）
     if (this.settings.labEnabled && this.settings.cloudMediaEnabled) {
@@ -490,9 +514,10 @@ export default class BDNSyncPlugin extends Plugin {
 
     // 注：设置页已在 onload 最前面注册，此处不再重复注册（避免设置里出现两个 BDNSync 页签）
 
-    // 网络恢复自动同步
+    // 网络恢复自动同步：仅自动类模式（auto / realtime）补同步；manual 模式不自动触发。
+    // 边界由 syncPolicy().online 统一判定（单一事实来源）。
     const onlineHandler = () => {
-      if (this.settings.syncMode !== 'manual') {
+      if (this.syncPolicy().online) {
         this.log('info', '网络已恢复');
         // 方案1：网络恢复后先 flush 失败重试队列，再触发常规同步
         // catch：避免未处理的 rejection 污染 Obsidian 宿主（界面不稳定）
@@ -566,6 +591,40 @@ export default class BDNSyncPlugin extends Plugin {
     }
   }
 
+  /** 组装自检宿主（隐藏私有字段，避免 self-check 模块反向依赖本类） */
+  private getSelfCheckHost(): SelfCheckHost {
+    return {
+      settings: this.settings,
+      hasAuth: () => this.hasAuth(),
+      makeApi: () => this.makeApi(),
+      logger: this.logger,
+      isEngineBusy: () => this.engine?.isBusy() ?? false,
+      engine: this.engine ?? null,
+      watcher: this.watcher ?? null,
+      retryQueue: this.retryQueue ?? null,
+      store: this.store ?? null,
+      cloudAdapter: this.cloudAdapter ?? null,
+    };
+  }
+
+  /** 实验室 · 功能自检：运行体检、记录日志（借日志着色更醒目）、弹出结果面板 */
+  async runSelfCheckCommand(): Promise<void> {
+    const report = await runSelfCheck(this.getSelfCheckHost());
+    this.logM('lab', 'info', report.healthy ? 'info' : 'warn', `自检：${report.summary}`);
+    for (const it of report.items) {
+      const lvl: 'info' | 'warn' | 'error' = it.ok ? 'info' : it.level;
+      const type: 'info' | 'error' = !it.ok && it.level === 'error' ? 'error' : 'info';
+      this.logM(
+        'lab',
+        type,
+        lvl,
+        `[自检·${it.name}] ${it.ok ? '✓' : it.level === 'error' ? '✗' : '⚠'} ${it.detail}`,
+      );
+    }
+    new Notice(`BDNSync 自检：${report.summary}`, 6000);
+    this.openExclusive('self-check', () => new SelfCheckModal(this.app, report))?.open();
+  }
+
   onunload(): void {
     // 停止后台重试轮询定时器（schedulePoll 用的是裸 window.setInterval，不会随插件卸载自动清除，
     // 否则卸载后每 15s 仍会在已释放的插件实例上触发 flush → 泄漏），须在 onunload 显式停止。
@@ -612,6 +671,18 @@ export default class BDNSyncPlugin extends Plugin {
       window.clearTimeout(this.backlinkRebuildTimer);
       this.backlinkRebuildTimer = null;
     }
+    // 关闭所有已登记的单实例弹窗：否则插件卸载后 Modal 遮罩会残留在界面上无法关闭，
+    // 且弹窗内持有的回调仍引用已释放的插件实例。逐个 try 包裹，避免单个弹窗 close
+    // 抛错中断后续清理。
+    for (const modal of Array.from(this.openModals.values())) {
+      try {
+        modal.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.openModals.clear();
+    this.orphanModal = null;
     // 清理状态栏（含内部 revert 定时器）
     this.statusBar?.unmount();
     //  ㅤ卸载前把「今天」日志缓冲落盘，避免当天日志丢失
@@ -646,6 +717,8 @@ export default class BDNSyncPlugin extends Plugin {
       dirty = true;
     }
     if (dirty) await this.writeSettings();
+    // 初始化加密快照基准（后续 saveSettings 用此值比较判断是否需要 refreshEncryptionKey）
+    this.lastEncSnapshot = this.encryptionSnapshot();
     this.applyTheme();
     this.applyRuntimeConfig();
   }
@@ -661,15 +734,50 @@ export default class BDNSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    // 记录调度相关字段的旧值，用于判断本次保存是否改动了「触发时间 / 触发条件」
+    const prevMode = this.settings.syncMode;
+    const prevInterval = this.settings.autoSyncInterval;
+    // 快照加密相关字段：仅在它们变化时才走昂贵的 refreshEncryptionKey + refreshBackend，
+    // 避免每次文本输入（如改 excludePatterns）都异步读 vault 文件 + 重建后端。
+    // 注意：此快照在 writeSettings 之前捕获，因为 writeSettings 操作 deep clone 不修改 this.settings，
+    // 所以必须用「上次保存时的快照」vs「当前内存状态」做比较。
+    const encChanged = this.encryptionSnapshot() !== this.lastEncSnapshot;
     await this.writeSettings();
-    // 设置可能改动了加密开关 / 密码 / 密钥文件路径，需重新解析密钥再重建后端，
-    // 否则「改成密钥文件模式」不会生效（历史缺陷：解析链路根本没被接上）。
-    await this.refreshEncryptionKey();
-    this.refreshBackend();
+    // 更新快照为当前状态（下次比较基准）
+    this.lastEncSnapshot = this.encryptionSnapshot();
+    if (encChanged) {
+      // 设置可能改动了加密开关 / 密码 / 密钥文件路径，需重新解析密钥再重建后端，
+      // 否则「改成密钥文件模式」不会生效（历史缺陷：解析链路根本没被接上）。
+      await this.refreshEncryptionKey();
+      this.refreshBackend();
+    }
     // 「启用 API 健康探查 / 探查周期」改动即时生效（此前定时器只在 onload 注册，需重载插件）
     this.restartApiProbe();
+    // 同步触发调度热生效：syncMode / autoSyncInterval 改动后立即重算下次自动同步时间，
+    // 否则改动要等下次重启才生效（nextAutoSyncAt 一直沿用旧间隔，可能长时间不触发或触发过频）。
+    if (this.settings.syncMode !== prevMode || this.settings.autoSyncInterval !== prevInterval) {
+      this.restartScheduler();
+    }
+    // 实时模式切换时同步更新 watcher 防抖档位：realtime → 跟手档（800/3000/1500），
+    // 其它模式 → 原档位（3000/10000/5000），让用户即时感知"实时"与"自动"的手感差异（痛点 #2）。
+    if (this.settings.syncMode !== prevMode && this.watcher) {
+      if (this.settings.syncMode === 'realtime') {
+        this.watcher.setTiming(800, 3000, 1500);
+      } else {
+        this.watcher.setTiming(3000, 10000, 5000);
+      }
+    }
     this.applyTheme();
     this.applyRuntimeConfig();
+  }
+
+  /** 上次 saveSettings 时加密相关字段的快照，用于下次保存时判断是否有变化 */
+  private lastEncSnapshot = '';
+
+  /** 生成加密相关字段的快照字符串，用于判断是否需要重建后端 */
+  private encryptionSnapshot(): string {
+    const s = this.settings;
+    return [s.encryptionEnabled, s.encryptionPassword, s.keyFilePath, s.encryptionSalt, s.authMode, s.bduss, s.cookies, s.stoken, s.accessToken, s.refreshToken, s.appKey, s.secretKey].join('|');
   }
 
   /** 将运行时字段（风暴阈值、脏集合窗口、日志配置）与最新 settings 联动 */
@@ -939,6 +1047,20 @@ export default class BDNSyncPlugin extends Plugin {
 
   // ---------------- 同步触发 ----------------
 
+  /**
+   * 当前设置的同步触发边界条件（查表，非各入口自行判断）。
+   * 集中在此取数，避免 onLayoutReady / tickScheduler / onlineHandler / runQuickSync
+   * 各处重复表达 `syncMode === 'manual'` 而出现语义漂移。
+   */
+  private syncPolicy(): SyncTriggerPolicy {
+    return resolveSyncTriggers({
+      syncMode: this.settings.syncMode,
+      syncOnSave: this.settings.syncOnSave,
+      syncOnStartup: this.settings.syncOnStartup,
+      hasAuth: this.hasAuth(),
+    });
+  }
+
   private async withSuspendedWatcher<T>(fn: () => Promise<T>): Promise<T> {
     this.watcher?.suspend();
     try {
@@ -986,10 +1108,19 @@ export default class BDNSyncPlugin extends Plugin {
           };
         }
       } else {
-        this.statusBar.setSyncing('同步进行中…');
+        // 注意：此处不要覆写状态栏文案——已有同步正在进行，状态栏正在展示它的真实进度，
+        // 改成通用的「同步进行中…」会盖掉有效进度信息（且该调用无对应复位）。
         this.log('info', '同步被跳过：已有同步进行中');
         // 用户主动点击同步时给出明确反馈（限频：3 秒内同文案不重复弹，避免连点刷屏）
-        if (trigger === 'manual') this.notifyBusy('BDNSync：已有同步正在进行，请稍候。完成后再试即可。', 4000);
+        if (trigger === 'manual') {
+          // 🔴 修复（用户痛点 #1/#2）：手动触发不再「静默放弃」——置位排队，
+          // 当前同步结束后由 finally 自动补做一次完整同步，保证点击必执行。
+          this.pendingManualSync = true;
+          this.notifyBusy(
+            'BDNSync：已有同步正在进行，本次点击已排队，完成将自动再同步一次。',
+            4000,
+          );
+        }
         return {
           ok: false,
           cancelled: true,
@@ -1007,7 +1138,12 @@ export default class BDNSyncPlugin extends Plugin {
       }
     }
     if (!this.engine || !navigator.onLine) {
-      if (!navigator.onLine) this.statusBar.setOffline();
+      if (!navigator.onLine) {
+        this.statusBar.setOffline();
+        new Notice('BDNSync：当前离线，恢复网络后自动同步');
+      } else {
+        new Notice('BDNSync：同步引擎尚未初始化，请检查插件设置后重载');
+      }
       return {
         ok: false,
         uploaded: 0,
@@ -1058,46 +1194,61 @@ export default class BDNSyncPlugin extends Plugin {
         /* 配额查询失败不阻断同步 */
       }
     }
-    // 同步预览（dry-run）：手动双向同步且开启预览时，先展示计划让用户确认
+    // 同步预览（dry-run）：手动双向同步且开启预览时，先展示计划让用户确认。
+    // 计算过程由底部状态栏承担进度展示（不再弹独立 Toast/浮层），可继续编辑笔记；
+    // 计划算好后自动弹出居中模态框展示完整计划并等待确认，避免「点击后长时间无反馈」。
+    // reusePlan=true 表示本次同步已通过预览计划算好索引/目录树/扫描，fullSync 应直接复用（避免重复 I/O）
+    let reusePlan = false;
     if (trigger === 'manual' && this.settings.syncPreviewEnabled && direction === 'bidirectional') {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      const plan = await this.engine!.buildPreviewPlan(direction);
-      const modal = this.openExclusive('sync-preview', () => new SyncPreviewModal(this.app, plan));
-      if (!modal) {
-        // 预览弹窗已打开（连点）：不重复弹，本次按取消处理
-        return {
-          ok: false,
-          cancelled: true,
-          uploaded: 0,
-          downloaded: 0,
-          deletedLocal: 0,
-          deletedRemote: 0,
-          conflicts: 0,
-          skipped: 0,
-          errors: 0,
-          bytesUp: 0,
-          bytesDown: 0,
-          errorMessages: [],
-        };
+      // 防止重复触发预览计算（连点/并发）
+      if (this.previewPanel) {
+        return this.cancelledResult();
       }
-      const ok = await modal.open();
-      if (!ok) {
-        this.statusBar.setIdle();
-        this.log('info', '已取消同步（预览确认未通过）');
-        return {
-          ok: false,
-          cancelled: true,
-          uploaded: 0,
-          downloaded: 0,
-          deletedLocal: 0,
-          deletedRemote: 0,
-          conflicts: 0,
-          skipped: 0,
-          errors: 0,
-          bytesUp: 0,
-          bytesDown: 0,
-          errorMessages: [],
-        };
+      this.previewPanel = true;
+      // 用状态栏显示预览计算进度（不再使用独立 Toast）
+      this.statusBar.setSyncing('正在准备同步计划…');
+      let plan: SyncPlanPreview | null = null;
+      let planReady = false;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        plan = await this.engine!.buildPreviewPlan(
+          direction,
+          (msg) => this.statusBar.setSyncing(msg),
+          undefined, // 不再提供 AbortController（无取消 UI）
+        );
+        planReady = true;
+      } catch (e) {
+        if (e instanceof SyncAbortedError) {
+          this.log('info', '已取消同步预览（用户中止）');
+        } else {
+          const msg = e instanceof Error ? e.message : String(e);
+          this.statusBar.setError(msg);
+          this.logM('engine', 'error', 'error', `同步预览失败：${msg}`);
+          this.maybeSurfaceAuthFailure(msg);
+          new Notice(`BDNSync：同步预览失败 — ${msg}`, 8000);
+        }
+      }
+      try {
+        if (!planReady || !plan) {
+          this.statusBar.forceIdle();
+          if (planReady) this.log('info', '已取消同步（预览计算未完成）');
+          this.engine?.discardPreviewCache();
+          return this.cancelledResult();
+        }
+        // 计算成功 → 弹出居中模态框展示完整计划，等用户确认
+        const modal = new SyncPreviewModal(this.app);
+        // 登记进单实例表：插件卸载时统一收口关闭，避免遮罩残留与实例泄漏
+        this.openExclusive('sync-preview', () => modal);
+        const confirmed = await modal.show(plan);
+        if (!confirmed) {
+          this.statusBar.forceIdle();
+          this.log('info', '已取消同步（用户在预览弹窗中取消）');
+          this.engine?.discardPreviewCache();
+          return this.cancelledResult();
+        }
+        reusePlan = true;
+      } finally {
+        this.previewPanel = false;
       }
     }
     this.statusBar.setSyncing();
@@ -1110,9 +1261,9 @@ export default class BDNSyncPlugin extends Plugin {
     return await this.withSuspendedWatcher(async () => {
       try {
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        const result = await this.engine!.fullSync(trigger, direction);
+        const result = await this.engine!.fullSync(trigger, direction, false, reusePlan);
         if (!result || result.cancelled) {
-          this.statusBar.setIdle();
+          this.statusBar.forceIdle();
           if (!result) this.log('info', '同步被跳过：已有同步进行中');
           return (
             result ?? {
@@ -1174,14 +1325,20 @@ export default class BDNSyncPlugin extends Plugin {
           errorMessages: [msg],
         };
       } finally {
-        // 增量同步期间被占用而推迟的请求，在本次完整同步结束后补一次全量对账，
-        // 确保并发编辑不会因「静默丢弃」而漏传。
         // 注意：必须解耦到下一个宏任务执行，不能在 finally 中同步递归调用 syncNow，
         // 否则每次同步结束都可能再触发、再递归，导致调用栈持续加深（潜在栈溢出）。
-        if (this.pendingQuickSync) {
+        // 1) 用户手动触发被排队（引擎忙时点击按钮）→ 优先补做一次完整同步（用户痛点 #1/#2）。
+        // 2) 增量同步期间被占用而推迟的请求 → 补一次全量对账，确保并发编辑不丢。
+        if (this.pendingManualSync) {
+          this.pendingManualSync = false;
+          this.log('info', '执行被排队的手动同步');
+          window.setTimeout(() => void this.syncNow('manual'), 0);
+        } else if (this.pendingQuickSync) {
           this.pendingQuickSync = false;
           this.log('info', '执行被推迟的增量同步兜底对账');
-          window.setTimeout(() => void this.syncNow('manual'), 0);
+          // 🔴 用 'auto' 而非 'manual'：这是引擎自动兜底，不应触发「同步预览确认弹窗」
+          // （此前 syncPreviewEnabled 开启时，每次完整同步结束都会莫名再弹一次预览框）。
+          window.setTimeout(() => void this.syncNow('auto'), 0);
         }
       }
     });
@@ -1329,8 +1486,7 @@ export default class BDNSyncPlugin extends Plugin {
   private lanPeerDir(): string | null {
     const base = this.getVaultDiskPath();
     if (!base) return null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const path = (globalThis as any).require?.('path');
+    const path = window.require?.('path') as { join: (...args: string[]) => string } | undefined;
     if (!path) return null;
     return path.join(base, LAN_PEER_DIR);
   }
@@ -1460,7 +1616,9 @@ export default class BDNSyncPlugin extends Plugin {
 
   private async runQuickSync(paths: string[]): Promise<void> {
     if (this.disposing) return; // 卸载中：不发起新同步
-    if (!this.engine || !this.settings.syncOnSave || this.settings.syncMode === 'manual') return;
+    // 仅 realtime + syncOnSave 才「保存即同步」；auto 模式不立即同步，变更由下一个
+    // 周期全量扫描覆盖（避免每次保存都打一次网盘）。manual 模式由策略统一判否。
+    if (!this.engine || !this.syncPolicy().saveImmediate) return;
     if (!navigator.onLine) {
       this.statusBar.setOffline();
       // 离线：把路径计入脏集合，恢复后补齐
@@ -1580,6 +1738,9 @@ export default class BDNSyncPlugin extends Plugin {
   }
 
   private onLocalChange(path: string): void {
+    // 本方法只决定「是否把本地变更纳入跟踪」（供重命名配对 + 周期全量扫描对账），
+    // 不决定是否「立即同步」——后者由 runQuickSync 的 syncPolicy().saveImmediate 判定。
+    // 因此 auto 与 realtime 都会在此跟踪变更，仅 realtime 进一步立即触发增量同步。
     if (!this.settings.syncOnSave || this.settings.syncMode === 'manual') return;
     if (new PathFilter(this.settings).isExcluded(path)) return;
     this.watcher.onChange(path);
@@ -1629,13 +1790,36 @@ export default class BDNSyncPlugin extends Plugin {
       } catch {
         /* ignore */
       }
-      // skipStartupSync：用户在会话中手动启用插件时为 true，避免抢占其正在操作的设置页
-      if (this.settings.syncOnStartup && this.hasAuth() && !opts.skipStartupSync) {
-        // 启动同步失败不应影响后续配额 / 账号 / 流服务初始化
-        try {
-          await this.syncNow('startup');
-        } catch (e) {
-          console.error('[BDNSync] 启动同步失败：', e);
+      // 重开 / 启动触发策略（🔴 用户痛点 #5 的核心修复）：
+      // 目标：三种同步方式在「应用启动 / 插件重载 / Obsidian 关闭重开」下都要自动执行一次完整同步。
+      // - manual 模式 + syncOnStartup（默认开）：同样触发——用户选择了同步模式并保持默认的
+      //   "启动时同步"，就应遵守；只有显式关掉 syncOnStartup 才完全手动。
+      // - auto / realtime 模式：无论 syncOnStartup 开关都触发（选了自动类模式即期望"打开就同步"）。
+      // - skipStartupSync（插件在设置页内被手动启用 / 重载，布局已就绪）：**不跳过**，
+      //   改为延迟 ~12s 执行，既避免抢占设置页，又保证"插件重载后也会自动同步"。
+      //   此前直接跳过 → 重载后要干等一个完整 autoSyncInterval 才首轮自动，正是
+      //   "重载/重开不触发自动同步"的直接代码根因。
+      // 上述边界统一由 syncPolicy().startup 判定（单一事实来源）。
+      const wantReopenSync = this.syncPolicy().startup;
+      if (wantReopenSync) {
+        const runStartupSync = async (): Promise<void> => {
+          // 启动同步失败不应影响后续配额 / 账号 / 流服务初始化
+          try {
+            await this.syncNow('startup');
+          } catch (e) {
+            console.error('[BDNSync] 启动同步失败：', e);
+          }
+          // 对齐周期调度：让下一次自动同步发生在「本次启动同步之后 autoSyncInterval」，
+          // 而非「插件加载之后 autoSyncInterval」，避免重开后首轮自动与启动同步挤在一起或拖太久。
+          if (this.settings.syncMode !== 'manual') this.restartScheduler();
+        };
+        if (opts.skipStartupSync) {
+          const timer = window.setTimeout(() => {
+            if (!this.disposing) void runStartupSync();
+          }, 12_000);
+          this.register(() => window.clearTimeout(timer));
+        } else {
+          await runStartupSync();
         }
       }
       // 启动后静默拉取网盘配额（存储使用情况），避免连接卡片一直显示「尚未测试连接」/ 0B。
@@ -1689,22 +1873,32 @@ export default class BDNSyncPlugin extends Plugin {
     }
   }
 
-  /** 后台刷新网盘配额（存储使用情况），写回 lastQuota 与最近错误，通知设置页刷新 */
+  /**
+   * 后台刷新网盘配额（存储使用情况），写回 lastQuota 与最近错误，通知设置页刷新。
+   * 同一时刻只允许一个请求在飞（连点「刷新用量」复用同一 Promise），避免并发打网盘接口。
+   */
   async refreshQuota(): Promise<QuotaInfo | null> {
-    try {
-      const q = await this.makeApi().getQuota();
-      this.lastQuota = q;
-      this.lastQuotaError = null;
-      window.dispatchEvent(new CustomEvent('bdnsync:quota-updated'));
-      return q;
-    } catch (e) {
-      // 保存最近一次失败原因，让设置页连接卡片能告诉用户为什么没拿到容量。
-      // 失败原因可能包含敏感字段（access_token 等），先经 redactSecrets 脱敏再存储。
-      this.lastQuotaError =
-        e instanceof Error ? redactSecrets(e.message) : redactSecrets(String(e));
-      window.dispatchEvent(new CustomEvent('bdnsync:quota-updated'));
-      return null;
-    }
+    if (this.quotaInFlight) return this.quotaInFlight;
+    const task = (async (): Promise<QuotaInfo | null> => {
+      try {
+        const q = await this.makeApi().getQuota();
+        this.lastQuota = q;
+        this.lastQuotaError = null;
+        window.dispatchEvent(new CustomEvent('bdnsync:quota-updated'));
+        return q;
+      } catch (e) {
+        // 保存最近一次失败原因，让设置页连接卡片能告诉用户为什么没拿到容量。
+        // 失败原因可能包含敏感字段（access_token 等），先经 redactSecrets 脱敏再存储。
+        this.lastQuotaError =
+          e instanceof Error ? redactSecrets(e.message) : redactSecrets(String(e));
+        window.dispatchEvent(new CustomEvent('bdnsync:quota-updated'));
+        return null;
+      } finally {
+        this.quotaInFlight = null;
+      }
+    })();
+    this.quotaInFlight = task;
+    return task;
   }
 
   hasAuth(): boolean {
@@ -1765,6 +1959,24 @@ export default class BDNSyncPlugin extends Plugin {
     return parts.length ? parts.join('，') : '无变更';
   }
 
+  /** 构造一个"已取消"的空 SyncResult，消除 syncNow 中大量重复的字面量 */
+  private cancelledResult(): SyncResult {
+    return {
+      ok: false,
+      cancelled: true,
+      uploaded: 0,
+      downloaded: 0,
+      deletedLocal: 0,
+      deletedRemote: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 0,
+      bytesUp: 0,
+      bytesDown: 0,
+      errorMessages: [],
+    };
+  }
+
   // ---------------- 日志 ----------------
   // 业务类型 → 默认级别（与旧 logger 的 inferLevel 一致：error→error，conflict→warn，其余→info）
   private inferLevel(type: SyncLogEntry['type']): LogLevel {
@@ -1774,6 +1986,30 @@ export default class BDNSyncPlugin extends Plugin {
   /** 旧契约：this.log(type, message, path) —— 默认归到 general 模块 */
   log(type: SyncLogEntry['type'], message: string, path?: string): void {
     this.logger.log('general', type, this.inferLevel(type), message, path);
+  }
+
+  /**
+   * 左侧同步按钮 / 状态栏同步图标的统一入口：立即给出反馈并触发一次手动同步。
+   * 此前的痛点：点按钮后无即时反馈，若引擎正忙或本次无变更则"看似毫无反应"。
+   * 现改为：先立即把状态栏置为「同步中」，再触发完整同步；当本次确实无任何上传/下载/
+   * 删除时，明确提示「已是最新」，让用户确认点击已生效（用户反馈痛点 #1）。
+   */
+  triggerManualSync(): void {
+    this.statusBar.setSyncing('正在同步…');
+    void this
+      .syncNow('manual')
+      .then((r) => {
+        if (r && r.ok && !r.cancelled) {
+          const touched =
+            (r.uploaded ?? 0) + (r.downloaded ?? 0) + (r.deletedLocal ?? 0) + (r.deletedRemote ?? 0);
+          if (touched === 0) {
+            new Notice('BDNSync：已是最新，无需同步', 2500);
+          }
+        }
+      })
+      .catch(() => {
+        /* syncNow 内部已给出错误提示 */
+      });
   }
 
   /** 模块化日志：显式指定来源模块、业务类型、级别（核心子系统使用） */
@@ -1797,13 +2033,17 @@ export default class BDNSyncPlugin extends Plugin {
   /** 由 registerInterval 每 30 秒调用 */
   tickScheduler(): void {
     if (this.disposing) return; // 卸载中：不发起新同步
-    // 周期性后台同步只适用于 auto 模式。
-    // realtime 模式仅靠「保存文件 → 3 秒防抖 → quickSync」响应，不做定时轮询；
-    // manual 模式完全由用户手动触发。
-    if (this.settings.syncMode !== 'auto') return;
+    // 周期调度仅对自动类模式（auto / realtime）启用；manual 模式完全由用户手动触发。
+    // 边界由 syncPolicy().periodic 统一判定（单一事实来源）。
+    if (!this.syncPolicy().periodic) return;
     if (!this.hasAuth()) return;
-    if (Date.now() < this.nextAutoSyncAt) return;
+    // 🔴RC-A 修复：周期性后台同步适用于 auto 模式，也适用于 realtime 模式（开启保存同步时）。
+    // 此前 realtime 模式在 tickScheduler 里直接 return，完全依赖文件事件逐条送达；
+    // 一旦文件事件被漏掉（超大文件 / 同步窗口内变更 / 监听异常），改动会永久丢失，直到重启。
+    // 现增加「周期兜底对账」：即使实时链路漏触发，也能在下一个 autoSyncInterval 周期内补齐，
+    // 确保 100% 不丢。manual 模式仍完全由用户手动触发。
     if (this.engine?.isBusy()) return;
+    if (Date.now() < this.nextAutoSyncAt) return;
 
     const intervalMs = Math.max(1, this.settings.autoSyncInterval) * 60_000;
     const backoffMs =

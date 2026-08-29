@@ -158,40 +158,23 @@ export class BaiduAdapter implements SyncBackend {
    * 相对 root 的前缀，否则子目录里的文件会以 basename 作为键（丢掉父目录前缀），
    * 导致同步决策把本地 `Notes/sub/a.md` 误判为「云端不存在」而删除本地文件。
    */
-  async listTree(onProgress?: (count: number) => void): Promise<Map<string, RemoteEntry>> {
-    const result = new Map<string, RemoteEntry>();
-    // 队列元素：dir = 绝对网盘路径；rel = 相对 root 的路径（'' 表示 root 自身）
-    const queue: { dir: string; rel: string }[] = [{ dir: this.root, rel: '' }];
-    const visited = new Set<string>([this.root]);
-    let count = 0;
-    while (queue.length > 0) {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      const cur = queue.shift()!;
-      let entries: RemoteEntry[] = [];
-      try {
-        entries = await this.listRemoteDir(cur.dir);
-      } catch (e) {
-        if (e instanceof BaiduApiError && (e.errno === -9 || e.errno === -7)) continue; // 目录不存在
-        throw e;
-      }
-      for (const e of entries) {
-        const name = e.path || e.name;
-        if (!name) continue;
-        const rel = cur.rel ? `${cur.rel}/${name}` : name;
-        if (e.isDir) {
-          if (rel === INDEX_DIR) continue; // 索引目录单独处理
-          const abs = remoteJoin(cur.dir, name);
-          if (visited.has(abs)) continue;
-          visited.add(abs);
-          queue.push({ dir: abs, rel });
-        } else {
-          result.set(rel, { ...e, path: rel });
-          count++;
-          if (onProgress && count % 100 === 0) onProgress(count);
-        }
-      }
-    }
-    return result;
+  async listTree(
+    onProgress?: (count: number) => void,
+    signal?: AbortSignal,
+  ): Promise<Map<string, RemoteEntry>> {
+    // 有界并发遍历远端目录树：复用「扫描并发数（listDir 并发上限）」设置（默认 3）。
+    // 旧实现逐目录串行 listRemoteDir，每个目录一次网络往返；大库下目录多即成为
+    // 「对比阶段」主要耗时。并发列举目录可显著缩短墙钟时间（默认 3 路，已兼顾百度 QPS 限频）。
+    return traverseRemoteTree(
+      this.root,
+      (dir) => this.listRemoteDir(dir),
+      {
+        concurrency: this.settings().orphanScanConcurrency,
+        indexDir: INDEX_DIR,
+        onProgress,
+        abortSignal: signal,
+      },
+    );
   }
 
   /** 列出远程目录（单层），返回相对 root 的路径条目 */
@@ -653,4 +636,92 @@ export class BaiduAdapter implements SyncBackend {
   static chunksMd5(chunks: Uint8Array[]): string[] {
     return chunks.map((c) => md5HexOf([c]));
   }
+}
+
+/**
+ * 并发遍历远端目录树（BFS，有界并发 worker 池）。
+ * 旧实现逐目录串行 listRemoteDir，每个目录一次网络往返；大库下目录多即成为同步「对比阶段」主要耗时。
+ * 这里用有界并发 worker 池（concurrency 限制，默认 3）并发列举目录，显著缩短墙钟时间。
+ * 结果语义与串行完全一致（按 rel 去重入 Map），不依赖遍历顺序。
+ */
+export async function traverseRemoteTree(
+  root: string,
+  listDir: (dir: string) => Promise<RemoteEntry[]>,
+  opts: {
+    concurrency: number;
+    indexDir: string;
+    onProgress?: (count: number) => void;
+    /** 取消信号：用户取消同步预览时中止遍历（已发出的网络请求不可撤销，但不再入队新目录） */
+    abortSignal?: AbortSignal;
+  },
+): Promise<Map<string, RemoteEntry>> {
+  const result = new Map<string, RemoteEntry>();
+  // 队列元素：dir = 绝对网盘路径；rel = 相对 root 的路径（'' 表示 root 自身）
+  const queue: { dir: string; rel: string }[] = [{ dir: root, rel: '' }];
+  const visited = new Set<string>([root]);
+  let count = 0;
+  const limit = Math.max(1, Math.min(8, Math.floor(opts.concurrency) || 3));
+
+  // 动态队列信号：目录入队时唤醒等待中的 worker（广播式，避免多等待者死锁）
+  let waiters: Array<() => void> = [];
+  let notify = new Promise<void>((r) => waiters.push(r));
+  const signal = () => {
+    const ws = waiters;
+    waiters = [];
+    notify = new Promise<void>((r) => waiters.push(r));
+    ws.forEach((w) => w());
+  };
+
+  let cursor = 0; // 已取出分配的目录数
+  let active = 0; // 正在 listDir 的 worker 数
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      // 取消优先：一旦信号置位立即收尾，避免继续列举远端目录
+      if (opts.abortSignal?.aborted) break;
+      if (cursor < queue.length) {
+        const cur = queue[cursor++];
+        active++;
+        try {
+          const entries = await listDir(cur.dir).catch((e: unknown) => {
+            if (e instanceof BaiduApiError && (e.errno === -9 || e.errno === -7))
+              return [] as RemoteEntry[];
+            throw e;
+          });
+          // 本轮列举结果若已取消则丢弃，直接结束（已发出的请求不可撤销，但不继续累积）
+          if (opts.abortSignal?.aborted) break;
+          for (const entry of entries) {
+            const name = entry.path || entry.name;
+            if (!name) continue;
+            const rel = cur.rel ? `${cur.rel}/${name}` : name;
+            if (entry.isDir) {
+              if (rel === opts.indexDir) continue; // 索引目录单独处理
+              const abs = remoteJoin(cur.dir, name);
+              if (visited.has(abs)) continue;
+              visited.add(abs);
+              queue.push({ dir: abs, rel });
+              signal(); // 唤醒等待中的 worker，均衡负载
+            } else {
+              result.set(rel, { ...entry, path: rel });
+              count++;
+              if (opts.onProgress && count % 100 === 0) opts.onProgress(count);
+            }
+          }
+        } finally {
+          active--;
+          // 队列已空且无人飞行 → 唤醒所有等待者，使其走入 else 分支 break，避免死锁
+          if (cursor >= queue.length && active === 0) signal();
+        }
+      } else if (active > 0) {
+        // 当前无可分配目录，但其它 worker 仍在飞行（可能继续入队），等待信号
+        await notify;
+      } else {
+        break; // 无新目录且无人飞行 → 结束
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  if (opts.onProgress) opts.onProgress(count);
+  return result;
 }

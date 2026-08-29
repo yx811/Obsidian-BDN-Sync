@@ -161,7 +161,8 @@ export class Logger {
   onEntry(fn: (e: SyncLogEntry) => void): () => void {
     this.listeners.push(fn);
     return () => {
-      this.listeners = this.listeners.filter((f) => f !== fn);
+      const idx = this.listeners.indexOf(fn);
+      if (idx >= 0) this.listeners.splice(idx, 1);
     };
   }
 
