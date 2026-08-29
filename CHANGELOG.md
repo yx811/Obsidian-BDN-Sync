@@ -217,11 +217,7 @@
   - 命令面板：`BDNSync：Git 增量同步`；每次成功同步后基线 ref 自动推进为最新 HEAD，逐步收敛到「上次同步后」区间。
   - 设置 → 实验室新增「⑤ Git 差异增量同步」子区（开关 / 回退开关 / 基线 ref 状态展示）。
 
-### 验证
-- 类型检查 `tsc -noEmit`、ESLint、生产构建 `esbuild production` 全绿。
-- 局域网 loopback 集成测试（双真实 `SyncEngine` 经 127.0.0.1 往返）：推送落盘、空库拉回逐字节一致、删除传播、双重加密非明文、信标编解码、路径穿越拒绝、口令不一致快速失败——共 7 项全过。
-
-### 加固（深度审查后修复）
+### 加固：深度审查后修复
 
 - **R1 请求超时**：`TcpLink.request()` 新增按请求整体超时（默认 30s，可配），对端无响应 / 口令不一致导致解密丢帧时不再无限挂起，而是抛出清晰错误。
 - **R2 持久连接**：`LanBackend` 由「每操作新建连接」改为复用单条持久 TCP 链路（抖动自动重连），全量同步的连接数从 ~2N 降到 1，消除握手开销与临时端口耗尽风险。
@@ -234,6 +230,14 @@
 > ⚠️ 已知限制（非缺陷，留待后续）：Git 同步用 `child_process.spawnSync` 在主线程同步执行，最坏阻塞 20s（手动命令可接受）；后续可改为异步 `spawn` 以消除 UI 冻结。
 - 单元测试：Git 变更采集 9 项、局域网 P2P loopback 集成（推送 / 拉回 / 删除 / 加密落盘 / 信标编解码）全绿；全量 `vitest` 263 项通过。
 - 局域网联调验证口径：本机内启动 `LanPeer` 服务 + 两个真实 `SyncEngine`（各自独立 `LocalStore`）经 127.0.0.1 TCP 来回同步，覆盖推送落盘、空库拉回、删除传播、加密信道落盘非明文。
+- 类型检查 `tsc -noEmit`、ESLint、生产构建 `esbuild production` 全绿。
+- 局域网 loopback 集成测试（双真实 `SyncEngine` 经 127.0.0.1 往返）：推送落盘、空库拉回逐字节一致、删除传播、双重加密非明文、信标编解码、路径穿越拒绝、口令不一致快速失败——共 7 项全过。
+
+### 发布元数据
+
+- 版本号：**1.0.5**（自 1.0.4 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` / `package.json` 同步更新为 1.0.5。
+- 构建产物 `main.js` / `styles.css` 由 CI 自动生成，不在版本控制中。
+- 质量门禁：`tsc -noEmit` 0 错误 / `eslint` 0 问题 / `vitest` 263 项全过 / 生产构建通过。
 
 ## [1.0.4] - 2026-08-26
 
@@ -255,20 +259,22 @@
 - **响应式适配**：桌面端自动多列网格，移动端 ≤720px 单列，≤420px 隐藏标题文字并纵向堆叠指标。
 - **无障碍**：保留文本状态标签（不依赖颜色）、支持 `prefers-reduced-motion` 关闭脉冲与过渡动画。
 
-### 安全与健壮性加固
+### 加固：安全与健壮性
+
 - **S1 安全**：`SyncEngine.writeLocalFile` 新增路径穿越守卫——拒绝任何含 `..` 段（父目录）的 `relPath` 并以抛错阻断（而非静默跳过），防止伪造/被篡改的远端索引越界写出 vault。
 - **S2 安全**：`redactSecrets` 词表增补 `encryptionPassword`，与 `secrets.ts` 的 `SECRET_KEYS` 保持一致，日志脱敏覆盖更完整。
 - **Q1 代码质量**：收紧 `main.ts` / `sync/engine.ts` / `ui/modals.ts` / `util/md5.ts` 中的 `as any` 类型逃逸——改为精确接口与 `unknown` 中转，移除冗余 eslint-disable。
 - **R1 健壮性**：启动后一次性 `setTimeout(runApiProbe, 15s)` 改用 `registerInterval` 托管，确保 `onunload` 时自动清理。
 
-### 生命周期清理修复（发布前审查）
+### 修复：生命周期清理（发布前审查）
+
 - `main.ts`：移除 `onload` 中重复的 `StreamServer` 启动块，避免布局就绪时创建两个流式代理实例、卸载时只关停一个导致端口泄漏。
 - `main.ts`：`onunload` 增加 `detachLeavesOfType(VIEW_TYPE_BDNSYNC_DASHBOARD)`，确保跨设备看板标签页在插件卸载时一并关闭。
 - `main.ts`：`onunload` 清理 `backlinkRebuildTimer` 防抖定时器，避免在已卸载实例上执行反向引用重建。
 - `main.ts`：`onunload` 调用 `statusBar.unmount()`，移除状态栏 DOM 与内部超时。
 - `main.ts`：调整 `disposing` 置位时机，先发起 `watcher.flush()` 再标记卸载，使卸载前尽力同步真正有机会执行（仍受 startup 全量兜底保护）。
 
-### 代码审查与视觉打磨
+### 优化：代码审查与视觉打磨
 
 交付前对全模块（51 个源文件）做系统性审查，识别并修复缺陷、冗余与性能问题，并对新增前端界面做视觉统一：
 
@@ -288,13 +294,19 @@
   - 统计/预览卡片增加 `hover` 过渡；新增 `@media (max-width:640px)` 窄屏适配（栅格降列、表格横向滚动、分栏堆叠）
 - **验证**：`tsc -noEmit` 0 错误 · `esbuild production` 通过 · `vitest` 全绿（249/249）
 
+### 发布元数据
+
+- 版本号：**1.0.4**（自 1.0.3 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` / `package.json` 同步更新为 1.0.4。
+- 构建产物 `main.js` / `styles.css` 由 CI 自动生成，不在版本控制中。
+- 质量门禁：`tsc -noEmit` 0 错误 / `esbuild production` 通过 / `vitest` 全绿（249/249）。
+
 ## [1.0.3] - 2026-08-26
 
-### 新增
+### 新增：空文件夹同步支持
 
 - **空文件夹同步支持**：本地空目录（自身及子孙均无文件，含多层嵌套）现在同步到云端——全量同步显式 `ensureDir` 补建、实时模式监听 `TFolder` 创建/移动即时增量补建，均受沙箱根护栏保护（`/apps/<appName>` 之内、绝不越过，修复历史 `errno=102`）；新建的空目录数计入同步摘要「建目录 N」
 
-### 稳健性 & 技术债闭环（交付前代码审查）
+### 稳健性：技术债闭环（交付前代码审查）
 
 交付前以「功能 / UI / 代码质量 / UX」四维做最后一轮全面审查，并将此前遗留的 17 项 🟡 稳健性项与 🟢 技术债一次性闭环（详见各模块注释与单元测试；验证：`tsc -noEmit` 0 错误、`eslint` 0 问题、`vitest` 全绿、`esbuild` 生产构建通过）。主要主题：
 
@@ -332,19 +344,16 @@
 - **根因**：v1.0.3 引入 v2 路径时，把 `OrphanCleanupModal.phase` 默认值设为 `'scanning'`。后续链路：Obsidian 框架调 `modal.onOpen()` 的 `legacyScanOnOpen=false` 分支直接 `return`（只跑 `renderShell()`，body 节点为空）→ main.ts 紧接调 `modal.startDeepScan(...)` → 其首行守卫 `if (this.phase === 'scanning') return;` 因 phase 在构造时就是 `'scanning'` 而**首次调用被早 return**，跳过 `renderBody` + `renderFooter` + `startScanTimer` → 弹窗终态 = 标题 + 扫描范围一行 + 空 body。这意味着 **v1.0.3 起所有 v2 入口打开的弹窗都坏**（1.0.2 还能扫出来，正是因为 1.0.2 还没引入 v2 路径）。
 - **修复**：`phase` 默认从 `'scanning'` 改为 `'idle'`（中性占位）；`startDeepScan` 守卫从 `phase==='scanning'` 改为基于 `scanStartAt` 标志（真在跑才拦截，不再误伤首次进入）。
 
-### 验证
-
-- `tsc -noEmit` 0 错误；`eslint` 0 error（1 处预存 `any` warning）；`vitest` 全绿（含搜索兜底 / 进度回调 / 真实路径优先等回归测试）；`esbuild` 生产构建通过
-
 ### 发布元数据
 
 - 版本号：**1.0.3**（自 1.0.2 升）；最低 Obsidian 版本维持 `1.13.7`；`manifest.json` / `versions.json` 同步更新
+- 质量门禁：`tsc -noEmit` 0 错误 / `eslint` 0 error（1 处预存 `any` warning）/ `vitest` 全绿（含搜索兜底 / 进度回调 / 真实路径优先等回归测试）/ `esbuild` 生产构建通过。
 
 ---
 
 ## [1.0.2] - 2026-08-25
 
-### 新增
+### 新增：网盘孤儿备份清理与深度扫描 v2
 
 - **网盘孤儿备份清理**：命令「扫描并清理网盘备份」识别父目录下 `vault名_YYYYMMDD_HHMMSS[_...]` 型疑似孤儿备份目录（非当前插件写入）
 - 严格安全模型：仅扫描直接子项、严格规则匹配、零自动删除，所有删除需逐项勾选 + 二次确认
@@ -359,7 +368,7 @@
 - 安全回收 / 永久删除双模式：默认送回收站（百度删除即进回收站可恢复）；百度无跳过回收站接口时永久删除自动降级为送回收站并显式告警
 - 资源占用控制：`maxNodes` / `maxBytes` 双预算 + `concurrency` 并发池，超出即截断（`truncated` 标记）
 
-### 修复
+### 修复：孤儿删除根因与 UI/UX 加固
 
 - 孤儿删除 `errno=-7` 根因：lister 未把 `adapter.listRemoteDir` 的相对 basename 拼回绝对路径，导致百度 API 在用户家目录查找失败；已在 lister 边界用 `remoteJoin` 修复（manual 与巡检两条路径）
 - 失败面板增强：完整绝对路径 + errno 诊断、失败项「重试」与「复制失败清单」、来源说明
@@ -384,7 +393,7 @@
 - **检测型巡检覆盖盲区（重要级，代码审查发现）**：`autoPrune=false` 的「仅检测」巡检与爆发检测此前走 `collectOrphanCandidates`（只扫父目录层），vault 自身层 `.obsidian_*`/`.bdnsync_*` 孤儿漏报；改为复用 `runOrphanScan` 统一引擎（两层全覆盖），日志按三类计数，爆发检测对比两层命中路径；删除不再使用的 `collectOrphanCandidates`
 - **v2 测量失败标注（轻微级）**：`measureDirFindings` 将 `measureError` 透传进 `OrphanFinding`，v2 分组视图显示「测量失败」徽标而非误导性的「空 / 仅目录」（与 legacy 行一致）
 
-### 安全
+### 安全加固：误删护栏与默认配置
 
 - 默认仅预勾选 `backup-dir`（风险 ≥1），`orphan-file` / `orphan-dir` 默认不勾选，最大限度降低误删
 
@@ -400,7 +409,7 @@
 
 > 注：初始发布版本即 **1.0.1**（不存在 1.0.0 发布），原 1.0.0 条目所列功能均包含在 1.0.1 中。
 
-### 新增
+### 新增：核心同步、加密与实验功能
 
 - 双模式连接：Cookie（BDUSS/STOKEN）+ OpenAPI 设备码扫码授权
 - 三向冲突合并：diff3 文本自动合并，二进制分叉保留
@@ -416,13 +425,13 @@
 - Release 包包含 `manifest.json` / `main.js` / `styles.css`
 - README 重写：基于源码完善系统架构、同步机制、配置参考、命令列表等文档
 
-### 变更
+### 变更：作者/构建/CI 规范
 
 - 作者名统一为 Game811
 - 构建产物 (`main.js` / `styles.css`) 不再纳入版本控制，改由 GitHub Releases 分发
 - CI 中 `obsidian` 依赖锁定为 `1.7.7`，确保构建可复现
 
-### 修复
+### 修复：安全加固
 
 - 设置导入白名单校验，防止任意字段注入（Mass-Assignment）
 - 所有日志与错误信息中的凭证字段（BDUSS/STOKEN/Token/SecretKey）自动脱敏
@@ -430,9 +439,15 @@
 - 大规模删除保护扩展至实时同步（quickSync）路径
 - 本地流服务器增加环回地址 + Host 头 + Token 三重校验
 
-### 移除
+### 移除：中间审查稿与冗余产物
 
 - 中间审查稿（code-review-report 系列、overview、frontend-optimization 等）
 - `.html` 格式重复文档，仅保留 Markdown 版本
 - `copy-to-vault.cjs` 中硬编码的作者本地 vault 路径
+
+### 发布元数据
+
+- 版本号：**1.0.1**（初始发布版本）；最低 Obsidian 版本：`1.13.7`（`manifest.json` / `versions.json` / `package.json` 同步）。
+- 构建产物 `main.js` / `styles.css` 由 CI 自动生成，不在版本控制中。
+- 质量门禁：`tsc -noEmit` 0 错误 / `eslint` 0 问题 / 单元测试全绿 / 生产构建通过。
 
